@@ -2,17 +2,18 @@ use crate::{
     DuckDBType, Parameters, ToValue,
     builder_helpers::scalar_callback,
     connection::FFILink,
-    environment::Environment,
-    environment::StorageLocation,
+    environment::{Environment, StorageLocation},
     error::DuckDBError,
+    get_decimal_size,
     logical_type::LogicalType,
     query_result::QueryResultStep,
     types::{
-        Any, BigNumValue, BitValue, BlobValue, DateValue, DecimalValue, IntervalValue, MapValue, StructSchema,
-        StructValue, TimeNsValue, TimeTzValue, TimeValue, TimestampMsValue, TimestampNsValue, TimestampSecValue,
-        TimestampTzNsValue, TimestampTzValue, TimestampValue, UnionSchema, UnionValue, UuidValue,
+        Any, Array, BigNum, BigNumValue, BitValue, BlobValue, DateValue, Decimal, DecimalValue, IntervalValue, List,
+        Map, MapValue, Struct, StructSchema, StructValue, TString, TimeNsValue, TimeTzValue, TimeValue,
+        TimestampMsValue, TimestampNsValue, TimestampSecValue, TimestampTzNsValue, TimestampTzValue, TimestampValue,
+        Union, UnionSchema, UnionValue, UuidValue, Variant,
     },
-    vector::{Array, Decimal, List, MapWrite, StorageKind, Struct, StructWrite, TString, Union, UnionWriter, Variant},
+    vector::{MapWrite, StorageKind, StructWrite, UnionWriter},
 };
 
 #[cfg(feature = "capi-v2-p2")]
@@ -480,7 +481,7 @@ pub fn test_vector_map() -> crate::Result<()> {
 
     assert_eq!(res.vectors_count()?, 1);
 
-    let vector = res.get_vector_at::<crate::vector::Map<i32, Decimal<i16>>>(0)?;
+    let vector = res.get_vector_at::<Map<i32, Decimal<i16>>>(0)?;
     let mut reader = vector.iter()?;
 
     assert_eq!(vector.len(), 3);
@@ -488,15 +489,15 @@ pub fn test_vector_map() -> crate::Result<()> {
     let row = reader.next().unwrap().unwrap();
 
     assert_eq!(row.keys()?, vec![&1, &2]);
-    assert_eq!(row.values()?, vec![&121, &412]);
+    assert_eq!(row.values()?, vec![&Decimal::<i16>(121), &Decimal::<i16>(412)]);
 
-    assert_eq!(row.get(&1)?, Some(&121));
-    assert_eq!(row.get(&2)?, Some(&412));
+    assert_eq!(row.get(&1)?, Some(&Decimal::<i16>(121)));
+    assert_eq!(row.get(&2)?, Some(&Decimal::<i16>(412)));
 
     let row = reader.next().unwrap().unwrap();
 
-    assert_eq!(row.get(&1)?, Some(&1121));
-    assert_eq!(row.get(&2)?, Some(&1412));
+    assert_eq!(row.get(&1)?, Some(&Decimal::<i16>(1121)));
+    assert_eq!(row.get(&2)?, Some(&Decimal::<i16>(1412)));
     Ok(())
 }
 
@@ -668,7 +669,7 @@ pub fn vector_test_bignum() -> crate::Result<()> {
     for item in result {
         let item = item?;
 
-        let res = item.get_vector_at::<crate::vector::BigNum>(0)?;
+        let res = item.get_vector_at::<BigNum>(0)?;
 
         assert!(res.len() == 3);
         let reader = res.iter()?;
@@ -1108,4 +1109,30 @@ fn test_vector_tstring() -> crate::Result<()> {
     assert_eq!(results, expected);
 
     Ok(())
+}
+
+#[test]
+#[cfg(feature = "rust_decimal")]
+fn test_vector_decimal() -> crate::Result<()> {
+    use crate::error::Error;
+
+    let env = Environment::new()?;
+    let db = env.open(StorageLocation::InMemory)?;
+    let conn = db.connect()?;
+
+    let result = conn.query("SELECT CAST('123.45' AS DECIMAL(5, 2));", Parameters::None)?;
+
+    for chunk in result {
+        let chunk = chunk?;
+        let vector = chunk.get_vector_at::<Decimal<get_decimal_size!(5)>>(0)?;
+
+        for item in vector.iter()? {
+            let decimal: rust_decimal::Decimal = item.unwrap().to_rust_decimal(2);
+
+            assert_eq!(decimal, rust_decimal::Decimal::new(12345, 2));
+
+            return Ok(());
+        }
+    }
+    Err(Error::api_error("chunk not found"))
 }
