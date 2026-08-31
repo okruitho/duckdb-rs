@@ -11,8 +11,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 bundled = ["libduckdb-sys/bundled"]
 strict-docs = []
 capi-v2-p2 = []
+rust_decimal = ["dep:rust_decimal"]
 
 [dependencies]
 libc = "0.2.186"
 libduckdb-sys = { path = "../libduckdb-sys" }
 paste = "1.0.15"
+rust_decimal = { version = "1.42.1", optional = true }

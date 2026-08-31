@@ -69,10 +69,10 @@ impl Error {
     }
 
     /// Create an API-classified error with a human-readable message.
-    pub fn api_error(message: String) -> Self {
+    pub fn api_error(message: impl Into<String>) -> Self {
         Error {
             code: DuckDBError::DUCKDB_V2_ERROR_API,
-            message,
+            message: message.into(),
         }
     }
 }
