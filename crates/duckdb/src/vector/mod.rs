@@ -46,9 +46,6 @@ use crate::{
 };
 
 mod element;
-pub use crate::types::{
-    Array, BigNum, BigNumDecoded, Decimal, InternalDecimalType, List, Map, Struct, TString, Union, Variant,
-};
 pub use element::*;
 
 /// Runtime view of a vector's storage kind.

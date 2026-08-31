@@ -265,7 +265,7 @@ impl<T: InternalDecimalType> VectorElement for Decimal<T> {
     const TYPE_ID: LogicalTypeID = LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_DECIMAL;
 
     type Ref<'a>
-        = &'a T
+        = &'a Decimal<T>
     where
         Self: 'a;
 
@@ -273,7 +273,7 @@ impl<T: InternalDecimalType> VectorElement for Decimal<T> {
     where
         Self: Sized + 'a,
     {
-        let data_ptr = vector.view.unwrap().data as *const T;
+        let data_ptr = vector.view.unwrap().data as *const Decimal<T>;
 
         (unsafe { &*data_ptr.add(physical) }) as _
     }
