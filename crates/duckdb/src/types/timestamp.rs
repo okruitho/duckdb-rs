@@ -116,19 +116,6 @@ declare_storage_value!(
     ffi::duckdb_v2_value_get_timestamp_tz_ns
 );
 
-macro_rules! declare_to_chrono {
-    (
-        $name:ident, $chrono_type:ty, $operation:ident
-    ) => {
-        #[cfg(feature = "chrono")]
-        impl From<$name> for $chrono_type {
-            fn from(value: $name) -> Self {
-                <$chrono_type>::$operation(value.0)
-            }
-        }
-    };
-}
-
 macro_rules! declare_to_chrono_option {
     (
         $name:ident, $chrono_type:ty, $operation:ident
@@ -175,10 +162,30 @@ impl From<TimestampSecValue> for Option<chrono::DateTime<chrono::Utc>> {
 }
 
 declare_to_chrono_option!(TimestampMsValue, chrono::DateTime<chrono::Utc>, from_timestamp_millis);
-declare_to_chrono!(TimestampNsValue, chrono::DateTime<chrono::Utc>, from_timestamp_nanos);
 
 declare_to_chrono_option!(TimestampTzValue, chrono::DateTime<chrono::Utc>, from_timestamp_micros);
-declare_to_chrono!(TimestampTzNsValue, chrono::DateTime<chrono::Utc>, from_timestamp_nanos);
+
+#[cfg(feature = "chrono")]
+fn timestamp_nanos_to_chrono(value: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+    if value == i64::MAX || value == -i64::MAX {
+        return None;
+    }
+    Some(chrono::DateTime::from_timestamp_nanos(value))
+}
+
+#[cfg(feature = "chrono")]
+impl From<TimestampNsValue> for Option<chrono::DateTime<chrono::Utc>> {
+    fn from(value: TimestampNsValue) -> Self {
+        timestamp_nanos_to_chrono(value.0)
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl From<TimestampTzNsValue> for Option<chrono::DateTime<chrono::Utc>> {
+    fn from(value: TimestampTzNsValue) -> Self {
+        timestamp_nanos_to_chrono(value.0)
+    }
+}
 
 #[cfg(test)]
 #[cfg(feature = "chrono")]
@@ -187,8 +194,8 @@ mod tests {
         Parameters,
         environment::{Environment, StorageLocation},
         types::{
-            DateValue, TimeNsValue, TimeValue, TimestampMsValue, TimestampNsValue, TimestampSecValue, TimestampTzValue,
-            TimestampValue,
+            DateValue, TimeNsValue, TimeValue, TimestampMsValue, TimestampNsValue, TimestampSecValue,
+            TimestampTzNsValue, TimestampTzValue, TimestampValue,
         },
     };
 
@@ -222,7 +229,7 @@ mod tests {
             let mut result = conn.query("SELECT TIMESTAMP_NS '1992-09-20 11:30:00.123456789';", Parameters::None)?;
             let chunk = result.next().unwrap()?;
             let vec = chunk.get_vector_at::<TimestampNsValue>(0)?;
-            let timestamp = <chrono::DateTime<chrono::Utc>>::from(*vec.get(0)?.unwrap());
+            let timestamp = Option::<chrono::DateTime<chrono::Utc>>::from(*vec.get(0)?.unwrap()).unwrap();
             assert_eq!(
                 timestamp,
                 chrono::DateTime::parse_from_rfc3339("1992-09-20T11:30:00.123456789Z")
@@ -298,6 +305,33 @@ mod tests {
                     .with_timezone(&chrono::Utc)
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_timestamp_ns_infinity_conversion() -> crate::Result<()> {
+        let env = Environment::new()?;
+        let db = env.open(StorageLocation::InMemory)?;
+        let conn = db.connect()?;
+        let mut result = conn.query(
+            "SELECT
+                'infinity'::TIMESTAMP_NS,
+                '-infinity'::TIMESTAMP_NS,
+                'infinity'::TIMESTAMPTZ_NS,
+                '-infinity'::TIMESTAMPTZ_NS;",
+            Parameters::None,
+        )?;
+        let chunk = result.next().unwrap()?;
+
+        for index in 0..2 {
+            let vector = chunk.get_vector_at::<TimestampNsValue>(index)?;
+            assert!(Option::<chrono::DateTime<chrono::Utc>>::from(*vector.get(0)?.unwrap()).is_none());
+        }
+        for index in 2..4 {
+            let vector = chunk.get_vector_at::<TimestampTzNsValue>(index)?;
+            assert!(Option::<chrono::DateTime<chrono::Utc>>::from(*vector.get(0)?.unwrap()).is_none());
+        }
+
         Ok(())
     }
 
