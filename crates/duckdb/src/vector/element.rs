@@ -955,7 +955,14 @@ DeclareWritableVectorElement!(u64);
 DeclareWritableVectorElement!(u128);
 DeclareWritableVectorElement!(f32);
 DeclareWritableVectorElement!(f64);
-DeclareWritableVectorElement!(String);
+
+impl WritableVectorElement for String {
+    type Write<'a> = String;
+
+    fn write(vector: &mut Vector<'_, Self>, index: usize, value: Option<Self::Write<'_>>) -> Result<()> {
+        vector.write_string(index, value.as_deref())
+    }
+}
 
 impl WritableVectorElement for Variant {
     type Write<'a> = Value;
@@ -965,5 +972,36 @@ impl WritableVectorElement for Variant {
             Some(value) => vector.write_value_slow(index, value),
             None => vector.write_raw::<Unknown>(index, None),
         }
+    }
+}
+
+#[cfg(feature = "serde_json")]
+impl VectorElement for serde_json::Value {
+    const TYPE_ID: LogicalTypeID = LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_VARCHAR;
+
+    type Ref<'a>
+        = Result<serde_json::Value>
+    where
+        Self: 'a;
+    fn get<'a, U>(vector: &'a Vector<'_, U>, physical: usize, logical: usize) -> Self::Ref<'a>
+    where
+        Self: Sized + 'a,
+    {
+        let data_ptr = vector.view.unwrap().data as *const ffi::duckdb_v2_bytes;
+
+        let string_view = unsafe { &*data_ptr.add(physical) };
+
+        let str: &str = string_view.into();
+
+        serde_json::from_str(str).map_err(|e| Error::api_error(format!("Could not read json value: {e}")))
+    }
+}
+
+#[cfg(feature = "serde_json")]
+impl WritableVectorElement for serde_json::Value {
+    type Write<'a> = serde_json::Value;
+
+    fn write(vector: &mut Vector<'_, Self>, index: usize, value: Option<Self::Write<'_>>) -> Result<()> {
+        vector.write_string(index, value.as_ref().map(|v| v.to_string()).as_deref())
     }
 }

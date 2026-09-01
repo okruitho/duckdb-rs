@@ -11,8 +11,13 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 bundled = ["libduckdb-sys/bundled"]
 strict-docs = []
 capi-v2-p2 = []
+serde_json = ["dep:serde_json"]
 
 [dependencies]
 libc = "0.2.186"
 libduckdb-sys = { path = "../libduckdb-sys" }
 paste = "1.0.15"
+serde_json = { version = "1.0.151", optional = true }
+
+[dev-dependencies]
+serde = { version = "1.0.229", features = ["serde_derive"] }

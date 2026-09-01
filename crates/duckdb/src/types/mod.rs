@@ -895,6 +895,20 @@ impl_tuple_value!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4), (F, 5));
 impl_tuple_value!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4), (F, 5), (G, 6));
 impl_tuple_value!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4), (F, 5), (G, 6), (H, 7));
 
+#[cfg(feature = "serde_json")]
+impl ToValue for serde_json::Value {
+    fn value<C: FFILink + ?Sized>(&self, link: &C) -> Result<Value> {
+        link.create_value(ValueInput::Varchar(&self.to_string()))
+    }
+}
+
+#[cfg(feature = "serde_json")]
+impl DuckDBType for serde_json::Value {
+    fn logical_type<C: FFILink + ?Sized>(link: &C) -> Result<LogicalType> {
+        link.logical_type_create("VARCHAR", Parameters::None)
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests;

@@ -1109,3 +1109,48 @@ fn test_vector_tstring() -> crate::Result<()> {
 
     Ok(())
 }
+
+#[test]
+#[cfg(feature = "serde_json")]
+fn test_vector_json() -> crate::Result<()> {
+    #[derive(serde::Deserialize)]
+    struct TestJson {
+        key: String,
+    }
+
+    let env = Environment::new()?;
+    let db = env.open(StorageLocation::InMemory)?;
+    let conn = db.connect()?;
+
+    assert!(conn.execute("LOAD json;", Parameters::None)? == 0);
+
+    assert!(conn.execute("CREATE TABLE test_json (data JSON);", Parameters::None)? == 0);
+
+    let input = serde_json::json!({"key": "value"});
+
+    assert!(
+        conn.execute(
+            "INSERT INTO test_json (data) VALUES ($1);",
+            Parameters::Positional(&[&input])
+        )? == 1
+    );
+
+    let result = conn.query("SELECT * FROM test_json", Parameters::None)?;
+
+    for chunk in result {
+        let chunk = chunk?;
+        let vector = chunk.get_vector_at::<serde_json::Value>(0)?;
+
+        for item in vector.iter()? {
+            if let Some(value) = item {
+                let parsed: TestJson = serde_json::from_value(value.unwrap()).unwrap();
+
+                assert_eq!(parsed.key, "value");
+            } else {
+                panic!("Expected a JSON value, found None");
+            }
+        }
+    }
+
+    Ok(())
+}
