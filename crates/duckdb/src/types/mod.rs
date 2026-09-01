@@ -320,120 +320,6 @@ impl FromValue for BitValue<Vec<u8>> {
     }
 }
 
-macro_rules! declare_storage_value {
-    ($doc:literal, $name:ident, $storage:ty, $type_id:ident, $input:ident, $getter:path) => {
-        #[doc = $doc]
-        #[repr(transparent)]
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub struct $name(pub $storage);
-
-        impl Display for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                self.0.fmt(f)
-            }
-        }
-
-        impl DuckDBType for $name {
-            fn logical_type<C: FFILink + ?Sized>(link: &C) -> Result<LogicalType> {
-                link.logical_type_create_from_id(LogicalTypeID::$type_id, Parameters::None)
-            }
-        }
-
-        impl ToValue for $name {
-            fn value<C: FFILink + ?Sized>(&self, link: &C) -> Result<Value> {
-                link.create_value(ValueInput::$input(self.0))
-            }
-        }
-
-        impl FromValue for $name {
-            fn from_value(value: &Value) -> Result<Self> {
-                Ok(Self(check_api_call!($getter, **value, RET)?))
-            }
-        }
-    };
-}
-
-declare_storage_value!(
-    "Days since 1970-01-01 represented as a DuckDB `DATE`.",
-    DateValue,
-    i32,
-    DUCKDB_V2_LOGICAL_TYPE_ID_DATE,
-    Date,
-    ffi::duckdb_v2_value_get_date
-);
-declare_storage_value!(
-    "Microseconds since midnight represented as a DuckDB `TIME`.",
-    TimeValue,
-    i64,
-    DUCKDB_V2_LOGICAL_TYPE_ID_TIME,
-    Time,
-    ffi::duckdb_v2_value_get_time
-);
-declare_storage_value!(
-    "Nanoseconds since midnight represented as a DuckDB `TIME_NS`.",
-    TimeNsValue,
-    i64,
-    DUCKDB_V2_LOGICAL_TYPE_ID_TIME_NS,
-    TimeNs,
-    ffi::duckdb_v2_value_get_time_ns
-);
-declare_storage_value!(
-    "Packed time and UTC offset represented as a DuckDB `TIME_TZ`.",
-    TimeTzValue,
-    u64,
-    DUCKDB_V2_LOGICAL_TYPE_ID_TIME_TZ,
-    TimeTz,
-    ffi::duckdb_v2_value_get_time_tz
-);
-declare_storage_value!(
-    "Microseconds since 1970-01-01 represented as a DuckDB `TIMESTAMP`.",
-    TimestampValue,
-    i64,
-    DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP,
-    Timestamp,
-    ffi::duckdb_v2_value_get_timestamp
-);
-declare_storage_value!(
-    "Seconds since 1970-01-01 represented as a DuckDB `TIMESTAMP_SEC`.",
-    TimestampSecValue,
-    i64,
-    DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP_SEC,
-    TimestampSec,
-    ffi::duckdb_v2_value_get_timestamp_sec
-);
-declare_storage_value!(
-    "Milliseconds since 1970-01-01 represented as a DuckDB `TIMESTAMP_MS`.",
-    TimestampMsValue,
-    i64,
-    DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP_MS,
-    TimestampMs,
-    ffi::duckdb_v2_value_get_timestamp_ms
-);
-declare_storage_value!(
-    "Nanoseconds since 1970-01-01 represented as a DuckDB `TIMESTAMP_NS`.",
-    TimestampNsValue,
-    i64,
-    DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP_NS,
-    TimestampNs,
-    ffi::duckdb_v2_value_get_timestamp_ns
-);
-declare_storage_value!(
-    "UTC microseconds since 1970-01-01 represented as a DuckDB `TIMESTAMP_TZ`.",
-    TimestampTzValue,
-    i64,
-    DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP_TZ,
-    TimestampTz,
-    ffi::duckdb_v2_value_get_timestamp_tz
-);
-declare_storage_value!(
-    "UTC nanoseconds since 1970-01-01 represented as a DuckDB `TIMESTAMP_TZ_NS`.",
-    TimestampTzNsValue,
-    i64,
-    DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP_TZ_NS,
-    TimestampTzNs,
-    ffi::duckdb_v2_value_get_timestamp_tz_ns
-);
-
 /// DuckDB's internal signed 128-bit UUID representation.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -894,6 +780,9 @@ impl_tuple_value!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4));
 impl_tuple_value!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4), (F, 5));
 impl_tuple_value!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4), (F, 5), (G, 6));
 impl_tuple_value!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4), (F, 5), (G, 6), (H, 7));
+
+mod timestamp;
+pub use timestamp::*;
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
