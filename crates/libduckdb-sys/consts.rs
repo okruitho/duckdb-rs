@@ -1,5 +1,5 @@
 #[allow(dead_code)]
-pub const ARTIFACT_SHA: &str = "a00803f768";
+pub const ARTIFACT_SHA: &str = "154c2c8d5f";
 
 #[allow(dead_code)]
-pub const ARTIFACT_VERSION: &str = "v2.0.0-alpha39998";
+pub const ARTIFACT_VERSION: &str = "v2.1.0-alpha40575";
