@@ -79,7 +79,9 @@ impl QueryProgress {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use crate::{Environment, Parameters, StorageLocation, query_progress::QueryProgressTracker};
+    use crate::{
+        Parameters, environment::Environment, environment::StorageLocation, query_progress::QueryProgressTracker,
+    };
 
     #[test]
     fn test_query_progress() -> crate::Result<()> {

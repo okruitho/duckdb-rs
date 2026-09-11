@@ -5,13 +5,8 @@ use std::ops::Deref;
 use libduckdb_sys::{self as ffi, DUCKDB_V2_LOGICAL_TYPE_ID};
 
 use crate::{
-    Parameters, Result,
-    builder_helpers::context_and_connection_fn,
-    check_api_call, check_api_call_no_err,
-    connection::FFILink,
-    error::{DuckDBError, Error},
-    qualified_name::QualifiedName,
-    value::Value,
+    Parameters, Result, builder_helpers::context_and_connection_fn, check_api_call, check_api_call_no_err,
+    check_api_call_string, connection::FFILink, qualified_name::QualifiedName, value::Value,
 };
 
 /// DuckDB's logical type identifier.
@@ -179,32 +174,7 @@ impl LogicalType {
 
     /// Render the type as SQL text.
     pub fn to_string(&self) -> Result<String> {
-        let capacity = check_api_call!(
-            ffi::duckdb_v2_logical_type_to_text,
-            self.handle,
-            std::ptr::null::<i8>() as *mut i8,
-            0,
-            RET
-        )?;
-
-        let buffer_capacity = capacity + 1;
-        let mut text: Vec<u8> = Vec::with_capacity(buffer_capacity as usize);
-
-        let length = check_api_call!(
-            ffi::duckdb_v2_logical_type_to_text,
-            self.handle,
-            text.as_mut_ptr() as *mut i8,
-            buffer_capacity,
-            RET
-        )?;
-        unsafe {
-            text.set_len(length as usize);
-        }
-
-        String::from_utf8(text).map_err(|_| Error {
-            code: DuckDBError::DUCKDB_V2_ERROR_API,
-            message: "Failed to convert logical type text to UTF-8".to_string(),
-        })
+        check_api_call_string!(ffi::duckdb_v2_logical_type_to_text, self.handle)
     }
 
     /// Return the number of value parameters carried by the type.

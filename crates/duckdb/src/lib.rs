@@ -47,7 +47,7 @@ pub mod statement;
 pub mod types;
 pub mod value;
 pub mod vector;
-use crate::error::{Error, check_api_call, check_api_call_no_err};
+use crate::error::{Error, check_api_call, check_api_call_no_err, check_api_call_string};
 pub use bytes::DuckDBBytes;
 pub use parameter::{Parameters, QueryParameter};
 pub use types::{DuckDBType, FromValue, ToValue};
@@ -69,11 +69,11 @@ pub mod column_data_collection;
 pub mod copy_function;
 #[cfg(feature = "capi-v2-p2")]
 pub mod custom_type;
-#[cfg(feature = "capi-v2-p2")]
+// #[cfg(feature = "capi-v2-p2")]
 pub mod enums;
 #[cfg(feature = "capi-v2-p2")]
 pub mod expression;
-#[cfg(feature = "capi-v2-p2")]
+// #[cfg(feature = "capi-v2-p2")]
 pub mod file;
 #[cfg(feature = "capi-v2-p2")]
 pub mod log;
@@ -94,23 +94,9 @@ pub mod table_function;
 /// This result type is used extensively throughout the crate to represent the result of (FFI) operations that can fail.
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[cfg(feature = "capi-v2-p2")]
 /// Render a name as SQL, quoting and escaping it only when required.
 pub fn render_identifier_quoted(text: &str) -> Result<String> {
-    let data = check_api_call!(ffi::duckdb_v2_identifier_render_quoted, text.into(), RET)?;
-
-    let string = unsafe {
-        CStr::from_ptr(data).to_str().map_err(|e| Error {
-            code: DuckDBError::DUCKDB_V2_ERROR_INPUT_INVALID,
-            message: format!("Failed to convert library version to string: {}", e),
-        })
-    }
-    .map(|v| v.to_string());
-
-    unsafe {
-        libc::free(data as *mut libc::c_void);
-    }
-    string
+    check_api_call_string!(ffi::duckdb_v2_identifier_render_quoted, text.into())
 }
 
 /// Return the linked DuckDB library version.

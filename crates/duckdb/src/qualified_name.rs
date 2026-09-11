@@ -2,10 +2,7 @@
 
 use std::ops::Deref;
 
-use crate::{
-    Result, check_api_call, check_api_call_no_err,
-    error::{DuckDBError, Error},
-};
+use crate::{Result, check_api_call, check_api_call_no_err, check_api_call_string};
 use libduckdb_sys as ffi;
 
 /// An owned, optionally qualified name for a database object.
@@ -21,7 +18,7 @@ use libduckdb_sys as ffi;
 /// let name = QualifiedName::from_parts(&["main", "events"]).unwrap();
 ///
 /// assert_eq!(name.parts().unwrap(), ["main", "events"]);
-/// // assert_eq!(name.render().unwrap(), "main.events");
+/// assert_eq!(name.render().unwrap(), "main.events");
 /// ```
 #[derive(Debug)]
 pub struct QualifiedName {
@@ -55,23 +52,9 @@ impl QualifiedName {
     }
 
     /// Render the name as SQL, quoting and escaping parts when needed.
-    // pub fn render(&self) -> Result<String> {
-    //     let data = check_api_call!(ffi::duckdb_v2_qname_render, self.handle, RET)?;
-
-    //     let text = unsafe { std::ffi::CStr::from_ptr(data) }
-    //         .to_str()
-    //         .map(|s| s.to_string())
-    //         .map_err(|e| Error {
-    //             code: DuckDBError::DUCKDB_V2_ERROR_INPUT_INVALID,
-    //             message: format!("Failed to convert result to string: {}", e),
-    //         });
-
-    //     unsafe {
-    //         libc::free(data as *mut libc::c_void);
-    //     }
-
-    //     text
-    // }
+    pub fn render(&self) -> Result<String> {
+        check_api_call_string!(ffi::duckdb_v2_qname_render, self.handle)
+    }
 
     /// Return the number of identifier parts.
     pub fn parts_count(&self) -> Result<usize> {
@@ -145,7 +128,7 @@ mod tests {
         assert_ne!(qname, qname_2);
         assert_eq!(qname, qname_3);
 
-        // assert_eq!(qname.render()?, "main.test.\"table\"");
+        assert_eq!(qname.render()?, "main.test.\"table\"");
 
         Ok(())
     }
