@@ -219,6 +219,12 @@ impl LogicalType {
 
         Ok(params)
     }
+
+    pub(crate) fn copy_handle(handle: &mut ffi::duckdb_v2_logical_type_handle) -> Result<LogicalType> {
+        let handle = check_api_call!(ffi::duckdb_v2_logical_type_copy, *handle, RET)?;
+
+        Ok(LogicalType { handle })
+    }
 }
 
 impl PartialEq for LogicalType {

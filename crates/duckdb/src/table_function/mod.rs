@@ -26,16 +26,16 @@ use crate::{
 };
 
 /// An owned table-function builder handle.
-pub struct TableFunctionBuilderHandle(ffi::duckdb_v2_table_function_builder_handle);
+pub struct TableFunctionBuilderHandle(ffi::duckdb_v2_table_function_handle);
 
 impl Drop for TableFunctionBuilderHandle {
     fn drop(&mut self) {
-        check_api_call_no_err!(ffi::duckdb_v2_table_function_builder_destroy, &mut self.0).unwrap();
+        check_api_call_no_err!(ffi::duckdb_v2_table_function_destroy, &mut self.0).unwrap();
     }
 }
 
 impl Deref for TableFunctionBuilderHandle {
-    type Target = ffi::duckdb_v2_table_function_builder_handle;
+    type Target = ffi::duckdb_v2_table_function_handle;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -409,71 +409,67 @@ impl<T: TableFunctionCallbacks> TableFunctionBuilder<T> {
 
     /// Build an owned table-function builder handle.
     pub fn build(&self) -> Result<TableFunctionBuilderHandle> {
-        let handle = TableFunctionBuilderHandle(check_api_call!(ffi::duckdb_v2_table_function_builder_create, RET)?);
+        let handle = TableFunctionBuilderHandle(check_api_call!(ffi::duckdb_v2_table_function_create, RET)?);
+
+        check_api_call!(ffi::duckdb_v2_table_function_set_name, *handle, (&self.name).into())?;
 
         check_api_call!(
-            ffi::duckdb_v2_table_function_builder_set_name,
-            *handle,
-            (&self.name).into()
-        )?;
-
-        check_api_call!(
-            ffi::duckdb_v2_table_function_builder_set_signature,
+            ffi::duckdb_v2_table_function_set_signature,
             *handle,
             *self.signature.build()?
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_table_function_builder_set_projection_pushdown,
+            ffi::duckdb_v2_table_function_set_projection_pushdown,
             *handle,
             self.projection_pushdown
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_table_function_builder_set_user_data,
+            ffi::duckdb_v2_table_function_set_user_data,
             *handle,
             self.user_data.to_handle()
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_table_function_builder_set_init_local_callback,
+            ffi::duckdb_v2_table_function_set_init_local_callback,
             *handle,
             Some(init_local_callback::<T>)
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_table_function_builder_set_init_global_callback,
+            ffi::duckdb_v2_table_function_set_init_global_callback,
             *handle,
             Some(init_global_callback::<T>)
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_table_function_builder_set_progress_callback,
+            ffi::duckdb_v2_table_function_set_progress_callback,
             *handle,
             Some(progress_callback::<T>)
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_table_function_builder_set_cardinality_callback,
+            ffi::duckdb_v2_table_function_set_cardinality_callback,
             *handle,
             Some(cardinality_callback::<T>)
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_table_function_builder_set_pushdown_complex_filter_callback,
+            ffi::duckdb_v2_table_function_set_pushdown_complex_filter_callback,
             *handle,
             Some(pushdown_complex_filter_callback::<T>)
         )?;
 
         // required
         check_api_call!(
-            ffi::duckdb_v2_table_function_builder_set_bind_callback,
+            ffi::duckdb_v2_table_function_set_bind_callback,
             *handle,
             Some(bind_callback::<T>)
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_table_function_builder_set_exec_callback,
+            ffi::duckdb_v2_table_function_set_exec_callback,
             *handle,
             Some(exec_callback::<T>)
         )?;
@@ -485,8 +481,8 @@ impl<T: TableFunctionCallbacks> TableFunctionBuilder<T> {
         /// Register the function through a connection or callback context.
         pub fn register_with_[context, connection](self) -> Result<()>
         {
-            context_fn: ffi::duckdb_v2_table_function_builder_register_with_context,
-            connection_fn: ffi::duckdb_v2_table_function_builder_register_with_connection,
+            context_fn: ffi::duckdb_v2_table_function_register_with_context,
+            connection_fn: ffi::duckdb_v2_table_function_register_with_connection,
         }
         let handle = self.build()?;
 

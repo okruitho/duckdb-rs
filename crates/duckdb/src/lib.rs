@@ -74,6 +74,7 @@ pub mod enums;
 #[cfg(feature = "capi-v2-p2")]
 pub mod expression;
 // #[cfg(feature = "capi-v2-p2")]
+pub mod description;
 pub mod file;
 #[cfg(feature = "capi-v2-p2")]
 pub mod log;
@@ -86,8 +87,6 @@ pub mod replacement_scan;
 pub mod scalar;
 #[cfg(feature = "capi-v2-p2")]
 pub mod signature;
-#[cfg(feature = "capi-v2-p2")]
-pub mod table_description;
 #[cfg(feature = "capi-v2-p2")]
 pub mod table_function;
 
