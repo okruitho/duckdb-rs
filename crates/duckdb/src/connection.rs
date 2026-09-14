@@ -307,6 +307,17 @@ impl FFILink for Connection {
     }
 }
 
+#[repr(transparent)]
+pub struct Extension(pub(crate) ffi::duckdb_v2_extension_handle);
+
+impl Deref for Extension {
+    type Target = ffi::duckdb_v2_extension_handle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 /// A non-owning DuckDB context supplied for the duration of a callback.
 ///
 /// This wrapper does not own the underlying handle and must not outlive the callback invocation.

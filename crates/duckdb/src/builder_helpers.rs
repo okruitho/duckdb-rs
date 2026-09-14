@@ -1,10 +1,14 @@
-#[cfg(feature = "capi-v2-p2")]
+use crate::{
+    Result,
+    error::{DuckDBError, Error, check_api_call_no_err},
+    ffi,
+};
+
 pub(crate) struct OpaqueHandle<T> {
     data: *mut T,
     success: RefCell<bool>,
 }
 
-#[cfg(feature = "capi-v2-p2")]
 impl<T> OpaqueHandle<T> {
     pub(crate) fn new(data: T) -> Self {
         let boxed = Box::new(data);
@@ -27,7 +31,6 @@ impl<T> OpaqueHandle<T> {
         }
     }
 }
-#[cfg(feature = "capi-v2-p2")]
 impl<T> Drop for OpaqueHandle<T> {
     fn drop(&mut self) {
         if !*self.success.borrow() {
@@ -36,21 +39,18 @@ impl<T> Drop for OpaqueHandle<T> {
     }
 }
 
-#[cfg(feature = "capi-v2-p2")]
 pub(crate) fn set_error(err: *mut ffi::duckdb_v2_error_info_handle, error: &Error) {
     check_api_call_no_err!(ffi::duckdb_v2_error_info_set_code, *err, error.code).expect("Failed to set error code");
     check_api_call_no_err!(ffi::duckdb_v2_error_info_set_text, *err, (&error.message).into())
         .expect("Failed to set error text");
 }
 
-#[cfg(feature = "capi-v2-p2")]
 pub(crate) unsafe extern "C" fn drop_opaque<T>(ptr: *mut c_void) {
     if !ptr.is_null() {
         let _ = unsafe { Box::from_raw(ptr as *mut T) };
     }
 }
 
-#[cfg(feature = "capi-v2-p2")]
 pub(crate) fn into_opaque<T>(value: T) -> ffi::duckdb_v2_opaque {
     let raw = Box::into_raw(Box::new(value));
 
@@ -61,7 +61,6 @@ pub(crate) fn into_opaque<T>(value: T) -> ffi::duckdb_v2_opaque {
     }
 }
 
-#[cfg(feature = "capi-v2-p2")]
 pub(crate) unsafe fn get_opaque_data_ref<'a, T>(ptr: *mut c_void) -> Option<&'a T> {
     if ptr.is_null() {
         None
@@ -70,7 +69,6 @@ pub(crate) unsafe fn get_opaque_data_ref<'a, T>(ptr: *mut c_void) -> Option<&'a 
     }
 }
 
-#[cfg(feature = "capi-v2-p2")]
 pub(crate) unsafe fn get_opaque_data_ref_mut<'a, T>(ptr: *mut c_void) -> Option<&'a mut T> {
     if ptr.is_null() {
         None
@@ -79,7 +77,6 @@ pub(crate) unsafe fn get_opaque_data_ref_mut<'a, T>(ptr: *mut c_void) -> Option<
     }
 }
 
-#[cfg(feature = "capi-v2-p2")]
 fn panic_message(panic: &(dyn Any + Send)) -> &str {
     if let Some(text) = panic.downcast_ref::<String>() {
         text.as_str()
@@ -90,7 +87,6 @@ fn panic_message(panic: &(dyn Any + Send)) -> &str {
     }
 }
 
-#[cfg(feature = "capi-v2-p2")]
 pub(crate) fn handle_unwind<T, F: FnOnce() -> Result<T>>(
     f: F,
     err: *mut ffi::duckdb_v2_error_info_handle,
@@ -117,10 +113,128 @@ pub(crate) fn handle_unwind<T, F: FnOnce() -> Result<T>>(
     }
 }
 
+// Generates a pair of near-identical methods: one that operates through a
+// callback-scoped handle (either `Extension` or `Context`, selected by
+// whichever literal keyword is used in the `[extension, connection]` /
+// `[context, connection]` suffix list) and one that operates through an
+// owned `Connection`. The matching `extension_fn:` / `context_fn:` key must
+// be used to pair with the chosen keyword.
+//
+// Each of the three top-level arms below handles a different receiver shape
+// (`&self`, no receiver, or a bare receiver such as `self`), and is
+// duplicated once for the `extension` keyword and once for the `context`
+// keyword since macro_rules can't match on the *value* of an already-bound
+// identifier, only on literal tokens.
 macro_rules! context_and_connection_fn {
     (
         $(#[$meta:meta])*
-        $vis:vis fn $prefix:ident [$context_suffix:ident, $connection_suffix:ident]
+        $vis:vis fn $prefix:ident [extension, $connection_suffix:ident]
+        $(<$($gen:ident),+ $(,)?>)? (
+            &$receiver:ident $(, $arg_name:ident : $arg_ty:ty)* $(,)?
+        ) -> $ret:ty
+        {
+            extension_fn: $ext_fn:expr,
+            connection_fn: $conn_fn:expr,
+        }
+        $($body:tt)*
+    ) => {
+        paste::paste! {
+            $(#[$meta])*
+            $vis fn [<$prefix extension>] $(<$($gen),+>)? (
+                &$receiver,
+                context: &$crate::connection::Extension,
+                $($arg_name: $arg_ty),*
+            ) -> $ret {
+                macro_rules! api_fn { () => { $ext_fn } }
+                macro_rules! api_arg { () => { context } }
+                $($body)*
+            }
+
+            $(#[$meta])*
+            $vis fn [<$prefix $connection_suffix>] $(<$($gen),+>)? (
+                &$receiver,
+                connection: &$crate::connection::Connection,
+                $($arg_name: $arg_ty),*
+            ) -> $ret {
+                macro_rules! api_fn { () => { $conn_fn } }
+                macro_rules! api_arg { () => { connection } }
+                $($body)*
+            }
+        }
+    };
+    (
+        $(#[$meta:meta])*
+        $vis:vis fn $prefix:ident [extension, $connection_suffix:ident]
+        $(<$($gen:ident),+ $(,)?>)? (
+            $($arg_name:ident : $arg_ty:ty),* $(,)?
+        ) -> $ret:ty
+        {
+            extension_fn: $ext_fn:expr,
+            connection_fn: $conn_fn:expr,
+        }
+        $($body:tt)*
+    ) => {
+        paste::paste! {
+            $(#[$meta])*
+            $vis fn [<$prefix extension>] $(<$($gen),+>)? (
+                context: &$crate::connection::Extension,
+                $($arg_name: $arg_ty),*
+            ) -> $ret {
+                macro_rules! api_fn { () => { $ext_fn } }
+                macro_rules! api_arg { () => { context } }
+                $($body)*
+            }
+
+            $(#[$meta])*
+            $vis fn [<$prefix $connection_suffix>] $(<$($gen),+>)? (
+                connection: &$crate::connection::Connection,
+                $($arg_name: $arg_ty),*
+            ) -> $ret {
+                macro_rules! api_fn { () => { $conn_fn } }
+                macro_rules! api_arg { () => { connection } }
+                $($body)*
+            }
+        }
+    };
+    (
+        $(#[$meta:meta])*
+        $vis:vis fn $prefix:ident [extension, $connection_suffix:ident]
+        $(<$($gen:ident),+ $(,)?>)? (
+            $receiver:ident $(, $arg_name:ident : $arg_ty:ty)* $(,)?
+        ) -> $ret:ty
+        {
+            extension_fn: $ext_fn:expr,
+            connection_fn: $conn_fn:expr,
+        }
+        $($body:tt)*
+    ) => {
+        paste::paste! {
+            $(#[$meta])*
+            $vis fn [<$prefix extension>] $(<$($gen),+>)? (
+                $receiver,
+                context: &$crate::connection::Extension,
+                $($arg_name: $arg_ty),*
+            ) -> $ret {
+                macro_rules! api_fn { () => { $ext_fn } }
+                macro_rules! api_arg { () => { context } }
+                $($body)*
+            }
+
+            $(#[$meta])*
+            $vis fn [<$prefix $connection_suffix>] $(<$($gen),+>)? (
+                $receiver,
+                connection: &$crate::connection::Connection,
+                $($arg_name: $arg_ty),*
+            ) -> $ret {
+                macro_rules! api_fn { () => { $conn_fn } }
+                macro_rules! api_arg { () => { connection } }
+                $($body)*
+            }
+        }
+    };
+    (
+        $(#[$meta:meta])*
+        $vis:vis fn $prefix:ident [context, $connection_suffix:ident]
         $(<$($gen:ident),+ $(,)?>)? (
             &$receiver:ident $(, $arg_name:ident : $arg_ty:ty)* $(,)?
         ) -> $ret:ty
@@ -132,7 +246,7 @@ macro_rules! context_and_connection_fn {
     ) => {
         paste::paste! {
             $(#[$meta])*
-            $vis fn [<$prefix $context_suffix>] $(<$($gen),+>)? (
+            $vis fn [<$prefix context>] $(<$($gen),+>)? (
                 &$receiver,
                 context: &$crate::connection::Context,
                 $($arg_name: $arg_ty),*
@@ -156,7 +270,7 @@ macro_rules! context_and_connection_fn {
     };
     (
         $(#[$meta:meta])*
-        $vis:vis fn $prefix:ident [$context_suffix:ident, $connection_suffix:ident]
+        $vis:vis fn $prefix:ident [context, $connection_suffix:ident]
         $(<$($gen:ident),+ $(,)?>)? (
             $($arg_name:ident : $arg_ty:ty),* $(,)?
         ) -> $ret:ty
@@ -168,7 +282,7 @@ macro_rules! context_and_connection_fn {
     ) => {
         paste::paste! {
             $(#[$meta])*
-            $vis fn [<$prefix $context_suffix>] $(<$($gen),+>)? (
+            $vis fn [<$prefix context>] $(<$($gen),+>)? (
                 context: &$crate::connection::Context,
                 $($arg_name: $arg_ty),*
             ) -> $ret {
@@ -190,7 +304,7 @@ macro_rules! context_and_connection_fn {
     };
     (
         $(#[$meta:meta])*
-        $vis:vis fn $prefix:ident [$context_suffix:ident, $connection_suffix:ident]
+        $vis:vis fn $prefix:ident [context, $connection_suffix:ident]
         $(<$($gen:ident),+ $(,)?>)? (
             $receiver:ident $(, $arg_name:ident : $arg_ty:ty)* $(,)?
         ) -> $ret:ty
@@ -202,7 +316,7 @@ macro_rules! context_and_connection_fn {
     ) => {
         paste::paste! {
             $(#[$meta])*
-            $vis fn [<$prefix $context_suffix>] $(<$($gen),+>)? (
+            $vis fn [<$prefix context>] $(<$($gen),+>)? (
                 $receiver,
                 context: &$crate::connection::Context,
                 $($arg_name: $arg_ty),*
@@ -226,7 +340,6 @@ macro_rules! context_and_connection_fn {
     };
 }
 
-#[cfg(feature = "capi-v2-p2")]
 macro_rules! get_user_data {
     ($ffi_call:expr, $handle:expr) => {{
         let user_data = check_api_call!($ffi_call, $handle, RET)?;
@@ -235,7 +348,6 @@ macro_rules! get_user_data {
     }};
 }
 
-#[cfg(feature = "capi-v2-p2")]
 macro_rules! get_bind_data {
     ($ffi_call:expr, $handle:expr) => {{
         let bind_data = check_api_call!($ffi_call, $handle, RET)?;
@@ -244,7 +356,6 @@ macro_rules! get_bind_data {
     }};
 }
 
-#[cfg(feature = "capi-v2-p2")]
 macro_rules! get_init_data {
     ($ffi_call:expr, $handle:expr) => {{
         let bind_data = check_api_call!($ffi_call, $handle, RET)?;
@@ -253,7 +364,6 @@ macro_rules! get_init_data {
     }};
 }
 
-#[cfg(feature = "capi-v2-p2")]
 macro_rules! get_global_state {
     ($ffi_call:expr, $handle:expr) => {{
         let global_data = check_api_call!($ffi_call, $handle, RET)?;
@@ -262,7 +372,6 @@ macro_rules! get_global_state {
     }};
 }
 
-#[cfg(feature = "capi-v2-p2")]
 macro_rules! get_local_state {
     ($ffi_call:expr, $handle:expr) => {{
         let local_data = check_api_call!($ffi_call, $handle, RET)?;
@@ -308,19 +417,16 @@ macro_rules! ffi_enum_redeclaration {
     };
 }
 
+use std::{any::Any, cell::RefCell, ffi::c_void, panic::AssertUnwindSafe};
+
 pub(crate) use ffi_enum_redeclaration;
 
 pub(crate) use context_and_connection_fn;
 
-#[cfg(feature = "capi-v2-p2")]
 pub(crate) use get_bind_data;
-#[cfg(feature = "capi-v2-p2")]
 pub(crate) use get_global_state;
-#[cfg(feature = "capi-v2-p2")]
 pub(crate) use get_init_data;
-#[cfg(feature = "capi-v2-p2")]
 pub(crate) use get_local_state;
-#[cfg(feature = "capi-v2-p2")]
 pub(crate) use get_user_data;
 
 #[cfg(test)]
@@ -338,7 +444,7 @@ macro_rules! scalar_callback {
                 &self,
                 _bind_data: Option<&Self::BindData>,
                 _init_data: Option<&Self::InitData>,
-                $ctx: $crate::connection::Context,
+                $ctx: $crate::connection::Extension,
                 $input: &$crate::data_chunk::DataChunk,
                 $result: $crate::vector::Vector<'_>,
             ) -> $crate::Result<()> {

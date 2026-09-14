@@ -2,8 +2,16 @@
 
 use std::ops::Deref;
 
-use crate::{Result, check_api_call, check_api_call_no_err, check_api_call_string};
+use crate::{Result, check_api_call, check_api_call_no_err, check_api_call_string, error::Error};
 use libduckdb_sys as ffi;
+
+#[derive(Default, Debug)]
+pub struct QualifiedNameView {
+    pub catalog: Option<String>,
+    pub schema: Option<String>,
+    pub table: Option<String>,
+    pub column: Option<String>,
+}
 
 /// An owned, optionally qualified name for a database object.
 ///
@@ -24,6 +32,14 @@ use libduckdb_sys as ffi;
 pub struct QualifiedName {
     /// The owned DuckDB qualified-name handle.
     pub handle: ffi::duckdb_v2_qname_handle,
+}
+
+impl TryFrom<&str> for QualifiedName {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        QualifiedName::from_sql(value)
+    }
 }
 
 impl QualifiedName {
@@ -61,6 +77,28 @@ impl QualifiedName {
         let count = check_api_call!(ffi::duckdb_v2_qname_get_part_count, self.handle, RET)?;
 
         Ok(count as usize)
+    }
+
+    pub fn get_view(&self) -> Result<QualifiedNameView> {
+        let mut view = QualifiedNameView {
+            catalog: None,
+            column: None,
+            schema: None,
+            table: None,
+        };
+
+        let parts = self.parts()?;
+
+        let mut iter = parts.iter().rev();
+
+        if parts.len() == 4 {
+            view.column = iter.next().cloned();
+        }
+        view.table = iter.next().cloned();
+        view.schema = iter.next().cloned();
+        view.catalog = iter.next().cloned();
+
+        Ok(view)
     }
 
     /// Return the identifier part at a zero-based index.

@@ -59,15 +59,13 @@ pub mod r2d2;
 pub mod aggregate;
 #[cfg(feature = "capi-v2-p2")]
 pub mod arrow;
-#[cfg(feature = "capi-v2-p2")]
 pub mod bind_arguments;
 #[cfg(feature = "capi-v2-p2")]
 pub mod cast;
-#[cfg(feature = "capi-v2-p2")]
 pub mod column_data_collection;
 #[cfg(feature = "capi-v2-p2")]
 pub mod copy_function;
-#[cfg(feature = "capi-v2-p2")]
+// #[cfg(feature = "capi-v2-p2")]
 pub mod custom_type;
 // #[cfg(feature = "capi-v2-p2")]
 pub mod enums;
@@ -81,7 +79,6 @@ pub mod log;
 pub mod qualified_name;
 #[cfg(feature = "capi-v2-p2")]
 pub mod query_progress;
-#[cfg(feature = "capi-v2-p2")]
 pub mod replacement_scan;
 #[cfg(feature = "capi-v2-p2")]
 pub mod scalar;

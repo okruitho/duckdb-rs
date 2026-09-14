@@ -6,6 +6,7 @@ use libduckdb_sys as ffi;
 
 use crate::{Result, check_api_call, logical_type::LogicalType, value::Value};
 
+#[cfg(feature = "capi-v2-p4")]
 /// Metadata available while binding a scalar or aggregate function.
 ///
 /// The argument list follows signature-slot order: fixed parameters first,
@@ -17,6 +18,7 @@ pub struct BindMetadata<'a> {
     pub arguments: BindArguments<'a>,
 }
 
+#[cfg(feature = "capi-v2-p4")]
 impl<'a> BindMetadata<'a> {
     pub(crate) fn from_table_function(
         handle: &'a ffi::duckdb_v2_table_function_bind_info_handle,
@@ -64,6 +66,7 @@ impl<'a> BindMetadata<'a> {
     }
 }
 
+#[cfg(feature = "capi-v2-p4")]
 /// A read-only view of a function's resolved arguments during binding.
 ///
 /// Entries follow signature-slot order and include expanded variadic arguments.
@@ -73,6 +76,7 @@ pub struct BindArguments<'a> {
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
+#[cfg(feature = "capi-v2-p4")]
 impl<'a> BindArguments<'a> {
     /// Return an owned copy of the resolved type at `index`.
     ///

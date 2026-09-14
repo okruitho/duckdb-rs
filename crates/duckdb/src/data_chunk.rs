@@ -54,6 +54,13 @@ pub struct DataChunk {
     chunk: DataChunkRef<'static>,
 }
 
+impl Deref for DataChunkRef<'_> {
+    type Target = ffi::duckdb_v2_data_chunk_handle;
+    fn deref(&self) -> &Self::Target {
+        &self.handle
+    }
+}
+
 impl<'a> DataChunkRef<'a> {
     pub(crate) fn new(handle: ffi::duckdb_v2_data_chunk_handle, is_writable: bool) -> Self {
         Self {

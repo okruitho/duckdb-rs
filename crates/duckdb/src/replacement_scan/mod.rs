@@ -1,11 +1,16 @@
 //! Replacing unresolved table references with table-function calls.
 
+use std::ops::Deref;
+
 use crate::{
-    Context, Result,
+    Result,
     builder_helpers::{OpaqueHandle, get_user_data, handle_unwind},
     check_api_call,
+    connection::{Connection, Context, Extension},
     database::Database,
+    error::check_api_call_no_err,
     ffi,
+    qualified_name::QualifiedName,
     value::Value,
 };
 
@@ -20,13 +25,13 @@ pub struct ReplacementHandle<'a> {
 impl<'a> ReplacementHandle<'a> {
     /// Append a positional table-function parameter.
     pub fn add_parameter(&self, value: Value) -> Result<()> {
-        check_api_call!(ffi::duckdb_v2_replacement_scan_add_parameter, *self.info, value.handle,)
+        check_api_call!(ffi::duckdb_v2_replacement_scan_add_argument, *self.info, value.handle,)
     }
 
     /// Add a named table-function parameter.
     pub fn add_parameter_with_name(&self, name: &str, value: Value) -> Result<()> {
         check_api_call!(
-            ffi::duckdb_v2_replacement_scan_add_named_parameter,
+            ffi::duckdb_v2_replacement_scan_add_named_argument,
             *self.info,
             name.into(),
             value.handle,
@@ -34,12 +39,8 @@ impl<'a> ReplacementHandle<'a> {
     }
 
     /// Claim the reference with a table function.
-    pub fn set_function_name(&self, name: &str) -> Result<()> {
-        check_api_call!(
-            ffi::duckdb_v2_replacement_scan_set_function_name,
-            *self.info,
-            name.into(),
-        )
+    pub fn set_function_name(&self, name: &QualifiedName) -> Result<()> {
+        check_api_call!(ffi::duckdb_v2_replacement_scan_set_function_name, *self.info, **name,)
     }
 }
 
@@ -52,38 +53,31 @@ unsafe extern "C" fn replacement_callback<T: ReplacementScanCallbacks>(
         || {
             let user_data = get_user_data!(ffi::duckdb_v2_replacement_scan_get_user_data, info);
 
-            let catalog = check_api_call!(ffi::duckdb_v2_replacement_scan_get_catalog_name, info, RET)?;
+            let qname = QualifiedName {
+                handle: check_api_call!(ffi::duckdb_v2_replacement_scan_get_name, info, RET)?,
+            };
 
-            let schema = check_api_call!(ffi::duckdb_v2_replacement_scan_get_schema_name, info, RET)?;
+            dbg!("replacement_callback called with qualified_name: {}", &qname,);
 
-            let table = check_api_call!(ffi::duckdb_v2_replacement_scan_get_table_name, info, RET)?;
-
-            dbg!(
-                "replacement_callback called with catalog: {}, schema: {}, table: {}",
-                catalog,
-                schema,
-                table
-            );
-
-            T::scan(
-                user_data,
-                Context(context),
-                if catalog.ptr.is_null() {
-                    None
-                } else {
-                    Some(catalog.into())
-                },
-                if schema.ptr.is_null() {
-                    None
-                } else {
-                    Some(schema.into())
-                },
-                table.into(),
-                ReplacementHandle { info: &info },
-            )
+            T::scan(user_data, Context(context), &qname, ReplacementHandle { info: &info })
         },
         err,
     );
+}
+
+struct ReplacementScanBuilderHandle(ffi::duckdb_v2_replacement_scan_handle);
+
+impl Deref for ReplacementScanBuilderHandle {
+    type Target = ffi::duckdb_v2_replacement_scan_handle;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for ReplacementScanBuilderHandle {
+    fn drop(&mut self) {
+        check_api_call_no_err!(ffi::duckdb_v2_replacement_scan_destroy, &mut self.0).unwrap();
+    }
 }
 
 /// Registers a replacement scan callback.
@@ -94,7 +88,10 @@ pub struct ReplacementScanBuilder<T> {
     implementation: OpaqueHandle<T>,
 }
 
-impl<T: ReplacementScanCallbacks> ReplacementScanBuilder<T> {
+impl<T> ReplacementScanBuilder<T>
+where
+    T: ReplacementScanCallbacks,
+{
     /// Create a builder from its callback implementation.
     pub fn new(implementation: T) -> Self {
         Self {
@@ -102,26 +99,59 @@ impl<T: ReplacementScanCallbacks> ReplacementScanBuilder<T> {
         }
     }
 
-    /// Register the callback on the context's database.
-    pub fn register_with_context(self, context: &Context) -> Result<()> {
+    fn build(&self, handle: &ReplacementScanBuilderHandle) -> Result<()> {
         check_api_call!(
-            ffi::duckdb_v2_replacement_scan_register_with_context,
-            **context,
-            Some(replacement_callback::<T>),
-            self.implementation.to_handle(),
+            ffi::duckdb_v2_replacement_scan_set_callback,
+            **handle,
+            Some(replacement_callback::<T>)
         )?;
+
+        check_api_call!(
+            ffi::duckdb_v2_replacement_scan_set_user_data,
+            **handle,
+            &mut self.implementation.to_handle()
+        )?;
+
         Ok(())
+    }
+
+    fn register(&self, handle: &ReplacementScanBuilderHandle) -> Result<()> {
+        check_api_call!(ffi::duckdb_v2_replacement_scan_register, **handle)
+    }
+
+    pub fn register_with_connection(&self, connection: &Connection) -> Result<()> {
+        let handle = ReplacementScanBuilderHandle(check_api_call!(
+            ffi::duckdb_v2_replacement_scan_create_with_connection,
+            **connection,
+            RET,
+        )?);
+
+        self.build(&handle)?;
+        self.register(&handle)
+    }
+
+    /// Register the callback on the context's database.
+    pub fn register_with_extension(self, extension: &Extension) -> Result<()> {
+        let handle = ReplacementScanBuilderHandle(check_api_call!(
+            ffi::duckdb_v2_replacement_scan_create_with_extension,
+            **extension,
+            RET,
+        )?);
+
+        self.build(&handle)?;
+        self.register(&handle)
     }
 
     /// Register the callback on a database.
     pub fn register_with_database(self, database: &Database) -> Result<()> {
-        check_api_call!(
-            ffi::duckdb_v2_replacement_scan_register_with_database,
+        let handle = ReplacementScanBuilderHandle(check_api_call!(
+            ffi::duckdb_v2_replacement_scan_create_with_database,
             database.handle.lock().unwrap().handle,
-            Some(replacement_callback::<T>),
-            self.implementation.to_handle(),
-        )?;
-        Ok(())
+            RET,
+        )?);
+
+        self.build(&handle)?;
+        self.register(&handle)
     }
 }
 
@@ -131,14 +161,7 @@ pub trait ReplacementScanCallbacks: Send + Sync + 'static {
     ///
     /// Set a function name to claim it, return without doing so to let the next
     /// replacement scan try, or return an error to reject the query.
-    fn scan(
-        &self,
-        context: Context,
-        catalog: Option<&str>,
-        schema: Option<&str>,
-        table: &str,
-        parameters: ReplacementHandle,
-    ) -> Result<()>;
+    fn scan(&self, context: Context, name: &QualifiedName, parameters: ReplacementHandle) -> Result<()>;
 }
 
 #[cfg(test)]
@@ -149,7 +172,11 @@ mod tests {
     };
 
     use crate::{
-        Context, Environment, Parameters, Result, StorageLocation, ToValue,
+        Parameters, Result, ToValue,
+        connection::Context,
+        environment::Environment,
+        environment::StorageLocation,
+        qualified_name::QualifiedName,
         replacement_scan::{ReplacementHandle, ReplacementScanBuilder, ReplacementScanCallbacks},
     };
 
@@ -158,17 +185,14 @@ mod tests {
     }
 
     impl ReplacementScanCallbacks for CustomReplacementScan {
-        fn scan(
-            &self,
-            context: Context,
-            catalog: Option<&str>,
-            schema: Option<&str>,
-            table: &str,
-            replacement: ReplacementHandle,
-        ) -> Result<()> {
-            if table.starts_with("num") {
-                assert!(catalog == Some("test"));
-                assert!(schema == Some("main"));
+        fn scan(&self, context: Context, name: &QualifiedName, replacement: ReplacementHandle) -> Result<()> {
+            let view = name.get_view()?;
+
+            if let Some(table) = view.table
+                && table.starts_with("num")
+            {
+                assert!(view.catalog == Some("test".to_string()));
+                assert!(view.schema == Some("main".to_string()));
 
                 let split = table
                     .replace("num_", "")
@@ -179,7 +203,7 @@ mod tests {
 
                 dbg!(&split);
 
-                replacement.set_function_name("range")?;
+                replacement.set_function_name(&"range".try_into()?)?;
                 replacement.add_parameter(split[0].value(&context)?)?;
                 replacement.add_parameter((split[1] + self.count).value(&context)?)?;
             }
@@ -191,19 +215,14 @@ mod tests {
     struct CustomNamedParameters {}
 
     impl ReplacementScanCallbacks for CustomNamedParameters {
-        fn scan(
-            &self,
-            context: Context,
-            catalog: Option<&str>,
-            schema: Option<&str>,
-            table: &str,
-            replacement: ReplacementHandle,
-        ) -> Result<()> {
-            if table.starts_with("alltypes") {
-                assert!(catalog.is_none());
-                assert!(schema.is_none());
+        fn scan(&self, context: Context, name: &QualifiedName, replacement: ReplacementHandle) -> Result<()> {
+            let view = name.get_view()?;
 
-                replacement.set_function_name("test_all_types")?;
+            if view.table.is_some_and(|t| t.starts_with("alltypes")) {
+                assert!(view.catalog.is_none());
+                assert!(view.schema.is_none());
+
+                replacement.set_function_name(&"test_all_types".try_into()?)?;
                 replacement.add_parameter_with_name("use_large_bignum", true.value(&context)?)?;
                 replacement.add_parameter_with_name("use_large_enum", false.value(&context)?)?;
             }
@@ -220,7 +239,7 @@ mod tests {
 
         ReplacementScanBuilder::new(CustomReplacementScan { count: 42 }).register_with_database(&db)?;
 
-        ReplacementScanBuilder::new(CustomNamedParameters {}).register_with_database(&db)?;
+        ReplacementScanBuilder::new(CustomNamedParameters {}).register_with_connection(&conn)?;
 
         let mut query = conn.query("SELECT * FROM test.main.num_10_20", Parameters::None)?;
 

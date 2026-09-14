@@ -1,6 +1,9 @@
 //! Parsing, binding, and preparing SQL statements.
 
-use crate::{Result, check_api_call, check_api_call_no_err, connection::Connection, ffi, schema::Schema};
+use crate::{
+    Result, check_api_call, check_api_call_no_err, column_data_collection::ColumnDataCollection,
+    connection::Connection, ffi, schema::Schema,
+};
 
 #[cfg(feature = "capi-v2-p2")]
 use crate::{Parameters, column_data_collection::ColumnDataCollection, query_result::QueryResult, value::Value};
@@ -71,10 +74,7 @@ impl Iterator for Statements {
         } else {
             Some(Ok(Statement {
                 handle: stmt_handle,
-                #[cfg(feature = "capi-v2-p2")]
-                collections: Vec::new(),
-                #[cfg(not(feature = "capi-v2-p2"))]
-                collections: std::marker::PhantomData,
+                _collections: Vec::new(),
             }))
         }
     }
@@ -88,10 +88,7 @@ impl Iterator for Statements {
 pub struct Statement<'collection> {
     /// The owned DuckDB statement handle.
     pub handle: ffi::duckdb_v2_sql_statement_handle,
-    #[cfg(feature = "capi-v2-p2")]
-    collections: Vec<&'collection ColumnDataCollection>,
-    #[cfg(not(feature = "capi-v2-p2"))]
-    collections: std::marker::PhantomData<&'collection ()>,
+    _collections: Vec<&'collection ColumnDataCollection>,
 }
 
 impl<'collection> Statement<'collection> {
@@ -117,44 +114,42 @@ impl<'collection> Statement<'collection> {
     ///
     /// Custom column names must match the collection width; otherwise DuckDB
     /// exposes the columns as `col1`, `col2`, and so on.
-    #[cfg(feature = "capi-v2-p2")]
-    pub fn add_collection<'new_collection>(
-        self,
-        name: &str,
-        collection: &'new_collection ColumnDataCollection,
-        column_names: Option<&[String]>,
-    ) -> Result<Statement<'new_collection>>
-    where
-        'collection: 'new_collection,
-    {
-        let mut statement: Statement<'new_collection> = self;
+    // pub fn add_collection<'new_collection>(
+    //     self,
+    //     name: &str,
+    //     collection: &'new_collection ColumnDataCollection,
+    //     column_names: Option<&[String]>,
+    // ) -> Result<Statement<'new_collection>>
+    // where
+    //     'collection: 'new_collection,
+    // {
+    //     let mut statement: Statement<'new_collection> = self;
 
-        statement.register_collection(name, collection, column_names)?;
-        statement.collections.push(collection);
+    //     statement.register_collection(name, collection, column_names)?;
+    //     statement.collections.push(collection);
 
-        Ok(statement)
-    }
+    //     Ok(statement)
+    // }
 
-    #[cfg(feature = "capi-v2-p2")]
-    fn register_collection(
-        &self,
-        name: &str,
-        collection: &ColumnDataCollection,
-        column_names: Option<&[String]>,
-    ) -> Result<()> {
-        let names = column_names.map_or(vec![], |v| {
-            v.iter().map(|name| name.into()).collect::<Vec<ffi::duckdb_v2_str>>()
-        });
+    // fn register_collection(
+    //     &self,
+    //     name: &str,
+    //     collection: &ColumnDataCollection,
+    //     column_names: Option<&[String]>,
+    // ) -> Result<()> {
+    //     let names = column_names.map_or(vec![], |v| {
+    //         v.iter().map(|name| name.into()).collect::<Vec<ffi::duckdb_v2_str>>()
+    //     });
 
-        check_api_call!(
-            ffi::duckdb_v2_statement_add_collection,
-            self.handle,
-            name.into(),
-            collection.handle,
-            names.as_ptr(),
-            column_names.map_or(0, |v| v.len() as u64)
-        )
-    }
+    //     check_api_call!(
+    //         ffi::duckdb_v2_statement_add_collection,
+    //         self.handle,
+    //         name.into(),
+    //         collection.handle,
+    //         names.as_ptr(),
+    //         column_names.map_or(0, |v| v.len() as u64)
+    //     )
+    // }
 
     #[cfg(feature = "capi-v2-p2")]
     /// Prepare the statement for repeated execution.

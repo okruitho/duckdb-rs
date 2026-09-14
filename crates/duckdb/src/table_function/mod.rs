@@ -12,14 +12,15 @@ use std::{any::Any, ops::Deref};
 use libduckdb_sys as ffi;
 
 use crate::{
-    Context, Result,
+    Result,
     bind_arguments::{BindArguments, BindMetadata},
     builder_helpers::{
         OpaqueHandle, context_and_connection_fn, get_bind_data, get_global_state, get_local_state, get_opaque_data_ref,
         get_user_data, handle_unwind, into_opaque,
     },
     check_api_call, check_api_call_no_err,
-    data_chunk::DataChunk,
+    connection::Context,
+    data_chunk::{DataChunk, DataChunkRef},
     expression::Expression,
     logical_type::LogicalType,
     signature::SignatureBuilder,
@@ -74,7 +75,7 @@ unsafe extern "C" fn bind_callback<T: TableFunctionCallbacks>(
             check_api_call!(
                 ffi::duckdb_v2_table_function_bind_set_bind_data,
                 info,
-                into_opaque(bind_data)
+                &mut into_opaque(bind_data)
             )?;
 
             if let Some(cardinality) = cardinality {
@@ -106,11 +107,10 @@ unsafe extern "C" fn exec_callback<T: TableFunctionCallbacks>(
             let global_state = get_global_state!(ffi::duckdb_v2_table_function_exec_get_global_state, info);
             let local_state = get_local_state!(ffi::duckdb_v2_table_function_exec_get_local_state, info);
 
-            let output_chunk = DataChunk {
-                handle: check_api_call!(ffi::duckdb_v2_table_function_exec_get_output_chunk, info, RET)?,
-                is_owned: false,
-                is_writable: true,
-            };
+            let output_chunk = DataChunkRef::new(
+                check_api_call!(ffi::duckdb_v2_table_function_exec_get_output_chunk, info, RET)?,
+                true,
+            );
 
             T::exec(
                 user_data,
@@ -526,7 +526,7 @@ pub trait TableFunctionCallbacks: Send + Sync + 'static {
         global_state: Option<&Self::GlobalState>,
         local_state: Option<&mut Self::LocalState>,
         context: Context,
-        output: DataChunk,
+        output: DataChunkRef<'_>,
     ) -> Result<()>;
 
     /// **Bind:** validate arguments, declare columns, and create shared data.
