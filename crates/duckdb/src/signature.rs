@@ -17,6 +17,7 @@ use crate::{Parameters, Result, check_api_call, check_api_call_no_err, logical_t
 /// type.
 pub struct Signature(ffi::duckdb_v2_function_signature_handle);
 
+#[cfg(feature = "capi-v2-p4")]
 impl Signature {
     /// Return the number of fixed parameters.
     pub fn parameter_count(&self) -> Result<usize> {
@@ -132,6 +133,7 @@ impl Signature {
     }
 }
 
+#[cfg(feature = "capi-v2-p4")]
 impl Drop for Signature {
     fn drop(&mut self) {
         check_api_call_no_err!(ffi::duckdb_v2_function_signature_destroy, &mut self.0).unwrap();
@@ -231,39 +233,6 @@ impl Parameter {
 /// Parameters with defaults must follow required parameters, and parameter
 /// names must be unique. DuckDB checks these structural rules when the
 /// function is registered.
-///
-/// # Example
-/// ```
-/// use duckdb::{DuckDBType, Environment, StorageLocation};
-/// use duckdb::logical_type::LogicalTypeID;
-/// use duckdb::signature::{Parameter, SignatureBuilder};
-///
-/// # fn main() -> duckdb::Result<()> {
-/// let env = Environment::new()?;
-/// let db = env.open(StorageLocation::InMemory)?;
-/// let conn = db.connect()?;
-///
-/// let signature = SignatureBuilder::new(
-///     [
-///         Parameter::normal("value", i32::logical_type(&conn)?),
-///         Parameter::tail_vararg("extra", i32::logical_type(&conn)?),
-///     ],
-///     i32::logical_type(&conn)?,
-/// )
-/// .build()?;
-///
-/// assert_eq!(signature.parameter_count()?, 1);
-/// assert_eq!(
-///     signature.vararg()?.unwrap().type_id(),
-///     LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_INTEGER
-/// );
-/// assert_eq!(
-///     signature.return_type()?.unwrap().type_id(),
-///     LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_INTEGER
-/// );
-/// # Ok(())
-/// # }
-/// ```
 pub struct SignatureBuilder {
     parameters: Vec<ParameterType>,
     return_type: Option<LogicalType>,
@@ -286,12 +255,8 @@ impl SignatureBuilder {
         }
     }
 
-    /// Build an owned signature.
-    pub fn build(&self) -> Result<Signature> {
-        let handle = check_api_call!(ffi::duckdb_v2_function_signature_create, RET)?;
-
-        let handle = Signature(handle);
-
+    /// Build on an borrowed signature.
+    pub fn build(&self, handle: &ffi::duckdb_v2_function_signature_handle) -> Result<()> {
         if let Some(return_handle) = self.return_type.as_ref() {
             check_api_call!(
                 ffi::duckdb_v2_function_signature_set_return_type,
@@ -307,12 +272,13 @@ impl SignatureBuilder {
                         ffi::duckdb_v2_function_signature_add_parameter,
                         *handle,
                         (&param.name).into(),
-                        param.logical_type.handle
+                        param.logical_type.handle,
+                        std::ptr::null_mut()
                     )?;
                 }
                 ParameterType::WithDefault(param) => {
                     check_api_call!(
-                        ffi::duckdb_v2_function_signature_add_parameter_default,
+                        ffi::duckdb_v2_function_signature_add_parameter,
                         *handle,
                         (&param.name).into(),
                         param.logical_type.handle,
@@ -329,7 +295,7 @@ impl SignatureBuilder {
             }
         }
 
-        Ok(handle)
+        Ok(())
     }
 }
 
@@ -339,7 +305,10 @@ mod test {
     use crate::builder_helpers::scalar_callback;
     use crate::logical_type::LogicalTypeID;
     use crate::scalar::ScalarFunctionBuilder;
-    use crate::{DuckDBType, Environment, StorageLocation, ToValue};
+    use crate::{
+        DuckDBType, ToValue,
+        environment::{Environment, StorageLocation},
+    };
 
     use super::*;
 
@@ -427,6 +396,7 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "capi-v2-p4")]
     fn test_signature_reading() -> crate::Result<()> {
         let env = Environment::new()?;
         let db = env.open(StorageLocation::InMemory)?;

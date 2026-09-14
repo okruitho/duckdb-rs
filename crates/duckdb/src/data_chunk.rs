@@ -11,6 +11,39 @@ use crate::{
     vector::{Unknown, Vector},
 };
 
+pub struct VectorCollection {
+    pub(crate) handles: Vec<ffi::duckdb_v2_vector_handle>,
+    pub(crate) is_writable: bool,
+}
+
+impl VectorCollection {
+    /// Return all vectors as logically untyped borrowed views.
+    pub fn vectors(&self) -> Result<Vec<Vector<Unknown>>> {
+        let mut vectors = vec![];
+
+        for handle in &self.handles {
+            vectors.push(Vector::from_handle(&handle, self.is_writable)?);
+        }
+
+        Ok(vectors)
+    }
+
+    /// Return the vector at `index`, narrowed to `T`.
+    ///
+    /// An out-of-range index or a logical type incompatible with `T` returns an
+    /// error.
+    pub fn get_vector_at<T: VectorElement>(&self, index: usize) -> Result<Vector<'_, T>> {
+        let vec = Vector::from_handle(&self.handles[index], self.is_writable)?;
+
+        vec.cast::<T>()
+    }
+
+    /// Return the number of vectors, which is the column count.
+    pub fn vectors_count(&self) -> Result<usize> {
+        Ok(self.handles.len())
+    }
+}
+
 #[derive(Debug)]
 pub struct DataChunkRef<'a> {
     handle: ffi::duckdb_v2_data_chunk_handle,

@@ -1,4 +1,7 @@
-use crate::{Context, DuckDBType, Environment, Parameters, StorageLocation, signature::Parameter};
+use crate::{
+    DuckDBType, Parameters, connection::Context, environment::Environment, environment::StorageLocation,
+    signature::Parameter,
+};
 
 use super::*;
 
@@ -30,8 +33,8 @@ impl ScalarCallbacks for ScalarWithData {
         init_data: Option<&Self::InitData>,
         _context: Context,
 
-        input: &DataChunk,
-        output: Vector<'_>,
+        input: &VectorCollection,
+        output: Vector<Unknown>,
     ) -> Result<()> {
         let mut output: Vector<'_, i32> = output.cast::<Self::ResultType>()?;
 
@@ -64,8 +67,8 @@ impl ScalarCallbacks for BasicScalarFunction {
         _bind_data: Option<&Self::BindData>,
         _init_data: Option<&Self::InitData>,
         _context: Context,
-        _input: &DataChunk,
-        output: Vector<'_>,
+        _input: &VectorCollection,
+        output: Vector<'_, Unknown>,
     ) -> Result<()> {
         let mut output: Vector<'_, i32> = output.cast::<Self::ResultType>()?;
 
@@ -87,8 +90,8 @@ impl ScalarCallbacks for BasicScalarPanicFunction {
         _init_data: Option<&Self::InitData>,
         _bind_data: Option<&Self::BindData>,
         _context: Context,
-        _input: &DataChunk,
-        _output: Vector<'_>,
+        _input: &VectorCollection,
+        _output: Vector<'_, Unknown>,
     ) -> Result<()> {
         panic!("This function panics");
     }
@@ -303,7 +306,7 @@ impl ScalarCallbacks for OverrideAbleScalar {
         _bind_data: Option<&Self::BindData>,
         _init_data: Option<&Self::InitData>,
         _context: Context,
-        _input: &DataChunk,
+        _input: &VectorCollection,
         output: Vector<'_, Unknown>,
     ) -> Result<()> {
         let mut output = output.cast::<i8>()?;

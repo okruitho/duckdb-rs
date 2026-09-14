@@ -430,7 +430,6 @@ pub(crate) use get_local_state;
 pub(crate) use get_user_data;
 
 #[cfg(test)]
-#[cfg(feature = "capi-v2-p2")]
 macro_rules! scalar_callback {
     ($name:ident, $result_type:ty, |$input:ident, $result:ident, $ctx:ident, $user_data:ident| $body:block) => {
         struct $name;
@@ -444,21 +443,15 @@ macro_rules! scalar_callback {
                 &self,
                 _bind_data: Option<&Self::BindData>,
                 _init_data: Option<&Self::InitData>,
-                $ctx: $crate::connection::Extension,
-                $input: &$crate::data_chunk::DataChunk,
-                $result: $crate::vector::Vector<'_>,
+                $ctx: $crate::connection::Context,
+                $input: &$crate::data_chunk::VectorCollection,
+                $result: $crate::vector::Vector<crate::vector::Unknown>,
             ) -> $crate::Result<()> {
                 let $result = $result.cast::<Self::ResultType>()?;
                 $body
             }
         }
     };
-}
-
-#[cfg(not(feature = "capi-v2-p2"))]
-#[cfg(test)]
-macro_rules! scalar_callback {
-    ($name:ident, $result_type:ty, |$input:ident, $result:ident, $ctx:ident, $user_data:ident| $body:block) => {};
 }
 
 #[cfg(test)]

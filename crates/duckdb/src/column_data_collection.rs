@@ -73,7 +73,7 @@ impl Drop for SharedScanState {
 ///
 /// # Example
 /// ```
-/// use duckdb::{DuckDBType, Environment, StorageLocation};
+/// use duckdb::{DuckDBType, environment::{Environment, StorageLocation}};
 /// use duckdb::column_data_collection::ColumnDataCollection;
 /// use duckdb::data_chunk::DataChunk;
 ///

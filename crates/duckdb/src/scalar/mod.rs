@@ -9,29 +9,29 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::ops::Deref;
 
-use libduckdb_sys::{self as ffi};
+use libduckdb_sys::{self as ffi, duckdb_v2_str};
 
-use crate::bind_arguments::BindMetadata;
+use crate::bind_arguments::{BindMetadata, BindType};
 use crate::builder_helpers::{
     OpaqueHandle, context_and_connection_fn, get_bind_data, get_init_data, get_user_data, handle_unwind, into_opaque,
 };
-use crate::data_chunk::DataChunk;
+use crate::data_chunk::{DataChunk, VectorCollection};
 use crate::enums::FunctionProperty;
 use crate::logical_type::LogicalType;
 use crate::signature::SignatureBuilder;
 use crate::vector::{Unknown, Vector, VectorElement};
-use crate::{Context, Result, check_api_call, check_api_call_no_err};
+use crate::{Result, check_api_call, check_api_call_no_err, connection::Context};
 
-struct ScalarFunctionBuilderHandle(ffi::duckdb_v2_scalar_function_builder_handle);
+struct ScalarFunctionBuilderHandle(ffi::duckdb_v2_scalar_function_handle);
 
 impl Drop for ScalarFunctionBuilderHandle {
     fn drop(&mut self) {
-        check_api_call_no_err!(ffi::duckdb_v2_scalar_function_builder_destroy, &mut self.0).unwrap();
+        check_api_call_no_err!(ffi::duckdb_v2_scalar_function_destroy, &mut self.0).unwrap();
     }
 }
 
 impl Deref for ScalarFunctionBuilderHandle {
-    type Target = ffi::duckdb_v2_scalar_function_builder_handle;
+    type Target = ffi::duckdb_v2_scalar_function_handle;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -46,7 +46,9 @@ unsafe extern "C" fn bind_callback<T: ScalarCallbacks>(
         || {
             let user_data = get_user_data!(ffi::duckdb_v2_scalar_function_bind_get_user_data, info);
 
-            let metadata = BindMetadata::from_scalar(&info)?;
+            let metadata = BindMetadata {
+                bind_type: BindType::Scalar(&info),
+            };
 
             let result = T::bind(
                 user_data,
@@ -58,7 +60,7 @@ unsafe extern "C" fn bind_callback<T: ScalarCallbacks>(
             check_api_call!(
                 ffi::duckdb_v2_scalar_function_bind_set_bind_data,
                 info,
-                into_opaque(result)
+                &mut into_opaque(result)
             )?;
 
             Ok(())
@@ -83,7 +85,7 @@ unsafe extern "C" fn init_callback<T: ScalarCallbacks>(
             check_api_call!(
                 ffi::duckdb_v2_scalar_function_init_set_init_data,
                 info,
-                into_opaque(result)
+                &mut into_opaque(result)
             )?;
 
             Ok(())
@@ -109,11 +111,17 @@ unsafe extern "C" fn exec_callback<T: ScalarCallbacks>(
 
             let result_vec = Vector::from_handle(&result_handle, true)?;
 
-            let input_handle = check_api_call!(ffi::duckdb_v2_scalar_function_exec_get_input, info, RET)?;
+            let arg_count = check_api_call!(ffi::duckdb_v2_scalar_function_exec_get_arg_count, info, RET)? as usize;
 
-            let data_chunk = DataChunk {
-                handle: input_handle,
-                is_owned: false,
+            let mut handles = Vec::with_capacity(arg_count);
+
+            for i in 0..arg_count {
+                let handle = check_api_call!(ffi::duckdb_v2_scalar_function_exec_get_arg, info, i as u32, RET)?;
+                handles.push(handle);
+            }
+
+            let collection = VectorCollection {
+                handles: handles,
                 is_writable: false,
             };
 
@@ -122,7 +130,7 @@ unsafe extern "C" fn exec_callback<T: ScalarCallbacks>(
                 bind_data,
                 init_data,
                 Context(context),
-                &data_chunk,
+                &collection,
                 result_vec,
             )?;
 
@@ -178,70 +186,65 @@ impl<T: ScalarCallbacks> ScalarFunctionBuilder<T> {
         self
     }
 
-    fn build(&self) -> Result<ScalarFunctionBuilderHandle> {
-        let handle = ScalarFunctionBuilderHandle(check_api_call!(ffi::duckdb_v2_scalar_function_builder_create, RET)?);
+    fn build(&self, handle: &ScalarFunctionBuilderHandle) -> Result<()> {
+        let signature = check_api_call!(ffi::duckdb_v2_scalar_function_get_signature, **handle, RET)?;
+
+        self.signature.build(&signature)?;
 
         check_api_call!(
-            ffi::duckdb_v2_scalar_function_builder_set_signature,
-            *handle,
-            *self.signature.build()?
-        )?;
-
-        check_api_call!(
-            ffi::duckdb_v2_scalar_function_builder_set_name,
-            *handle,
-            (&self.name).into()
+            ffi::duckdb_v2_scalar_function_set_name,
+            **handle,
+            &mut (&self.name).into()
         )?;
 
         for (key, value) in &self.properties {
-            check_api_call!(
-                ffi::duckdb_v2_scalar_function_builder_set_property,
-                *handle,
-                *key,
-                *value
-            )?;
+            check_api_call!(ffi::duckdb_v2_scalar_function_set_property, **handle, *key, *value)?;
         }
 
         check_api_call!(
-            ffi::duckdb_v2_scalar_function_builder_set_user_data,
-            *handle,
-            self.user_data.to_handle()
+            ffi::duckdb_v2_scalar_function_set_user_data,
+            **handle,
+            &mut self.user_data.to_handle()
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_scalar_function_builder_set_bind_callback,
-            *handle,
+            ffi::duckdb_v2_scalar_function_set_bind_callback,
+            **handle,
             Some(bind_callback::<T>)
         )?;
         check_api_call!(
-            ffi::duckdb_v2_scalar_function_builder_set_init_callback,
-            *handle,
+            ffi::duckdb_v2_scalar_function_set_init_callback,
+            **handle,
             Some(init_callback::<T>)
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_scalar_function_builder_set_exec_callback,
-            *handle,
+            ffi::duckdb_v2_scalar_function_set_exec_callback,
+            **handle,
             Some(exec_callback::<T>)
         )?;
 
-        Ok(handle)
+        Ok(())
     }
 
     context_and_connection_fn! {
         /// Register the function through a connection or callback context.
-        pub fn register_with_[context, connection](self) -> Result<()>
+        pub fn register_with_[extension, connection](self) -> Result<()>
         {
-            context_fn: ffi::duckdb_v2_scalar_function_builder_register_with_context,
-            connection_fn: ffi::duckdb_v2_scalar_function_builder_register_with_connection,
+            extension_fn: ffi::duckdb_v2_scalar_function_create_with_extension,
+            connection_fn: ffi::duckdb_v2_scalar_function_create_with_connection,
         }
-        let builder_handle = self.build()?;
-
-        check_api_call!(
+        let handle =        ScalarFunctionBuilderHandle(check_api_call!(
             api_fn!(),
             **api_arg!(),
-            *builder_handle
-        )
+            RET
+        )?);
+
+        self.build(&handle)?;
+
+        check_api_call!(ffi::duckdb_v2_scalar_function_register, *handle)?;
+
+        Ok(())
     }
 }
 
@@ -278,7 +281,7 @@ pub trait ScalarCallbacks: Send + Sync + 'static {
         bind_data: Option<&Self::BindData>,
         init_data: Option<&Self::InitData>,
         context: Context,
-        input: &DataChunk,
+        vectors: &VectorCollection,
         output: Vector<'_, Unknown>,
     ) -> Result<()>;
 }

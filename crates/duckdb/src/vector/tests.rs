@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+
 use crate::{
-    Parameters,
+    Parameters, ToValue,
     builder_helpers::scalar_callback,
     data_chunk::DataChunk,
     environment::{Environment, StorageLocation},
@@ -7,8 +9,10 @@ use crate::{
     types::{
         Array, BigNum, BigNumValue, BitValue, BlobValue, DateValue, Decimal, DecimalValue, DuckDBType, IntervalValue,
         Map, Struct, TimeNsValue, TimeTzValue, TimeValue, TimestampMsValue, TimestampNsValue, TimestampSecValue,
-        TimestampTzNsValue, TimestampTzValue, TimestampValue, Union, UuidValue,
+        TimestampTzNsValue, TimestampTzValue, TimestampValue, Union, UuidValue, structs::StructWrite,
+        union::UnionWriter,
     },
+    vector::{StorageKind, Unknown},
 };
 
 #[cfg(feature = "capi-v2-p2")]
@@ -70,7 +74,7 @@ scalar_callback!(UpperScalar, String, |input, output, _ctx, _user_data| {
 
 scalar_callback!(
     MapScalar,
-    crate::vector::Map<i32, String>,
+    Map<i32, String>,
     |input, result, _ctx, _user_data| {
     let keys = input.get_vector_at::<i32>(0)?;
     let values = input.get_vector_at::<String>(1)?;
@@ -143,7 +147,11 @@ scalar_callback!(StructScalar, Struct, |input, output, _ctx, _user_data| {
     for (index, (key, value)) in rows.iter().enumerate() {
         output.write(
             index,
-            Some(StructWrite::new().field::<i32>(Some(*key)).field::<String>(Some(value))),
+            Some(
+                StructWrite::default()
+                    .field::<i32>(Some(*key))
+                    .field::<String>(Some(value)),
+            ),
         )?;
     }
     for (row, (key, value)) in output.iter()?.zip(rows) {
@@ -163,8 +171,10 @@ scalar_callback!(ConstantScalar, i32, |_input, result, ctx, _user_data| {
 });
 
 scalar_callback!(SequenceScalar, i32, |input, result, _ctx, _user_data| {
+    let input_len = input.get_vector_at::<Unknown>(0)?.len();
+
     let mut result = result;
-    result.make_sequence(42, 10, input.row_count()?)?;
+    result.make_sequence(42, 10, input_len)?;
     Ok(())
 });
 

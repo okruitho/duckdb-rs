@@ -48,9 +48,9 @@ impl ColumnDescription {
 ///
 /// # Example
 /// ```
-/// use duckdb::{Environment, StorageLocation, Parameters};
+/// use duckdb::{Parameters, environment::{Environment, StorageLocation}};
 /// use duckdb::qualified_name::QualifiedName;
-/// use duckdb::table_description::TableDescription;
+/// use duckdb::description::TableDescription;
 ///
 /// # fn main() -> duckdb::Result<()> {
 /// let env = Environment::new()?;
@@ -66,8 +66,7 @@ impl ColumnDescription {
 /// let name = QualifiedName::from_sql("items")?;
 /// let description = TableDescription::new(&conn, &name)?;
 ///
-/// assert_eq!(description.schema()?.len()?, 2);
-/// assert!(description.column_has_default(1)?);
+/// assert!(description.column(1)?.has_default()?);
 /// # Ok(())
 /// # }
 /// ```

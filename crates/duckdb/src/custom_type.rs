@@ -18,7 +18,7 @@ use crate::{
 ///
 /// # Example
 /// ```
-/// use duckdb::{DuckDBType, Environment, StorageLocation};
+/// use duckdb::{DuckDBType, environment::{Environment, StorageLocation}};
 /// use duckdb::custom_type::CustomType;
 ///
 /// # fn main() -> duckdb::Result<()> {
@@ -29,7 +29,7 @@ use crate::{
 /// let temperature = CustomType::new("TEMPERATURE", i32::logical_type(&conn)?)?;
 /// temperature.register_with_connection(&conn)?;
 ///
-/// let logical_type = i32::logical_type(&conn)?.to_alias("TEMPERATURE")?;
+/// let logical_type = i32::logical_type(&conn)?.to_alias_with_connection(&conn, "TEMPERATURE")?;
 /// assert_eq!(logical_type.to_string()?, "TEMPERATURE");
 /// # Ok(())
 /// # }

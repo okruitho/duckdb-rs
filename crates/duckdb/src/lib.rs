@@ -74,15 +74,12 @@ pub mod expression;
 // #[cfg(feature = "capi-v2-p2")]
 pub mod description;
 pub mod file;
-#[cfg(feature = "capi-v2-p2")]
 pub mod log;
 pub mod qualified_name;
 #[cfg(feature = "capi-v2-p2")]
 pub mod query_progress;
 pub mod replacement_scan;
-#[cfg(feature = "capi-v2-p2")]
 pub mod scalar;
-#[cfg(feature = "capi-v2-p2")]
 pub mod signature;
 #[cfg(feature = "capi-v2-p2")]
 pub mod table_function;
