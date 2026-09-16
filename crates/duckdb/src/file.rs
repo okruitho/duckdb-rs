@@ -1,6 +1,8 @@
 //! File access through DuckDB's file system.
 
-use crate::{Result, builder_helpers::context_and_connection_fn, check_api_call, check_api_call_no_err, ffi};
+use crate::{
+    Result, builder_helpers::context_and_connection_fn, check_api_call, check_api_call_no_err, ffi, value::Value,
+};
 
 /// A borrowed handle to DuckDB's file system.
 pub struct FileSystem {
@@ -110,6 +112,16 @@ impl<'a> FileBuilder<'a> {
             ffi::duckdb_v2_file_open_options_set_flag,
             self.handle,
             ffi::DUCKDB_V2_FILE_FLAG::DUCKDB_V2_FILE_FLAG_PARALLEL_ACCESS
+        )?;
+        Ok(self)
+    }
+
+    pub fn set_value(self, name: &str, value: &Value) -> Result<Self> {
+        check_api_call!(
+            ffi::duckdb_v2_file_open_options_set_value,
+            self.handle,
+            name.into(),
+            **value
         )?;
         Ok(self)
     }

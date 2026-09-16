@@ -8,7 +8,7 @@
 //! chunks. A type may implement either trait, or both to support the format's
 //! name on both sides of `COPY`. Register with [`CopyFunctionBuilder`].
 
-use std::{any::Any, ops::Deref};
+use std::{any::Any, collections::HashMap, ops::Deref};
 
 use crate::{
     Result,
@@ -37,12 +37,11 @@ unsafe extern "C" fn bind_to_callback<T: CopyToFunctionCallbacks>(
 ) {
     handle_unwind(
         || {
-            let column_info = ColumnInfo { handle: info };
-            let logical_types = column_info.logical_types()?;
-
+            let bind_info = CopyToBindInfo { handle: info };
             let user_data = get_user_data!(ffi::duckdb_v2_copy_to_bind_get_user_data, info);
+            let logical_types = bind_info.logical_types()?;
 
-            let bind_data = T::bind(user_data, Context(context), column_info)?;
+            let bind_data = T::bind(user_data, Context(context), bind_info)?;
 
             check_api_call!(
                 ffi::duckdb_v2_copy_to_bind_set_bind_data,
@@ -71,11 +70,9 @@ unsafe extern "C" fn init_to_callback<T: CopyToFunctionCallbacks>(
             let bind_data = check_api_call!(ffi::duckdb_v2_copy_to_init_get_bind_data, info, RET)?;
             let bind_data = unsafe { get_opaque_data_ref::<CopyFunctionBindData<T::BindData>>(bind_data) }.unwrap();
 
-            let mut file_path = ffi::duckdb_v2_str::default();
+            let file_path = check_api_call!(ffi::duckdb_v2_copy_to_init_get_file_path, info, RET).map(|x| x.into())?;
 
-            check_api_call!(ffi::duckdb_v2_copy_to_init_get_file_path, info, &mut file_path)?;
-
-            let init_data = T::init(user_data, Context(context), &bind_data.data, file_path.into())?;
+            let init_data = T::init(user_data, Context(context), &bind_data.data, file_path)?;
 
             check_api_call!(
                 ffi::duckdb_v2_copy_to_init_set_init_data,
@@ -117,6 +114,28 @@ unsafe extern "C" fn batch_to_callback<T: CopyToFunctionCallbacks>(
             )?;
 
             Ok(())
+        },
+        err,
+    );
+}
+
+unsafe extern "C" fn batch_size_callback<T: CopyToFunctionCallbacks>(
+    info: ffi::duckdb_v2_copy_to_batch_size_info_handle,
+    context: ffi::duckdb_v2_context_handle,
+    err: *mut ffi::duckdb_v2_error_info_handle,
+) {
+    handle_unwind(
+        || {
+            let user_data = get_user_data!(ffi::duckdb_v2_copy_to_batch_size_get_user_data, info);
+            let bind_data = get_bind_data!(ffi::duckdb_v2_copy_to_batch_size_get_bind_data, info).unwrap();
+
+            let target = T::batch_size(user_data, Context(context), &bind_data);
+
+            if let Some(target) = target {
+                check_api_call!(ffi::duckdb_v2_copy_to_batch_size_set_target, info, target as u64)
+            } else {
+                Ok(())
+            }
         },
         err,
     );
@@ -249,6 +268,12 @@ impl<T: CopyToFunctionCallbacks> CopyFunctionBuilder<T> {
         )?;
 
         check_api_call!(
+            ffi::duckdb_v2_copy_to_set_batch_size_callback,
+            **handle,
+            Some(batch_size_callback::<T>)
+        )?;
+
+        check_api_call!(
             ffi::duckdb_v2_copy_to_set_finalize_callback,
             **handle,
             Some(finalize_to_callback::<T>)
@@ -363,11 +388,11 @@ impl<T: CopyToFunctionCallbacks + CopyFromFunctionCallbacks> CopyFunctionBuilder
 ///
 /// Column order matches the input relation being copied. Returned logical
 /// types are owned copies.
-pub struct ColumnInfo {
+pub struct CopyToBindInfo {
     handle: ffi::duckdb_v2_copy_to_bind_info_handle,
 }
 
-impl ColumnInfo {
+impl CopyToBindInfo {
     fn logical_types(&self) -> Result<Vec<LogicalType>> {
         (0..self.len()?)
             .map(|index| self.get_column(index).map(|(_, logical_type)| logical_type))
@@ -412,51 +437,27 @@ impl ColumnInfo {
 
         Ok((name.into(), logical_type))
     }
-}
 
-/// Callback lifecycle for a user-defined `COPY TO` format.
-///
-/// DuckDB binds the input columns, initializes one output file, prepares input
-/// batches, flushes each prepared batch, and finalizes the file.
-///
-/// A type may also implement [`CopyFromFunctionCallbacks`] to support `COPY
-/// ... FROM` under the same format name; register both sides at once with
-/// [`CopyFunctionBuilder::register_to_and_from_with_connection`] or
-/// [`CopyFunctionBuilder::register_to_and_from_with_extension`].
-pub trait CopyToFunctionCallbacks: Send + Sync + 'static {
-    /// State created once for the bound copy operation.
-    type InitData: Any + Send + Sync;
-    /// Data resolved while binding the input columns.
-    type BindData: Any + Send + Sync;
-    /// A prepared batch passed from [`Self::batch`] to [`Self::flush`].
-    type BatchData: Any + Send + Sync;
+    pub fn file_path(&self) -> Result<String> {
+        check_api_call!(ffi::duckdb_v2_copy_to_bind_get_file_path, self.handle, RET).map(|x| x.into())
+    }
 
-    /// **Bind:** inspect the input columns and create shared bind data.
-    fn bind(&self, context: Context, column_info: ColumnInfo) -> Result<Self::BindData>;
+    fn option_count(&self) -> Result<usize> {
+        check_api_call!(ffi::duckdb_v2_copy_to_bind_get_option_count, self.handle, RET).map(|x| x as usize)
+    }
 
-    /// **Initialize:** open the output path and create file-level state.
-    fn init(&self, _context: Context, _bind_data: &Self::BindData, file_path: &str) -> Result<Self::InitData>;
+    pub fn options(&self) -> Result<HashMap<String, Value>> {
+        let len = self.option_count()?;
+        let mut items: HashMap<String, Value> = HashMap::with_capacity(len);
 
-    /// **Batch:** prepare one input collection for flushing.
-    fn batch(
-        &self,
-        _context: Context,
-        _bind_data: &Self::BindData,
-        _init_data: &Self::InitData,
-        input: ColumnDataCollection,
-    ) -> Result<Self::BatchData>;
+        for i in 0..len {
+            let name = check_api_call!(ffi::duckdb_v2_copy_to_bind_get_option_name, self.handle, i as u64, RET)?;
+            let handle = check_api_call!(ffi::duckdb_v2_copy_to_bind_get_option_value, self.handle, i as u64, RET)?;
 
-    /// **Flush:** write one prepared batch to the output.
-    fn flush(
-        &self,
-        _context: Context,
-        _bind_data: &Self::BindData,
-        _init_data: &Self::InitData,
-        _batch_data: &Self::BatchData,
-    ) -> Result<()>;
-
-    /// **Finalize:** finish and close the output after all batches are flushed.
-    fn finalize(&self, _context: Context, _bind_data: &Self::BindData, _init_data: &Self::InitData) -> Result<()>;
+            items.insert(name.into(), Value { handle });
+        }
+        Ok(items)
+    }
 }
 
 unsafe extern "C" fn bind_from_callback<T: CopyFromFunctionCallbacks>(
@@ -757,6 +758,55 @@ pub trait CopyFromFunctionCallbacks: Send + Sync + 'static {
     ) -> Result<Option<f64>> {
         Ok(None)
     }
+}
+
+/// Callback lifecycle for a user-defined `COPY TO` format.
+///
+/// DuckDB binds the input columns, initializes one output file, prepares input
+/// batches, flushes each prepared batch, and finalizes the file.
+///
+/// A type may also implement [`CopyFromFunctionCallbacks`] to support `COPY
+/// ... FROM` under the same format name; register both sides at once with
+/// [`CopyFunctionBuilder::register_to_and_from_with_connection`] or
+/// [`CopyFunctionBuilder::register_to_and_from_with_extension`].
+pub trait CopyToFunctionCallbacks: Send + Sync + 'static {
+    /// State created once for the bound copy operation.
+    type InitData: Any + Send + Sync;
+    /// Data resolved while binding the input columns.
+    type BindData: Any + Send + Sync;
+    /// A prepared batch passed from [`Self::batch`] to [`Self::flush`].
+    type BatchData: Any + Send + Sync;
+
+    /// **Bind:** inspect the input columns and create shared bind data.
+    fn bind(&self, context: Context, bind_info: CopyToBindInfo) -> Result<Self::BindData>;
+
+    /// **Initialize:** open the output path and create file-level state.
+    fn init(&self, _context: Context, _bind_data: &Self::BindData, file_path: &str) -> Result<Self::InitData>;
+
+    /// **Batch:** prepare one input collection for flushing.
+    fn batch(
+        &self,
+        _context: Context,
+        _bind_data: &Self::BindData,
+        _init_data: &Self::InitData,
+        input: ColumnDataCollection,
+    ) -> Result<Self::BatchData>;
+
+    fn batch_size(&self, context: Context, bind_data: &Self::BindData) -> Option<usize> {
+        return None;
+    }
+
+    /// **Flush:** write one prepared batch to the output.
+    fn flush(
+        &self,
+        _context: Context,
+        _bind_data: &Self::BindData,
+        _init_data: &Self::InitData,
+        _batch_data: &Self::BatchData,
+    ) -> Result<()>;
+
+    /// **Finalize:** finish and close the output after all batches are flushed.
+    fn finalize(&self, _context: Context, _bind_data: &Self::BindData, _init_data: &Self::InitData) -> Result<()>;
 }
 
 #[cfg(test)]

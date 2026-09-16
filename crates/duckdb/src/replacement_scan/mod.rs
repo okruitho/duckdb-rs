@@ -6,6 +6,7 @@ use crate::{
     Result,
     builder_helpers::{OpaqueHandle, get_user_data, handle_unwind},
     check_api_call,
+    column_data_collection::ColumnDataCollection,
     connection::{Connection, Context, Extension},
     database::Database,
     error::check_api_call_no_err,
@@ -20,6 +21,12 @@ use crate::{
 /// before returning are passed to that table function.
 pub struct ReplacementHandle<'a> {
     info: &'a ffi::duckdb_v2_replacement_scan_info_handle,
+}
+
+pub enum ReplacementType {
+    Table(QualifiedName),
+    ColumnDataCollection((ColumnDataCollection, Vec<String>)),
+    Subquery(String),
 }
 
 impl<'a> ReplacementHandle<'a> {
@@ -39,8 +46,30 @@ impl<'a> ReplacementHandle<'a> {
     }
 
     /// Claim the reference with a table function.
-    pub fn set_function_name(&self, name: &QualifiedName) -> Result<()> {
-        check_api_call!(ffi::duckdb_v2_replacement_scan_set_function_name, *self.info, **name,)
+    pub fn set_reference(&self, replacement_type: ReplacementType) -> Result<()> {
+        match replacement_type {
+            ReplacementType::Table(name) => {
+                check_api_call!(ffi::duckdb_v2_replacement_scan_set_function_name, *self.info, *name)
+            }
+            ReplacementType::ColumnDataCollection((cdc, names)) => check_api_call!(
+                ffi::duckdb_v2_replacement_scan_set_collection,
+                *self.info,
+                *cdc,
+                (&names).iter().map(|n| n.into()).collect::<Vec<_>>().as_ptr(),
+                names.len() as u64
+            ),
+            ReplacementType::Subquery(query) => {
+                check_api_call!(
+                    ffi::duckdb_v2_replacement_scan_set_subquery,
+                    *self.info,
+                    (&query).into()
+                )
+            }
+        }
+    }
+
+    pub fn set_alias(&self, name: &str) -> Result<()> {
+        check_api_call!(ffi::duckdb_v2_replacement_scan_set_alias, *self.info, name.into())
     }
 }
 
@@ -174,10 +203,9 @@ mod tests {
     use crate::{
         Parameters, Result, ToValue,
         connection::Context,
-        environment::Environment,
-        environment::StorageLocation,
+        environment::{Environment, StorageLocation},
         qualified_name::QualifiedName,
-        replacement_scan::{ReplacementHandle, ReplacementScanBuilder, ReplacementScanCallbacks},
+        replacement_scan::{ReplacementHandle, ReplacementScanBuilder, ReplacementScanCallbacks, ReplacementType},
     };
 
     struct CustomReplacementScan {
@@ -203,7 +231,7 @@ mod tests {
 
                 dbg!(&split);
 
-                replacement.set_function_name(&"range".try_into()?)?;
+                replacement.set_reference(ReplacementType::Table("range".try_into()?))?;
                 replacement.add_parameter(split[0].value(&context)?)?;
                 replacement.add_parameter((split[1] + self.count).value(&context)?)?;
             }
@@ -222,7 +250,7 @@ mod tests {
                 assert!(view.catalog.is_none());
                 assert!(view.schema.is_none());
 
-                replacement.set_function_name(&"test_all_types".try_into()?)?;
+                replacement.set_reference(ReplacementType::Table("test_all_types".try_into()?))?;
                 replacement.add_parameter_with_name("use_large_bignum", true.value(&context)?)?;
                 replacement.add_parameter_with_name("use_large_enum", false.value(&context)?)?;
             }

@@ -102,13 +102,10 @@ unsafe extern "C" fn exec_callback<T: ScalarCallbacks>(
     handle_unwind(
         || {
             let user_data = get_user_data!(ffi::duckdb_v2_scalar_function_exec_get_user_data, info);
-
             let bind_data = get_bind_data!(ffi::duckdb_v2_scalar_function_exec_get_bind_data, info);
-
             let init_data = get_init_data!(ffi::duckdb_v2_scalar_function_exec_get_init_data, info);
 
             let result_handle = check_api_call!(ffi::duckdb_v2_scalar_function_exec_get_result, info, RET)?;
-
             let result_vec = Vector::from_handle(&result_handle, true)?;
 
             let arg_count = check_api_call!(ffi::duckdb_v2_scalar_function_exec_get_arg_count, info, RET)? as usize;

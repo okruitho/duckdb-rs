@@ -43,11 +43,11 @@ impl<T: Display + Send + Sync + 'static> AggregateCallbacks for BasicAggregate<T
         Ok(bind_data)
     }
 
-    fn init(&self) -> crate::Result<Self::StateItem> {
+    fn init(&self, bind_data: Option<&Self::BindData>) -> crate::Result<Self::StateItem> {
         Ok(vec![])
     }
 
-    fn size(&self) -> crate::Result<usize> {
+    fn size(&self, bind_data: Option<&Self::BindData>) -> crate::Result<usize> {
         Ok(std::mem::size_of::<Self::StateItem>())
     }
 

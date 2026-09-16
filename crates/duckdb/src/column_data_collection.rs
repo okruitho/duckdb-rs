@@ -112,6 +112,13 @@ pub struct ColumnDataCollection {
     pub logical_types: Vec<LogicalType>,
 }
 
+impl Deref for ColumnDataCollection {
+    type Target = ffi::duckdb_v2_column_data_collection_handle;
+    fn deref(&self) -> &Self::Target {
+        &self.handle
+    }
+}
+
 impl ColumnDataCollection {
     context_and_connection_fn! {
         /// Create an empty collection using a connection or callback context's allocator.

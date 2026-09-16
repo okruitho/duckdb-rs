@@ -31,17 +31,25 @@ impl<'a> From<DuckDBStr<'a>> for &'a str {
     }
 }
 
+impl<'a> From<DuckDBStr<'a>> for String {
+    fn from(value: DuckDBStr<'a>) -> Self {
+        let s: &str = value.into();
+
+        s.to_string()
+    }
+}
+
 impl<'a> From<&'a duckdb_v2_bytes> for &'a str {
     fn from(value: &'a duckdb_v2_bytes) -> Self {
         unsafe {
             if value.value.inlined.length <= 12 {
                 let len = value.value.inlined.length as usize;
                 let bytes: &[u8] = std::slice::from_raw_parts(value.value.inlined.inlined.as_ptr() as *const u8, len);
-                std::str::from_utf8(bytes).unwrap()
+                std::str::from_utf8_unchecked(bytes)
             } else {
                 let len = value.value.pointer.length as usize;
                 let bytes = std::slice::from_raw_parts(value.value.pointer.ptr as *const u8, len);
-                std::str::from_utf8(bytes).unwrap()
+                std::str::from_utf8_unchecked(bytes)
             }
         }
     }

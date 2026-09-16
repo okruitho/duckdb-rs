@@ -136,8 +136,9 @@ unsafe extern "C" fn size_callback<T: AggregateCallbacks>(
     handle_unwind(
         || {
             let user_data = get_user_data!(ffi::duckdb_v2_aggregate_function_size_get_user_data, info);
+            let bind_data = get_bind_data!(ffi::duckdb_v2_aggregate_function_size_get_bind_data, info);
 
-            let size = T::size(user_data)?;
+            let size = T::size(user_data, bind_data)?;
 
             check_api_call!(ffi::duckdb_v2_aggregate_function_size_set_state_size, info, size as u64)
         },
@@ -152,6 +153,7 @@ unsafe extern "C" fn init_callback<T: AggregateCallbacks>(
     handle_unwind(
         || {
             let user_data = get_user_data!(ffi::duckdb_v2_aggregate_function_init_get_user_data, info);
+            let bind_data = get_bind_data!(ffi::duckdb_v2_aggregate_function_init_get_bind_data, info);
 
             let state_count = check_api_call!(ffi::duckdb_v2_aggregate_function_init_get_state_count, info, RET)?;
 
@@ -161,7 +163,7 @@ unsafe extern "C" fn init_callback<T: AggregateCallbacks>(
                 unsafe { std::slice::from_raw_parts(states_ptr as *mut *mut T::StateItem, state_count as usize) };
 
             for &state_ptr in states {
-                let data = T::init(user_data)?;
+                let data = T::init(user_data, bind_data)?;
 
                 unsafe {
                     state_ptr.write(data);
@@ -459,12 +461,12 @@ pub trait AggregateCallbacks: Send + Sync + 'static {
     fn bind(&self, context: Context, metadata: Vec<BindView>) -> Result<Self::BindData>;
 
     /// **Size:** return the allocation size of one aggregate state.
-    fn size(&self) -> Result<usize> {
+    fn size(&self, _bind_data: Option<&Self::BindData>) -> Result<usize> {
         Ok(size_of::<Self::StateItem>())
     }
 
     /// **Initialize:** create one empty aggregate state.
-    fn init(&self) -> Result<Self::StateItem>;
+    fn init(&self, bind_data: Option<&Self::BindData>) -> Result<Self::StateItem>;
 
     /// **Update:** apply an input batch to its corresponding aggregate states.
     fn update(

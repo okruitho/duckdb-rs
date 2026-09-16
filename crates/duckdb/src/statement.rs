@@ -3,8 +3,12 @@
 use libduckdb_sys::DuckDBStr;
 
 use crate::{
-    Parameters, Result, check_api_call, check_api_call_no_err, connection::Connection, ffi, query_result::QueryResult,
+    Parameters, Result, check_api_call, check_api_call_no_err,
+    connection::Connection,
+    ffi,
+    query_result::{QueryResult, StatementType},
     schema::Schema,
+    signature::Parameter,
 };
 
 /// Schemas resolved while binding a statement.
@@ -122,6 +126,29 @@ impl Statement {
             connection: conn,
             handle: prepared_handle,
         })
+    }
+
+    pub fn get_text(&self) -> Result<String> {
+        check_api_call!(ffi::duckdb_v2_sql_statement_get_text, self.handle, RET).map(|x| x.into())
+    }
+
+    pub fn get_type(&self) -> Result<StatementType> {
+        let val = check_api_call!(ffi::duckdb_v2_sql_statement_get_type, self.handle, RET)?;
+        val.try_into()
+    }
+
+    pub fn parameter_count(&self) -> Result<usize> {
+        check_api_call!(ffi::duckdb_v2_sql_statement_get_parameter_count, self.handle, RET).map(|x| x as usize)
+    }
+
+    pub fn parameter_name(&self, index: usize) -> Result<String> {
+        check_api_call!(
+            ffi::duckdb_v2_sql_statement_get_parameter_name,
+            self.handle,
+            index as u64,
+            RET
+        )
+        .map(|x| x.into())
     }
 }
 
