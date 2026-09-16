@@ -1,10 +1,8 @@
 //! Bind-time metadata for scalar, aggregate, and table functions.
 
-use std::marker::PhantomData;
-
 use libduckdb_sys as ffi;
 
-use crate::{Result, check_api_call, logical_type::LogicalType, value::Value};
+use crate::{Result, check_api_call, error::DuckDBError, logical_type::LogicalType, value::Value};
 
 pub(crate) enum BindType<'a> {
     Scalar(&'a ffi::duckdb_v2_scalar_function_bind_info_handle),
@@ -22,7 +20,7 @@ pub struct BindMetadata<'a> {
 
 pub struct BindView {
     pub logical_type: LogicalType,
-    pub value: Value,
+    pub value: Option<Value>,
 }
 
 impl<'a> BindMetadata<'a> {
@@ -46,13 +44,22 @@ impl<'a> BindMetadata<'a> {
             let logical_type = LogicalType {
                 handle: check_api_call!(ffi::duckdb_v2_scalar_function_bind_get_arg_type, *handle, i as u64, RET)?,
             };
-            let value = Value {
-                handle: check_api_call!(
-                    ffi::duckdb_v2_scalar_function_bind_get_arg_value,
-                    *handle,
-                    i as u64,
-                    RET
-                )?,
+
+            let value_handle = check_api_call!(
+                ffi::duckdb_v2_scalar_function_bind_get_arg_value,
+                *handle,
+                i as u64,
+                RET
+            );
+            let value = match value_handle {
+                Ok(v) => Some(Value { handle: v }),
+                Err(e) => {
+                    if e.code == DuckDBError::DUCKDB_V2_ERROR_QUERY_BINDER {
+                        None
+                    } else {
+                        return Err(e);
+                    }
+                }
             };
 
             bind_views.push(BindView { logical_type, value });
@@ -78,13 +85,21 @@ impl<'a> BindMetadata<'a> {
                     RET
                 )?,
             };
-            let value = Value {
-                handle: check_api_call!(
-                    ffi::duckdb_v2_aggregate_function_bind_get_arg_value,
-                    *handle,
-                    i as u64,
-                    RET
-                )?,
+            let value_handle = check_api_call!(
+                ffi::duckdb_v2_aggregate_function_bind_get_arg_value,
+                *handle,
+                i as u64,
+                RET
+            );
+            let value = match value_handle {
+                Ok(v) => Some(Value { handle: v }),
+                Err(e) => {
+                    if e.code == DuckDBError::DUCKDB_V2_ERROR_QUERY_BINDER {
+                        None
+                    } else {
+                        return Err(e);
+                    }
+                }
             };
 
             bind_views.push(BindView { logical_type, value });
@@ -106,7 +121,10 @@ impl<'a> BindMetadata<'a> {
                 handle: check_api_call!(ffi::duckdb_v2_table_function_bind_get_arg_value, *handle, i as u64, RET)?,
             };
 
-            bind_views.push(BindView { logical_type, value });
+            bind_views.push(BindView {
+                logical_type,
+                value: Some(value),
+            });
         }
 
         Ok(bind_views)

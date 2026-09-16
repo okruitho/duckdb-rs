@@ -6,9 +6,9 @@
 
 use std::ops::Deref;
 
-use libduckdb_sys::{self as ffi};
+use crate::ffi;
 
-use crate::{Parameters, Result, check_api_call, check_api_call_no_err, logical_type::LogicalType, value::Value};
+use crate::{Result, check_api_call, logical_type::LogicalType, value::Value};
 
 /// An owned function signature.
 ///
@@ -302,6 +302,7 @@ impl SignatureBuilder {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod test {
+    use crate::Parameters;
     use crate::builder_helpers::scalar_callback;
     use crate::logical_type::LogicalTypeID;
     use crate::scalar::ScalarFunctionBuilder;

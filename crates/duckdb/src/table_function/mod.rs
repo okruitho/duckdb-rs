@@ -13,17 +13,18 @@ use libduckdb_sys as ffi;
 
 use crate::{
     Result,
-    bind_arguments::{BindArguments, BindMetadata},
+    bind_arguments::{BindMetadata, BindType, BindView},
     builder_helpers::{
         OpaqueHandle, context_and_connection_fn, get_bind_data, get_global_state, get_local_state, get_opaque_data_ref,
         get_user_data, handle_unwind, into_opaque,
     },
     check_api_call, check_api_call_no_err,
     connection::Context,
-    data_chunk::{DataChunk, DataChunkRef},
+    data_chunk::DataChunkRef,
     expression::Expression,
     logical_type::LogicalType,
     signature::SignatureBuilder,
+    table_function::InitColumnHandle::{Global, Local},
 };
 
 /// An owned table-function builder handle.
@@ -68,9 +69,16 @@ unsafe extern "C" fn bind_callback<T: TableFunctionCallbacks>(
         || {
             let user_data = get_user_data!(ffi::duckdb_v2_table_function_bind_get_user_data, info);
 
-            let metadata = BindMetadata::from_table_function(&info)?;
+            let metadata = BindMetadata {
+                bind_type: BindType::Table(&info),
+            };
 
-            let (bind_data, cardinality) = T::bind(user_data, Context(context), metadata, BindFunctionHandle(&info))?;
+            let (bind_data, cardinality) = T::bind(
+                user_data,
+                Context(context),
+                metadata.get_view()?,
+                BindFunctionHandle(&info),
+            )?;
 
             check_api_call!(
                 ffi::duckdb_v2_table_function_bind_set_bind_data,
@@ -127,27 +135,43 @@ unsafe extern "C" fn exec_callback<T: TableFunctionCallbacks>(
     );
 }
 
+enum InitColumnHandle<'a> {
+    Local(&'a ffi::duckdb_v2_table_function_init_local_info_handle),
+    Global(&'a ffi::duckdb_v2_table_function_init_global_info_handle),
+}
+
 /// Projected-column metadata supplied during table-function initialization.
 pub struct InitColumnData<'a> {
-    handle: &'a ffi::duckdb_v2_table_function_init_info_handle,
+    handle: InitColumnHandle<'a>,
 }
 
 impl<'a> InitColumnData<'a> {
     /// Return the number of columns requested by the query.
     pub fn get_column_count(&self) -> Result<usize> {
-        let column_count = check_api_call!(ffi::duckdb_v2_table_function_init_get_column_count, *self.handle, RET)?;
+        let column_count = match self.handle {
+            Local(handle) => check_api_call!(ffi::duckdb_v2_table_function_init_local_get_column_count, *handle, RET),
+            Global(handle) => check_api_call!(ffi::duckdb_v2_table_function_init_global_get_column_count, *handle, RET),
+        }?;
 
         Ok(column_count as usize)
     }
 
     /// Map a projected position to its bind-declared result-column index.
     pub fn get_column_index(&self, projected_index: usize) -> Result<usize> {
-        let original_index = check_api_call!(
-            ffi::duckdb_v2_table_function_init_get_column_index,
-            *self.handle,
-            projected_index as u64,
-            RET
-        )?;
+        let original_index = match self.handle {
+            Local(handle) => check_api_call!(
+                ffi::duckdb_v2_table_function_init_local_get_column_index,
+                *handle,
+                projected_index as u64,
+                RET
+            ),
+            Global(handle) => check_api_call!(
+                ffi::duckdb_v2_table_function_init_global_get_column_index,
+                *handle,
+                projected_index as u64,
+                RET
+            ),
+        }?;
 
         Ok(original_index as usize)
     }
@@ -155,13 +179,17 @@ impl<'a> InitColumnData<'a> {
 
 /// Candidate filters and column mappings offered for pushdown.
 pub struct FilterColumnData<'a> {
-    handle: &'a ffi::duckdb_v2_table_function_filter_info_handle,
+    handle: &'a ffi::duckdb_v2_table_function_filter_pushdown_info_handle,
 }
 
 impl<'a> FilterColumnData<'a> {
     /// Return the number of columns in the pushdown-time column list.
     pub fn get_column_count(&self) -> Result<usize> {
-        let column_count = check_api_call!(ffi::duckdb_v2_table_function_filter_get_column_count, *self.handle, RET)?;
+        let column_count = check_api_call!(
+            ffi::duckdb_v2_table_function_filter_pushdown_get_column_count,
+            *self.handle,
+            RET
+        )?;
 
         Ok(column_count as usize)
     }
@@ -169,7 +197,7 @@ impl<'a> FilterColumnData<'a> {
     /// Map a pushdown-time position to its bind-declared column index.
     pub fn get_column_index(&self, projected_index: usize) -> Result<usize> {
         let original_index = check_api_call!(
-            ffi::duckdb_v2_table_function_filter_get_column_index,
+            ffi::duckdb_v2_table_function_filter_pushdown_get_column_index,
             *self.handle,
             projected_index as u64,
             RET
@@ -178,10 +206,20 @@ impl<'a> FilterColumnData<'a> {
         Ok(original_index as usize)
     }
 
+    pub fn filter_count(&self) -> Result<usize> {
+        let value = check_api_call!(
+            ffi::duckdb_v2_table_function_filter_pushdown_get_filter_count,
+            *self.handle,
+            RET
+        )?;
+
+        Ok(value as usize)
+    }
+
     /// Borrow a candidate filter expression.
-    pub fn get_expression(&self, index: usize) -> Result<Expression<'a>> {
+    pub fn filter(&self, index: usize) -> Result<Expression<'a>> {
         let expression_handle = check_api_call!(
-            ffi::duckdb_v2_table_function_filter_get_expression,
+            ffi::duckdb_v2_table_function_filter_pushdown_get_filter,
             *self.handle,
             index as u64,
             RET
@@ -193,46 +231,44 @@ impl<'a> FilterColumnData<'a> {
         })
     }
 
-    /// Mark a filter that the table function will apply itself.
-    ///
-    /// DuckDB removes marked filters from the plan above the scan. Leave a
-    /// filter unmarked unless the function will enforce it completely.
-    pub fn mark_handled(&self, index: usize) -> Result<()> {
+    pub fn accept_pushdown(&self, index: usize) -> Result<()> {
         check_api_call!(
-            ffi::duckdb_v2_table_function_filter_mark_handled,
+            ffi::duckdb_v2_table_function_filter_pushdown_accept,
             *self.handle,
             index as u64
-        )?;
-
-        Ok(())
+        )
     }
 }
 
 unsafe extern "C" fn init_global_callback<T: TableFunctionCallbacks>(
-    info: ffi::duckdb_v2_table_function_init_info_handle,
+    info: ffi::duckdb_v2_table_function_init_global_info_handle,
     context: ffi::duckdb_v2_context_handle,
     err: *mut ffi::duckdb_v2_error_info_handle,
 ) {
     handle_unwind(
         || {
-            let user_data = get_user_data!(ffi::duckdb_v2_table_function_init_get_user_data, info);
-            let bind_data = get_bind_data!(ffi::duckdb_v2_table_function_init_get_bind_data, info);
+            let user_data = get_user_data!(ffi::duckdb_v2_table_function_init_global_get_user_data, info);
+            let bind_data = get_bind_data!(ffi::duckdb_v2_table_function_init_global_get_bind_data, info);
 
-            let (global_state, max_threads) =
-                T::init_global_state(user_data, bind_data, Context(context), InitColumnData { handle: &info })?;
+            let (global_state, max_threads) = T::init_global_state(
+                user_data,
+                bind_data,
+                Context(context),
+                InitColumnData { handle: Global(&info) },
+            )?;
 
             if let Some(global_state) = global_state {
                 check_api_call!(
-                    ffi::duckdb_v2_table_function_init_set_global_state,
+                    ffi::duckdb_v2_table_function_init_global_set_global_state,
                     info,
-                    into_opaque(global_state)
+                    &mut into_opaque(global_state)
                 )?;
             }
 
             if let Some(max_threads) = max_threads {
                 dbg!(max_threads);
                 check_api_call!(
-                    ffi::duckdb_v2_table_function_init_set_max_threads,
+                    ffi::duckdb_v2_table_function_init_global_set_max_threads,
                     info,
                     max_threads as u64
                 )?;
@@ -245,31 +281,29 @@ unsafe extern "C" fn init_global_callback<T: TableFunctionCallbacks>(
 }
 
 unsafe extern "C" fn init_local_callback<T: TableFunctionCallbacks>(
-    info: ffi::duckdb_v2_table_function_init_info_handle,
+    info: ffi::duckdb_v2_table_function_init_local_info_handle,
     context: ffi::duckdb_v2_context_handle,
     err: *mut ffi::duckdb_v2_error_info_handle,
 ) {
     handle_unwind(
         || {
-            let user_data = get_user_data!(ffi::duckdb_v2_table_function_init_get_user_data, info);
-
-            let bind_data = get_bind_data!(ffi::duckdb_v2_table_function_init_get_bind_data, info);
-
-            let global_state = get_global_state!(ffi::duckdb_v2_table_function_init_get_global_state, info);
+            let user_data = get_user_data!(ffi::duckdb_v2_table_function_init_local_get_user_data, info);
+            let bind_data = get_bind_data!(ffi::duckdb_v2_table_function_init_local_get_bind_data, info);
+            let global_state = get_global_state!(ffi::duckdb_v2_table_function_init_local_get_global_state, info);
 
             let local_state = T::init_local_state(
                 user_data,
                 bind_data,
                 Context(context),
                 global_state,
-                InitColumnData { handle: &info },
+                InitColumnData { handle: Local(&info) },
             )?;
 
             if let Some(local_state) = local_state {
                 check_api_call!(
-                    ffi::duckdb_v2_table_function_init_set_local_state,
+                    ffi::duckdb_v2_table_function_init_local_set_local_state,
                     info,
-                    into_opaque(local_state)
+                    &mut into_opaque(local_state)
                 )?;
             }
 
@@ -280,21 +314,18 @@ unsafe extern "C" fn init_local_callback<T: TableFunctionCallbacks>(
 }
 
 unsafe extern "C" fn progress_callback<T: TableFunctionCallbacks>(
-    bind_data: *mut ::std::os::raw::c_void,
-    global_state: *mut ::std::os::raw::c_void,
-    out_progress: *mut f64,
-    context: ffi::duckdb_v2_context_handle,
+    info: ffi::duckdb_v2_table_function_progress_info_handle,
+    ctx: ffi::duckdb_v2_context_handle,
     err: *mut ffi::duckdb_v2_error_info_handle,
 ) {
     handle_unwind(
         || {
-            let bind_data = unsafe { get_opaque_data_ref::<T::BindData>(bind_data) };
-            let global_state = unsafe { get_opaque_data_ref::<T::GlobalState>(global_state) };
+            let user_data = get_user_data!(ffi::duckdb_v2_table_function_progress_get_user_data, info);
+            let bind_data = get_bind_data!(ffi::duckdb_v2_table_function_progress_get_bind_data, info);
+            let global_state = get_global_state!(ffi::duckdb_v2_table_function_progress_get_global_state, info);
 
-            if let Some(progress) = T::progress(bind_data, global_state, Context(context))? {
-                unsafe {
-                    *out_progress = progress;
-                }
+            if let Some(progress) = T::progress(user_data, bind_data, global_state, Context(ctx))? {
+                check_api_call!(ffi::duckdb_v2_table_function_progress_set_progress, info, progress)?
             }
 
             Ok(())
@@ -327,52 +358,17 @@ unsafe extern "C" fn cardinality_callback<T: TableFunctionCallbacks>(
     );
 }
 
-/// Candidate filter expressions offered during optimization.
-pub struct TableFunctionFilterHandle {
-    handle: ffi::duckdb_v2_table_function_filter_info_handle,
-}
-
-impl TableFunctionFilterHandle {
-    /// Return the number of candidate filters.
-    pub fn count(&self) -> Result<usize> {
-        let count = check_api_call!(ffi::duckdb_v2_table_function_filter_get_count, self.handle, RET)?;
-
-        Ok(count as usize)
-    }
-
-    /// Borrow a candidate filter expression.
-    pub fn expression<'a>(&'a self, index: usize) -> Result<Expression<'a>> {
-        let handle = check_api_call!(
-            ffi::duckdb_v2_table_function_filter_get_expression,
-            self.handle,
-            index as u64,
-            RET
-        )?;
-
-        Ok(Expression {
-            handle,
-            _marker: std::marker::PhantomData,
-        })
-    }
-}
-
-unsafe extern "C" fn pushdown_complex_filter_callback<T: TableFunctionCallbacks>(
-    bind_data: *mut ::std::os::raw::c_void,
-    info: ffi::duckdb_v2_table_function_filter_info_handle,
-    context: ffi::duckdb_v2_context_handle,
+unsafe extern "C" fn filter_pushdown_callback<T: TableFunctionCallbacks>(
+    info: ffi::duckdb_v2_table_function_filter_pushdown_info_handle,
+    ctx: ffi::duckdb_v2_context_handle,
     err: *mut ffi::duckdb_v2_error_info_handle,
 ) {
     handle_unwind(
         || {
-            let user_data = get_user_data!(ffi::duckdb_v2_table_function_filter_get_user_data, info);
-            let bind_data = unsafe { get_opaque_data_ref::<T::BindData>(bind_data) };
+            let user_data = get_user_data!(ffi::duckdb_v2_table_function_filter_pushdown_get_user_data, info);
+            let bind_data = get_bind_data!(ffi::duckdb_v2_table_function_filter_pushdown_get_bind_data, info);
 
-            T::pushdown_complex_filter(
-                user_data,
-                bind_data,
-                Context(context),
-                FilterColumnData { handle: &info },
-            )
+            T::pushdown_complex_filter(user_data, bind_data, Context(ctx), FilterColumnData { handle: &info })
         },
         err,
     );
@@ -408,91 +404,82 @@ impl<T: TableFunctionCallbacks> TableFunctionBuilder<T> {
     }
 
     /// Build an owned table-function builder handle.
-    pub fn build(&self) -> Result<TableFunctionBuilderHandle> {
-        let handle = TableFunctionBuilderHandle(check_api_call!(ffi::duckdb_v2_table_function_create, RET)?);
-
-        check_api_call!(ffi::duckdb_v2_table_function_set_name, *handle, (&self.name).into())?;
-
+    pub fn build(&self, handle: &TableFunctionBuilderHandle) -> Result<()> {
         check_api_call!(
-            ffi::duckdb_v2_table_function_set_signature,
-            *handle,
-            *self.signature.build()?
+            ffi::duckdb_v2_table_function_set_name,
+            **handle,
+            &mut (&self.name).into()
         )?;
+
+        let signature = check_api_call!(ffi::duckdb_v2_table_function_get_signature, **handle, RET)?;
+
+        self.signature.build(&signature)?;
 
         check_api_call!(
             ffi::duckdb_v2_table_function_set_projection_pushdown,
-            *handle,
+            **handle,
             self.projection_pushdown
         )?;
 
         check_api_call!(
             ffi::duckdb_v2_table_function_set_user_data,
-            *handle,
-            self.user_data.to_handle()
+            **handle,
+            &mut self.user_data.to_handle()
         )?;
 
         check_api_call!(
             ffi::duckdb_v2_table_function_set_init_local_callback,
-            *handle,
+            **handle,
             Some(init_local_callback::<T>)
         )?;
 
         check_api_call!(
             ffi::duckdb_v2_table_function_set_init_global_callback,
-            *handle,
+            **handle,
             Some(init_global_callback::<T>)
         )?;
 
         check_api_call!(
             ffi::duckdb_v2_table_function_set_progress_callback,
-            *handle,
+            **handle,
             Some(progress_callback::<T>)
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_table_function_set_cardinality_callback,
-            *handle,
-            Some(cardinality_callback::<T>)
-        )?;
-
-        check_api_call!(
-            ffi::duckdb_v2_table_function_set_pushdown_complex_filter_callback,
-            *handle,
-            Some(pushdown_complex_filter_callback::<T>)
+            ffi::duckdb_v2_table_function_set_filter_pushdown_callback,
+            **handle,
+            Some(filter_pushdown_callback::<T>)
         )?;
 
         // required
         check_api_call!(
             ffi::duckdb_v2_table_function_set_bind_callback,
-            *handle,
+            **handle,
             Some(bind_callback::<T>)
         )?;
 
         check_api_call!(
             ffi::duckdb_v2_table_function_set_exec_callback,
-            *handle,
+            **handle,
             Some(exec_callback::<T>)
         )?;
 
-        Ok(handle)
+        Ok(())
     }
 
     context_and_connection_fn! {
         /// Register the function through a connection or callback context.
-        pub fn register_with_[context, connection](self) -> Result<()>
+        pub fn register_with_[extension, connection](self) -> Result<()>
         {
-            context_fn: ffi::duckdb_v2_table_function_register_with_context,
-            connection_fn: ffi::duckdb_v2_table_function_register_with_connection,
+            extension_fn: ffi::duckdb_v2_table_function_create_with_extension,
+            connection_fn: ffi::duckdb_v2_table_function_create_with_connection,
         }
-        let handle = self.build()?;
+        let handle = TableFunctionBuilderHandle(check_api_call!(api_fn!(), **api_arg!(), RET)?);
+
+        self.build(&handle)?;
 
         check_api_call!(
-            api_fn!(),
-            **api_arg!(),
-            *handle
-        )?;
-
-        Ok(())
+            ffi::duckdb_v2_table_function_register, *handle)
     }
 }
 
@@ -533,7 +520,7 @@ pub trait TableFunctionCallbacks: Send + Sync + 'static {
     fn bind(
         &self,
         context: Context,
-        metadata: BindArguments,
+        arguments: Vec<BindView>,
         bind_handle: BindFunctionHandle,
     ) -> Result<(Self::BindData, Option<TableFunctionCardinality>)>;
 
@@ -547,6 +534,7 @@ pub trait TableFunctionCallbacks: Send + Sync + 'static {
 
     /// **Progress:** report execution progress from `0.0` to `1.0`.
     fn progress(
+        &self,
         _bind_data: Option<&Self::BindData>,
         _global_state: Option<&Self::GlobalState>,
         _context: Context,

@@ -78,7 +78,7 @@ impl IntoStatement for Statements {
     }
 }
 
-impl IntoStatement for Statement<'_> {
+impl IntoStatement for Statement {
     fn execute_statement<'conn>(
         self,
         conn: &'conn Connection,
@@ -140,12 +140,7 @@ impl Connection {
         stmt.execute_statement(self, names.as_deref(), &values)
     }
 
-    fn execute_statement(
-        &self,
-        stmt: Statement<'_>,
-        names: Option<&[&str]>,
-        values: &[&Value],
-    ) -> Result<QueryResult<'_>> {
+    fn execute_statement(&self, stmt: Statement, names: Option<&[&str]>, values: &[&Value]) -> Result<QueryResult<'_>> {
         let values = values.iter().map(|value| value.handle).collect::<Vec<_>>();
         let name_strs = names.map(|names| {
             names

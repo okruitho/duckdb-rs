@@ -1,15 +1,10 @@
 //! Emit DuckDB log records and register custom log storage.
 
-use std::ops::Deref;
-
 use crate::{
     Result,
-    builder_helpers::{
-        OpaqueHandle, context_and_connection_fn, ffi_enum_redeclaration, get_opaque_data_ref, handle_unwind,
-    },
-    check_api_call, check_api_call_no_err,
+    builder_helpers::{ffi_enum_redeclaration, get_opaque_data_ref, handle_unwind},
+    check_api_call,
     connection::Context,
-    database::Database,
     ffi,
 };
 

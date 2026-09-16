@@ -3,10 +3,13 @@ use std::fmt::Display;
 use libduckdb_sys::{DUCKDB_V2_FUNCTION_PROPERTY_KEY, DUCKDB_V2_FUNCTION_PROPERTY_VALUE};
 
 use crate::{
-    Context, DuckDBType, Environment, Parameters, StorageLocation,
+    DuckDBType, Parameters, ToValue,
     aggregate::{AggregateCallbacks, AggregateFunctionBuilder, BindMetadata, States},
-    connection_options::OptionValue,
-    data_chunk::DataChunk,
+    bind_arguments::BindView,
+    connection::Context,
+    connection_options::{ConfigOption, ConfigOptionValue},
+    data_chunk::{DataChunk, DataChunkRef, VectorCollection},
+    environment::{Environment, StorageLocation},
     signature::{Parameter, SignatureBuilder},
     vector::Vector,
 };
@@ -17,24 +20,22 @@ struct BasicAggregate<T> {
 
 // Formula = (user_data + bind_data) +  median()
 
-impl<T: Display> AggregateCallbacks for BasicAggregate<T> {
+impl<T: Display + Send + Sync + 'static> AggregateCallbacks for BasicAggregate<T> {
     type BindData = Vec<f32>;
     type StateItem = Vec<i32>;
     type IncomingType = i32;
     type ResultType = String;
 
-    fn bind(&self, context: Context, metadata: BindMetadata) -> crate::Result<Self::BindData> {
+    fn bind(&self, context: Context, arguments: Vec<BindView>) -> crate::Result<Self::BindData> {
         let mut bind_data: Vec<f32> = Vec::new();
 
-        for i in 0..metadata.arguments.len()? {
-            let name = metadata.arguments.name(i)?;
-            let arg_type = metadata.arguments.logical_type(i)?;
+        for argument in arguments {
+            let name = argument.value;
+            let arg_type = argument.logical_type;
 
             assert_eq!(arg_type, i32::logical_type(&context)?);
-            assert_eq!(name, "IN");
+            assert!(name.is_none());
         }
-
-        assert_eq!(metadata.function_name, "to_concatenated");
 
         bind_data.push(1.2);
         bind_data.push(3.4);
@@ -53,10 +54,10 @@ impl<T: Display> AggregateCallbacks for BasicAggregate<T> {
     fn update(
         &self,
         _bind_data: Option<&Self::BindData>,
-        data_chunk: DataChunk,
-        states: &mut crate::aggregate::States<'_, Self::StateItem>,
+        collection: VectorCollection,
+        states: &mut [&mut Self::StateItem],
     ) -> crate::Result<()> {
-        let vec = data_chunk.get_vector_at::<Self::IncomingType>(0)?;
+        let vec = collection.get_vector_at::<Self::IncomingType>(0)?;
 
         for (i, val) in vec.iter()?.enumerate() {
             if let Some(val) = val {
@@ -70,8 +71,8 @@ impl<T: Display> AggregateCallbacks for BasicAggregate<T> {
     fn combine(
         &self,
         _bind_data: Option<&Self::BindData>,
-        source: &crate::aggregate::States<'_, Self::StateItem>,
-        dest: &mut crate::aggregate::States<'_, Self::StateItem>,
+        source: &[&Self::StateItem],
+        dest: &mut [&mut Self::StateItem],
     ) -> crate::Result<()> {
         for i in 0..dest.len() {
             let values = source[i].clone();
@@ -84,7 +85,7 @@ impl<T: Display> AggregateCallbacks for BasicAggregate<T> {
     fn finalize(
         &self,
         bind_data: Option<&Self::BindData>,
-        states: &mut States<'_, Self::StateItem>,
+        states: &[&Self::StateItem],
         result: &mut Vector<'_, Self::ResultType>,
         result_offset: usize,
     ) -> crate::Result<()> {
@@ -142,7 +143,7 @@ pub fn aggregate_test_invalid_build() -> crate::Result<()> {
     let env = Environment::new()?;
     let db = env.open(StorageLocation::InMemory)?;
 
-    db.set_option(&OptionValue::new("threads", &1.to_string())?)?;
+    db.set_option(&ConfigOptionValue::new("threads", &1.to_string())?)?;
 
     let conn = db.connect()?;
 

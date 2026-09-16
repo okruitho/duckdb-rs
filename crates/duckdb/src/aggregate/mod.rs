@@ -14,13 +14,14 @@ use std::{
 use libduckdb_sys::{self as ffi};
 
 use crate::{
-    Context, Result,
-    bind_arguments::BindMetadata,
+    Result,
+    bind_arguments::{BindMetadata, BindType, BindView},
     builder_helpers::{
         OpaqueHandle, context_and_connection_fn, get_bind_data, get_user_data, handle_unwind, into_opaque,
     },
     check_api_call, check_api_call_no_err,
-    data_chunk::DataChunk,
+    connection::Context,
+    data_chunk::VectorCollection,
     enums::FunctionProperty,
     signature::SignatureBuilder,
     vector::{Vector, VectorElement},
@@ -107,16 +108,20 @@ unsafe extern "C" fn bind_callback<T: AggregateCallbacks>(
 ) {
     handle_unwind(
         || {
-            let metadata = BindMetadata::from_aggregate(&info)?;
+            let metadata = BindMetadata {
+                bind_type: BindType::Aggregate(&info),
+            };
 
             let user_data = get_user_data!(ffi::duckdb_v2_aggregate_function_bind_get_user_data, info);
 
-            let result = T::bind(user_data, Context(context), metadata)?;
+            let result = T::bind(user_data, Context(context), metadata.get_view()?)?;
+
+            dbg!("AA");
 
             check_api_call!(
                 ffi::duckdb_v2_aggregate_function_bind_set_bind_data,
                 info,
-                into_opaque(result)
+                &mut into_opaque(result)
             )
         },
         err,
@@ -127,13 +132,14 @@ unsafe extern "C" fn size_callback<T: AggregateCallbacks>(
     info: ffi::duckdb_v2_aggregate_function_size_info_handle,
     err: *mut ffi::duckdb_v2_error_info_handle,
 ) {
+    dbg!("AA");
     handle_unwind(
         || {
             let user_data = get_user_data!(ffi::duckdb_v2_aggregate_function_size_get_user_data, info);
 
             let size = T::size(user_data)?;
 
-            check_api_call!(ffi::duckdb_v2_aggregate_function_size_set_size, info, size as u64)
+            check_api_call!(ffi::duckdb_v2_aggregate_function_size_set_state_size, info, size as u64)
         },
         err,
     );
@@ -147,12 +153,19 @@ unsafe extern "C" fn init_callback<T: AggregateCallbacks>(
         || {
             let user_data = get_user_data!(ffi::duckdb_v2_aggregate_function_init_get_user_data, info);
 
-            let state = check_api_call!(ffi::duckdb_v2_aggregate_function_init_get_state, info, RET)?;
+            let state_count = check_api_call!(ffi::duckdb_v2_aggregate_function_init_get_state_count, info, RET)?;
 
-            let data = T::init(user_data)?;
+            let states_ptr = check_api_call!(ffi::duckdb_v2_aggregate_function_init_get_states, info, RET)?;
 
-            unsafe {
-                (state as *mut T::StateItem).write(data);
+            let states: &[*mut T::StateItem] =
+                unsafe { std::slice::from_raw_parts(states_ptr as *mut *mut T::StateItem, state_count as usize) };
+
+            for &state_ptr in states {
+                let data = T::init(user_data)?;
+
+                unsafe {
+                    state_ptr.write(data);
+                }
             }
 
             Ok(())
@@ -171,25 +184,31 @@ unsafe extern "C" fn update_callback<T: AggregateCallbacks>(
 
             let bind_data = get_bind_data!(ffi::duckdb_v2_aggregate_function_update_get_bind_data, info);
 
-            let data_chunk_handle = check_api_call!(ffi::duckdb_v2_aggregate_function_update_get_input, info, RET)?;
+            let arg_count =
+                check_api_call!(ffi::duckdb_v2_aggregate_function_update_get_arg_count, info, RET)? as usize;
 
-            let data_chunk = DataChunk {
-                handle: data_chunk_handle,
-                is_owned: false,
+            let mut vector_collection = VectorCollection {
+                handles: Vec::with_capacity(arg_count),
                 is_writable: false,
             };
 
-            // An array of pointers, one per row, each pointing to the aggregate state for that row. The callback applies updates to these states based on the input data.
-            let states_ptr: *mut *mut std::ffi::c_void =
-                check_api_call!(ffi::duckdb_v2_aggregate_function_update_get_states, info, RET)?;
+            for i in 0..arg_count {
+                vector_collection.handles.push(check_api_call!(
+                    ffi::duckdb_v2_aggregate_function_update_get_arg,
+                    info,
+                    i as u32,
+                    RET
+                )?);
+            }
 
-            // Convert to ** T::StateItem slice
-            let states: &[*mut T::StateItem] =
-                unsafe { std::slice::from_raw_parts(states_ptr as *mut *mut T::StateItem, data_chunk.row_count()?) };
+            let states_ptr = check_api_call!(ffi::duckdb_v2_aggregate_function_update_get_states, info, RET)?;
 
-            let mut states = unsafe { States::new(states) };
+            let row_count = check_api_call!(ffi::duckdb_v2_aggregate_function_update_get_row_count, info, RET)?;
 
-            T::update(user_data, bind_data, data_chunk, &mut states)
+            let states: &mut [&mut T::StateItem] =
+                unsafe { std::slice::from_raw_parts_mut(states_ptr as *mut &mut T::StateItem, row_count as usize) };
+
+            T::update(user_data, bind_data, vector_collection, states)
         },
         err,
     );
@@ -205,22 +224,19 @@ unsafe extern "C" fn combine_callback<T: AggregateCallbacks>(
 
             let bind_data = get_bind_data!(ffi::duckdb_v2_aggregate_function_combine_get_bind_data, info);
 
-            let count: u64 = check_api_call!(ffi::duckdb_v2_aggregate_function_combine_get_count, info, RET)?;
+            let count: u64 = check_api_call!(ffi::duckdb_v2_aggregate_function_combine_get_state_count, info, RET)?;
 
             let source_ptr = check_api_call!(ffi::duckdb_v2_aggregate_function_combine_get_sources, info, RET)?;
 
             let target_ptr = check_api_call!(ffi::duckdb_v2_aggregate_function_combine_get_targets, info, RET)?;
 
-            let source: &[*mut T::StateItem] =
-                unsafe { std::slice::from_raw_parts(source_ptr as *mut *mut T::StateItem, count as usize) };
+            let source: &[&T::StateItem] =
+                unsafe { std::slice::from_raw_parts(source_ptr as *const &T::StateItem, count as usize) };
 
-            let target: &[*mut T::StateItem] =
-                unsafe { std::slice::from_raw_parts(target_ptr as *mut *mut T::StateItem, count as usize) };
+            let target: &mut [&mut T::StateItem] =
+                unsafe { std::slice::from_raw_parts_mut(target_ptr as *mut &mut T::StateItem, count as usize) };
 
-            let source = unsafe { States::new(source) };
-            let mut target = unsafe { States::new(target) };
-
-            T::combine(user_data, bind_data, &source, &mut target)
+            T::combine(user_data, bind_data, source, target)
         },
         err,
     );
@@ -236,15 +252,13 @@ unsafe extern "C" fn finalize_callback<T: AggregateCallbacks>(
 
             let bind_data = get_bind_data!(ffi::duckdb_v2_aggregate_function_finalize_get_bind_data, info);
 
-            let count: u64 = check_api_call!(ffi::duckdb_v2_aggregate_function_finalize_get_count, info, RET)?;
+            let count: u64 = check_api_call!(ffi::duckdb_v2_aggregate_function_finalize_get_state_count, info, RET)?;
 
             let states_ptr: *mut *mut std::ffi::c_void =
                 check_api_call!(ffi::duckdb_v2_aggregate_function_finalize_get_states, info, RET)?;
 
-            let states: &[*mut T::StateItem] =
-                unsafe { std::slice::from_raw_parts(states_ptr as *mut *mut T::StateItem, count as usize) };
-
-            let mut states = unsafe { States::new(states) };
+            let states: &[&T::StateItem] =
+                unsafe { std::slice::from_raw_parts(states_ptr as *const &T::StateItem, count as usize) };
 
             let result_vector_handle =
                 check_api_call!(ffi::duckdb_v2_aggregate_function_finalize_get_result, info, RET)?;
@@ -256,13 +270,7 @@ unsafe extern "C" fn finalize_callback<T: AggregateCallbacks>(
             let result_offset: u64 =
                 check_api_call!(ffi::duckdb_v2_aggregate_function_finalize_get_result_offset, info, RET)?;
 
-            T::finalize(
-                user_data,
-                bind_data,
-                &mut states,
-                &mut result_vector,
-                result_offset as usize,
-            )
+            T::finalize(user_data, bind_data, states, &mut result_vector, result_offset as usize)
         },
         err,
     );
@@ -278,7 +286,8 @@ unsafe extern "C" fn destroy_callback<T: AggregateCallbacks>(
 
             let bind_data = get_bind_data!(ffi::duckdb_v2_aggregate_function_destroy_get_bind_data, info);
 
-            let states_count: u64 = check_api_call!(ffi::duckdb_v2_aggregate_function_destroy_get_count, info, RET)?;
+            let states_count: u64 =
+                check_api_call!(ffi::duckdb_v2_aggregate_function_destroy_get_state_count, info, RET)?;
 
             let states_ptr: *mut *mut std::ffi::c_void =
                 check_api_call!(ffi::duckdb_v2_aggregate_function_destroy_get_states, info, RET)?;
@@ -304,16 +313,16 @@ unsafe extern "C" fn destroy_callback<T: AggregateCallbacks>(
     );
 }
 
-struct AggregateFunctionBuilderHandle(ffi::duckdb_v2_aggregate_function_builder_handle);
+struct AggregateFunctionBuilderHandle(ffi::duckdb_v2_aggregate_function_handle);
 
 impl Drop for AggregateFunctionBuilderHandle {
     fn drop(&mut self) {
-        check_api_call_no_err!(ffi::duckdb_v2_aggregate_function_builder_destroy, &mut self.0).unwrap();
+        check_api_call_no_err!(ffi::duckdb_v2_aggregate_function_destroy, &mut self.0).unwrap();
     }
 }
 
 impl Deref for AggregateFunctionBuilderHandle {
-    type Target = ffi::duckdb_v2_aggregate_function_builder_handle;
+    type Target = ffi::duckdb_v2_aggregate_function_handle;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -346,95 +355,87 @@ impl<T: AggregateCallbacks> AggregateFunctionBuilder<T> {
         self
     }
 
-    fn build(&self) -> Result<AggregateFunctionBuilderHandle> {
-        let handle = check_api_call!(ffi::duckdb_v2_aggregate_function_builder_create, RET)?;
-
-        let handle = AggregateFunctionBuilderHandle(handle);
-
-        let name: ffi::duckdb_v2_str = self.name.as_str().into();
-        check_api_call!(ffi::duckdb_v2_aggregate_function_builder_set_name, *handle, name)?;
-
+    fn build(&self, handle: &AggregateFunctionBuilderHandle) -> Result<()> {
         check_api_call!(
-            ffi::duckdb_v2_aggregate_function_builder_set_signature,
-            *handle,
-            *self.signature.build()?
+            ffi::duckdb_v2_aggregate_function_set_name,
+            **handle,
+            &mut (&self.name).into()
         )?;
 
+        let signature = check_api_call!(ffi::duckdb_v2_aggregate_function_get_signature, **handle, RET)?;
+
+        self.signature.build(&signature)?;
+
         for (key, value) in &self.properties {
-            check_api_call!(
-                ffi::duckdb_v2_aggregate_function_builder_set_property,
-                *handle,
-                *key,
-                *value
-            )?;
+            check_api_call!(ffi::duckdb_v2_aggregate_function_set_property, **handle, *key, *value)?;
         }
 
         check_api_call!(
-            ffi::duckdb_v2_aggregate_function_builder_set_user_data,
-            *handle,
-            self.user_data.to_handle()
+            ffi::duckdb_v2_aggregate_function_set_user_data,
+            **handle,
+            &mut self.user_data.to_handle()
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_aggregate_function_builder_set_bind_callback,
-            *handle,
+            ffi::duckdb_v2_aggregate_function_set_bind_callback,
+            **handle,
             Some(bind_callback::<T>)
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_aggregate_function_builder_set_init_callback,
-            *handle,
+            ffi::duckdb_v2_aggregate_function_set_init_callback,
+            **handle,
             Some(init_callback::<T>)
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_aggregate_function_builder_set_size_callback,
-            *handle,
+            ffi::duckdb_v2_aggregate_function_set_size_callback,
+            **handle,
             Some(size_callback::<T>)
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_aggregate_function_builder_set_update_callback,
-            *handle,
+            ffi::duckdb_v2_aggregate_function_set_update_callback,
+            **handle,
             Some(update_callback::<T>)
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_aggregate_function_builder_set_combine_callback,
-            *handle,
+            ffi::duckdb_v2_aggregate_function_set_combine_callback,
+            **handle,
             Some(combine_callback::<T>)
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_aggregate_function_builder_set_finalize_callback,
-            *handle,
+            ffi::duckdb_v2_aggregate_function_set_finalize_callback,
+            **handle,
             Some(finalize_callback::<T>)
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_aggregate_function_builder_set_destroy_callback,
-            *handle,
+            ffi::duckdb_v2_aggregate_function_set_destroy_callback,
+            **handle,
             Some(destroy_callback::<T>)
         )?;
 
-        Ok(handle)
+        Ok(())
     }
 
     context_and_connection_fn! {
         /// Register the function through a connection or callback context.
-        pub fn register_with_[context, connection](self) -> Result<()>
+        pub fn register_with_[extension, connection](self) -> Result<()>
         {
-            context_fn: ffi::duckdb_v2_aggregate_function_builder_register_with_context,
-            connection_fn: ffi::duckdb_v2_aggregate_function_builder_register_with_connection,
+            extension_fn: ffi::duckdb_v2_aggregate_function_create_with_extension,
+            connection_fn: ffi::duckdb_v2_aggregate_function_create_with_connection,
         }
-        let handle = self.build()?;
+        let handle = AggregateFunctionBuilderHandle(check_api_call!(api_fn!(), **api_arg!(), RET)?);
+
+        self.build(&handle)?;
 
         check_api_call!(
-            api_fn!(),
-            **api_arg!(),
+            ffi::duckdb_v2_aggregate_function_register,
             *handle
         )?;
-
         Ok(())
     }
 }
@@ -455,7 +456,7 @@ pub trait AggregateCallbacks: Send + Sync + 'static {
     type ResultType: VectorElement;
 
     /// **Bind:** validate a call site and create data shared by later phases.
-    fn bind(&self, context: Context, metadata: BindMetadata<'_>) -> Result<Self::BindData>;
+    fn bind(&self, context: Context, metadata: Vec<BindView>) -> Result<Self::BindData>;
 
     /// **Size:** return the allocation size of one aggregate state.
     fn size(&self) -> Result<usize> {
@@ -469,21 +470,21 @@ pub trait AggregateCallbacks: Send + Sync + 'static {
     fn update(
         &self,
         bind_data: Option<&Self::BindData>,
-        data: DataChunk,
-        states: &mut States<'_, Self::StateItem>,
+        data: VectorCollection,
+        states: &mut [&mut Self::StateItem],
     ) -> Result<()>;
     /// **Combine:** merge partial source states into target states.
     fn combine(
         &self,
         bind_data: Option<&Self::BindData>,
-        source: &States<'_, Self::StateItem>,
-        target: &mut States<'_, Self::StateItem>,
+        source: &[&Self::StateItem],
+        target: &mut [&mut Self::StateItem],
     ) -> Result<()>;
     /// **Finalize:** write aggregate states to the result vector.
     fn finalize(
         &self,
         bind_data: Option<&Self::BindData>,
-        states: &mut States<'_, Self::StateItem>,
+        states: &[&Self::StateItem],
         result: &mut Vector<'_, Self::ResultType>,
         result_offset: usize,
     ) -> Result<()>;

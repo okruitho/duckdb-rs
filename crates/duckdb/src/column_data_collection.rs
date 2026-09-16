@@ -265,7 +265,7 @@ impl ColumnDataCollectionAppender {
     /// Append a copy of `chunk` to the collection.
     ///
     /// A mismatched column count or type returns an error without copying data.
-    pub fn append(&self, chunk: &DataChunk) -> Result<()> {
+    pub fn append(&mut self, chunk: &DataChunk) -> Result<()> {
         check_api_call!(
             ffi::duckdb_v2_column_data_collection_append,
             self.collection.handle,
@@ -296,10 +296,12 @@ impl ColumnDataCollectionAppender {
     }
 
     /// Remove all rows and return the collection with its schema unchanged.
-    pub fn reset(self) -> Result<ColumnDataCollection> {
-        check_api_call!(ffi::duckdb_v2_column_data_collection_reset, self.collection.handle,)?;
+    pub fn reset(&mut self) -> Result<()> {
+        check_api_call!(ffi::duckdb_v2_column_data_collection_reset, self.collection.handle)
+    }
 
-        Ok(self.collection)
+    pub fn clear(&mut self) -> Result<()> {
+        check_api_call!(ffi::duckdb_v2_column_data_collection_clear, self.collection.handle)
     }
 
     /// Finish appending and return the underlying collection.
@@ -372,13 +374,13 @@ mod test {
         id.write(0, Some(10))?;
         id.write(1, None)?;
 
-        let collection = collection.to_append()?;
+        let mut collection = collection.to_append()?;
 
         collection.append(&chunk)?;
 
         assert_eq!(collection.len()?, 2);
 
-        let mut collection = collection.reset()?.to_append()?;
+        collection.reset()?;
 
         assert_eq!(collection.len()?, 0);
 
@@ -401,7 +403,7 @@ mod test {
         id.write(0, Some(14))?;
         is_active.write(0, Some(true))?;
 
-        let collection_2 = ColumnDataCollection::from_connection(&conn, &logical_types)?.to_append()?;
+        let mut collection_2 = ColumnDataCollection::from_connection(&conn, &logical_types)?.to_append()?;
         collection_2.append(&chunk_2)?;
 
         collection.combine(collection_2.to_normal())?;
@@ -463,7 +465,7 @@ mod test {
         is_active.write(0, Some(false))?;
         is_active.write(1, None)?;
 
-        let collection = collection.to_append()?;
+        let mut collection = collection.to_append()?;
 
         collection.append(&chunk)?;
 

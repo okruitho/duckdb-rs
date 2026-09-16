@@ -160,6 +160,10 @@ pub struct File {
     pub handle: ffi::duckdb_v2_file_handle,
 }
 
+// TODO verify
+unsafe impl Send for File {}
+unsafe impl Sync for File {}
+
 impl File {
     /// Close the underlying file without destroying its handle.
     ///
@@ -232,6 +236,30 @@ impl File {
 
         Ok(bytes_written as usize)
     }
+
+    /// Read up to `len` bytes starting from `position`.
+    pub fn read_at(&self, position: usize, len: usize) -> Result<Vec<u8>> {
+        let mut buffer = vec![0u8; len];
+
+        check_api_call!(
+            ffi::duckdb_v2_file_read_at,
+            self.handle,
+            buffer.as_mut_ptr() as *mut std::ffi::c_void,
+            len as u64,
+            position as u64
+        )?;
+        Ok(buffer)
+    }
+    /// Write bytes at position. Increases file-size when overflowing.
+    pub fn write_at(&self, position: usize, buffer: &[u8]) -> Result<()> {
+        check_api_call!(
+            ffi::duckdb_v2_file_write_at,
+            self.handle,
+            buffer.as_ptr() as *const std::ffi::c_void,
+            buffer.len() as u64,
+            position as u64,
+        )
+    }
 }
 
 impl Drop for File {
@@ -264,6 +292,7 @@ mod tests {
             .open()?;
 
         file.write("HELLO RUST CLIENT!".as_bytes())?;
+        file.write_at(11, "DUCKDB".as_bytes())?;
 
         file.sync()?;
 
@@ -278,6 +307,8 @@ mod tests {
         assert_eq!(file.tell()?, 10);
 
         assert_eq!(file.size()?, 18);
+
+        assert_eq!(String::from_utf8(file.read_at(11, 6)?).unwrap(), "DUCKDB");
 
         file.close()?;
 

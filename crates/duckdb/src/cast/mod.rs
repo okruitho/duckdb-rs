@@ -5,7 +5,7 @@ use std::ops::Deref;
 use libduckdb_sys::{self as ffi};
 
 use crate::{
-    Context, Result,
+    Result,
     builder_helpers::{OpaqueHandle, context_and_connection_fn, ffi_enum_redeclaration, get_user_data, handle_unwind},
     check_api_call, check_api_call_no_err,
     logical_type::LogicalType,
@@ -23,16 +23,16 @@ ffi_enum_redeclaration! {
 }
 
 /// An owned cast-function builder handle.
-pub struct CastFunctionHandle(ffi::duckdb_v2_cast_function_builder_handle);
+pub struct CastFunctionHandle(ffi::duckdb_v2_cast_function_handle);
 
 impl Drop for CastFunctionHandle {
     fn drop(&mut self) {
-        check_api_call_no_err!(ffi::duckdb_v2_cast_function_builder_destroy, &mut self.0).unwrap();
+        check_api_call_no_err!(ffi::duckdb_v2_cast_function_destroy, &mut self.0).unwrap();
     }
 }
 
 impl Deref for CastFunctionHandle {
-    type Target = ffi::duckdb_v2_cast_function_builder_handle;
+    type Target = ffi::duckdb_v2_cast_function_handle;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -40,6 +40,7 @@ impl Deref for CastFunctionHandle {
 
 unsafe extern "C" fn exec_callback<T: CastFunctionCallbacks>(
     info: ffi::duckdb_v2_cast_function_exec_info_handle,
+    _ctx: ffi::duckdb_v2_context_handle,
     err: *mut ffi::duckdb_v2_error_info_handle,
 ) {
     handle_unwind(
@@ -88,35 +89,33 @@ impl<T: CastFunctionCallbacks> CastFunctionBuilder<T> {
         }
     }
 
-    fn build(&self) -> Result<CastFunctionHandle> {
-        let handle = CastFunctionHandle(check_api_call!(ffi::duckdb_v2_cast_function_builder_create, RET)?);
-
+    fn build(&self, handle: CastFunctionHandle) -> Result<CastFunctionHandle> {
         check_api_call!(
-            ffi::duckdb_v2_cast_function_builder_set_source_type,
+            ffi::duckdb_v2_cast_function_set_source_type,
             *handle,
             self.source_type.handle
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_cast_function_builder_set_target_type,
+            ffi::duckdb_v2_cast_function_set_target_type,
             *handle,
             self.target_type.handle
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_cast_function_builder_set_implicit_cast_cost,
+            ffi::duckdb_v2_cast_function_set_implicit_cast_cost,
             *handle,
             self.implicit_cast_cost
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_cast_function_builder_set_user_data,
+            ffi::duckdb_v2_cast_function_set_user_data,
             *handle,
-            self.user_data.to_handle()
+            &mut self.user_data.to_handle()
         )?;
 
         check_api_call!(
-            ffi::duckdb_v2_cast_function_builder_set_exec_callback,
+            ffi::duckdb_v2_cast_function_set_exec_callback,
             *handle,
             Some(exec_callback::<T>)
         )?;
@@ -126,18 +125,17 @@ impl<T: CastFunctionCallbacks> CastFunctionBuilder<T> {
 
     context_and_connection_fn! {
         /// Register the cast through a connection or callback context.
-        pub fn register_with_[context, connection](self) -> Result<()>
+        pub fn register_with_[extension, connection](self) -> Result<()>
         {
-            context_fn: ffi::duckdb_v2_cast_function_builder_register_with_context,
-            connection_fn: ffi::duckdb_v2_cast_function_builder_register_with_connection,
+            extension_fn: ffi::duckdb_v2_cast_function_create_with_extension,
+            connection_fn: ffi::duckdb_v2_cast_function_create_with_connection,
         }
-        let handle = self.build()?;
+        let handle = CastFunctionHandle(check_api_call!(api_fn!(), **api_arg!(), RET)?);
+
+        let handle = self.build(handle)?;
 
         check_api_call!(
-            api_fn!(),
-            **api_arg!(),
-            *handle
-        )
+            ffi::duckdb_v2_cast_function_register, *handle)
     }
 }
 
@@ -159,9 +157,11 @@ pub trait CastFunctionCallbacks: Send + Sync + 'static {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::{
-        DuckDBType, Environment, Parameters, StorageLocation,
+        DuckDBType, Parameters,
         cast::{CastFunctionBuilder, CastFunctionCallbacks, CastMode},
         custom_type,
+        environment::Environment,
+        environment::StorageLocation,
     };
 
     struct CastToFloat {
@@ -210,7 +210,7 @@ mod tests {
         let custom_type = custom_type::CustomType::new("TEMPERATURE", f32::logical_type(&conn)?)?;
         custom_type.register_with_connection(&conn)?;
         let logical_type = f32::logical_type(&conn)?;
-        let temperature_type = logical_type.to_alias("TEMPERATURE")?;
+        let temperature_type = logical_type.to_alias_with_connection(&conn, "TEMPERATURE")?;
 
         CastFunctionBuilder::new(
             String::logical_type(&conn)?,

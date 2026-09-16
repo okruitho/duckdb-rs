@@ -57,7 +57,7 @@ impl QueryProgress {
         let mut rows_processed = 0;
         let mut total_rows = 0;
         check_api_call!(
-            ffi::duckdb_v2_progress_get,
+            ffi::duckdb_v2_connection_progress_get,
             **conn,
             &mut percentage,
             &mut rows_processed,

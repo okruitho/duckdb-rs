@@ -63,10 +63,14 @@ impl CustomType {
         })
     }
 
-    fn build(&self, handle: CustomTypeBuilderHandle) -> Result<()> {
-        check_api_call!(ffi::duckdb_v2_custom_type_set_base_type, *handle, self.base_type.handle)?;
+    fn build(&self, handle: &CustomTypeBuilderHandle) -> Result<()> {
+        check_api_call!(
+            ffi::duckdb_v2_custom_type_set_base_type,
+            **handle,
+            self.base_type.handle
+        )?;
 
-        check_api_call!(ffi::duckdb_v2_custom_type_set_name, *handle, (&self.name).into(),)?;
+        check_api_call!(ffi::duckdb_v2_custom_type_set_name, **handle, (&self.name).into(),)?;
 
         Ok(())
     }
@@ -84,7 +88,12 @@ impl CustomType {
             RET,
         )?);
 
-        self.build(handle)
+        self.build(&handle)?;
+
+        check_api_call!(
+            ffi::duckdb_v2_custom_type_register,
+            *handle
+        )
     }
 }
 

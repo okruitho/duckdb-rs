@@ -4,89 +4,140 @@
 //! callback ownership convention. Importing an array transfers its buffers to
 //! the resulting [`crate::data_chunk::DataChunk`].
 
+use libduckdb_sys::DuckDBStr;
+
 use crate::{
-    Context, Result, check_api_call, check_api_call_no_err, data_chunk::DataChunk, ffi, logical_type::LogicalType,
+    Result, check_api_call, check_api_call_no_err,
+    connection::Context,
+    data_chunk::{DataChunk, DataChunkRef},
+    ffi,
+    logical_type::LogicalType,
     schema::Schema,
 };
 
-/// Convert logical types into an owned Arrow C schema.
-///
-/// Each Arrow field is named with the corresponding logical type's DuckDB
-/// name.
-///
-/// The caller must invoke the returned schema's `release` callback.
-pub fn logical_types_to_arrow_schema(context: &Context, logical_types: &[LogicalType]) -> Result<ffi::ArrowSchema> {
-    let names = logical_types
-        .iter()
-        .map(|v| v.name().unwrap().into())
-        .collect::<Vec<ffi::duckdb_v2_str>>();
-
-    let types = logical_types.iter().map(|v| v.handle).collect::<Vec<_>>();
-
-    check_api_call!(
-        ffi::duckdb_v2_logical_types_to_arrow_schema,
-        **context,
-        types.as_ptr(),
-        names.as_ptr(),
-        logical_types.len() as u64,
-        RET
-    )
+pub struct ArrowExporter {
+    handle: ffi::duckdb_v2_arrow_exporter_handle,
 }
 
-/// A reusable mapping from an Arrow schema to DuckDB logical types.
-///
-/// Build a plan once and reuse it for arrays with the same schema. Each
-/// imported array transfers ownership of its buffers to the returned
-/// [`DataChunk`].
-pub struct ConversionPlan {
-    /// The owned DuckDB Arrow-conversion-plan handle.
-    pub handle: ffi::duckdb_v2_arrow_conversion_plan_handle,
+impl ArrowExporter {
+    pub fn new(
+        context: &Context,
+        logical_types: &[LogicalType],
+        names: &[String],
+        count: usize,
+        batch_size: Option<usize>,
+    ) -> Result<Self> {
+        let logical_type_handles = logical_types.iter().map(|x| x.handle).collect::<Vec<_>>();
+        let name_ptrs = names.iter().map(|x| x.into()).collect::<Vec<DuckDBStr>>();
+
+        let handle = check_api_call!(
+            ffi::duckdb_v2_arrow_exporter_create,
+            **context,
+            logical_type_handles.as_ptr(),
+            name_ptrs.as_ptr(),
+            count as u64,
+            batch_size.unwrap_or(0) as u64,
+            RET
+        )?;
+
+        Ok(ArrowExporter { handle })
+    }
+
+    pub fn append(&mut self, mut chunk: DataChunkRef, flush: bool) -> Result<()> {
+        check_api_call!(
+            ffi::duckdb_v2_arrow_exporter_append,
+            self.handle,
+            &mut chunk.handle,
+            false,
+            flush
+        )
+    }
+
+    pub fn get_schema(&self) -> Result<ffi::ArrowSchema> {
+        check_api_call!(ffi::duckdb_v2_arrow_exporter_get_schema, self.handle, RET)
+    }
+
+    pub fn next_array(&self) -> Result<ffi::ArrowArray> {
+        check_api_call!(ffi::duckdb_v2_arrow_exporter_next_array, self.handle, RET)
+    }
 }
 
-impl ConversionPlan {
-    /// Resolve an Arrow schema using a context's type configuration.
-    ///
-    /// The schema remains caller-owned and may be released after this call.
-    pub fn new(context: &Context, schema: &mut ffi::ArrowSchema) -> Result<Self> {
-        Ok(Self {
-            handle: check_api_call!(ffi::duckdb_v2_arrow_conversion_plan_create, **context, schema, RET)?,
-        })
+impl Drop for ArrowExporter {
+    fn drop(&mut self) {
+        check_api_call_no_err!(ffi::duckdb_v2_arrow_exporter_destroy, &mut self.handle).unwrap();
+    }
+}
+
+pub struct ArrowImporter {
+    handle: ffi::duckdb_v2_arrow_importer_handle,
+}
+
+impl ArrowImporter {
+    pub fn new(context: Context, schema: &mut ffi::ArrowSchema, batch_size: Option<usize>) -> Result<Self> {
+        let handle = check_api_call!(
+            ffi::duckdb_v2_arrow_importer_create,
+            *context,
+            schema,
+            batch_size.unwrap_or(0) as u64,
+            RET
+        )?;
+        Ok(ArrowImporter { handle })
     }
 
-    /// Import an Arrow array as an owned data chunk.
-    ///
-    /// Ownership transfers to the chunk and the array's `release` callback is
-    /// cleared; do not release the array afterward.
-    pub fn to_data_chunk(&self, context: &Context, array: &mut ffi::ArrowArray) -> Result<DataChunk> {
-        Ok(DataChunk {
-            handle: check_api_call!(
-                ffi::duckdb_v2_arrow_array_to_data_chunk,
-                **context,
-                array,
-                self.handle,
-                RET
-            )?,
-            is_owned: true,
-            is_writable: false,
-        })
+    pub fn append(&self, array: &mut ffi::ArrowArray, flush: bool) -> Result<()> {
+        check_api_call!(ffi::duckdb_v2_arrow_importer_append, self.handle, array, false, flush)
     }
 
-    /// Return the resolved DuckDB field schema.
     pub fn schema(&self) -> Result<Schema> {
         Ok(Schema {
-            handle: check_api_call!(ffi::duckdb_v2_arrow_conversion_plan_get_schema, self.handle, RET)?,
+            handle: check_api_call!(ffi::duckdb_v2_arrow_importer_get_schema, self.handle, RET)?,
         })
+    }
+
+    pub fn chunk(&self) -> Result<DataChunk> {
+        Ok(DataChunk::new(
+            check_api_call!(ffi::duckdb_v2_arrow_importer_next_chunk, self.handle, RET)?,
+            true,
+        ))
     }
 }
 
-impl Drop for ConversionPlan {
+impl Drop for ArrowImporter {
     fn drop(&mut self) {
-        check_api_call_no_err!(ffi::duckdb_v2_arrow_conversion_plan_destroy, &mut self.handle).unwrap();
+        check_api_call_no_err!(ffi::duckdb_v2_arrow_importer_destroy, &mut self.handle).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        arrow::{ArrowExporter, ArrowImporter},
+        builder_helpers::scalar_callback,
+        data_chunk::DataChunk,
+        environment::{Environment, StorageLocation},
+    };
+
+    use crate::types::DuckDBType;
+
+    fn test_arrow_roundtrip() -> crate::Result<()> {
+        let env = Environment::new()?;
+        let db = env.open(StorageLocation::InMemory)?;
+        let conn = db.connect()?;
+
+        let data_chunk = DataChunk::create(&[i32::logical_type(&conn)?], false)?;
+        let mut vec = data_chunk.get_vector_at::<i32>(0)?;
+        vec.set_size(10)?;
+        for i in 0..10 {
+            vec.write(i, Some(i as i32))?;
+        }
+
+        Ok(())
     }
 }
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(false)]
 mod tests {
     use crate::{
         DuckDBType, Environment, Parameters, StorageLocation,

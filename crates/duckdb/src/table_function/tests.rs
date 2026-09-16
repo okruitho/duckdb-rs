@@ -1,11 +1,14 @@
 use std::sync::Mutex;
 
 use crate::{
-    Context, DuckDBType, Environment, Parameters, SettingScope, StorageLocation,
-    bind_arguments::BindArguments,
-    connection_options::OptionValue,
-    data_chunk::DataChunk,
+    DuckDBType, Parameters,
+    bind_arguments::BindView,
+    connection::{Context, SettingScope},
+    connection_options::ConfigOptionValue,
+    data_chunk::{DataChunk, DataChunkRef},
+    environment::{Environment, StorageLocation},
     error::{DuckDBError, Error},
+    logical_type::LogicalTypeID,
     signature::{Parameter, SignatureBuilder},
     table_function::{BindFunctionHandle, TableFunctionCallbacks, TableFunctionCardinality},
 };
@@ -46,13 +49,18 @@ fn test_table_function() -> crate::Result<()> {
         fn bind(
             &self,
             context: Context,
-            arguments: BindArguments,
+            arguments: Vec<BindView>,
             bind_handle: BindFunctionHandle,
         ) -> Result<(Self::BindData, Option<crate::table_function::TableFunctionCardinality>)> {
-            let val = arguments.fold(0, &context)?;
+            let arg = &arguments[0];
 
-            assert_eq!(arguments.names()?, vec!["offset"]);
-            assert_eq!(val.dbg_string()?, "10");
+            let val = &arg.value;
+
+            assert_eq!(
+                arg.logical_type.type_id(),
+                LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_INTEGER
+            );
+            assert_eq!(val.as_ref().unwrap().dbg_string()?, "10");
 
             bind_handle.add_result_column("out", i32::logical_type(&context)?)?;
 
@@ -95,6 +103,7 @@ fn test_table_function() -> crate::Result<()> {
         //TODO: Pushdown
 
         fn progress(
+            &self,
             _bind_data: Option<&Self::BindData>,
             global_state: Option<&Self::GlobalState>,
             _context: Context,
@@ -118,7 +127,7 @@ fn test_table_function() -> crate::Result<()> {
             global_state: Option<&Self::GlobalState>,
             local_state: Option<&mut Self::LocalState>,
             _context: Context,
-            output: DataChunk,
+            output: DataChunkRef,
         ) -> crate::Result<()> {
             let mut output_vector = output.get_vector_at::<i32>(0)?;
 
@@ -149,7 +158,7 @@ fn test_table_function() -> crate::Result<()> {
     let db = env.open(StorageLocation::InMemory)?;
     let conn = db.connect()?;
 
-    let option = OptionValue::new("enable_progress_bar", "true")?;
+    let option = ConfigOptionValue::new("enable_progress_bar", "true")?;
     conn.set_option(&option, Some(SettingScope::Local))?;
 
     TableFunctionBuilder::new(

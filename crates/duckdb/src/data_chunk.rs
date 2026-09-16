@@ -18,7 +18,7 @@ pub struct VectorCollection {
 
 impl VectorCollection {
     /// Return all vectors as logically untyped borrowed views.
-    pub fn vectors(&self) -> Result<Vec<Vector<Unknown>>> {
+    pub fn vectors(&self) -> Result<Vec<Vector<'_, Unknown>>> {
         let mut vectors = vec![];
 
         for handle in &self.handles {
@@ -46,7 +46,7 @@ impl VectorCollection {
 
 #[derive(Debug)]
 pub struct DataChunkRef<'a> {
-    handle: ffi::duckdb_v2_data_chunk_handle,
+    pub(crate) handle: ffi::duckdb_v2_data_chunk_handle,
     is_writable: bool,
     _marker: std::marker::PhantomData<&'a ()>,
 }

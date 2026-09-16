@@ -9,13 +9,13 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::ops::Deref;
 
-use libduckdb_sys::{self as ffi, duckdb_v2_str};
+use crate::ffi;
 
 use crate::bind_arguments::{BindMetadata, BindType};
 use crate::builder_helpers::{
     OpaqueHandle, context_and_connection_fn, get_bind_data, get_init_data, get_user_data, handle_unwind, into_opaque,
 };
-use crate::data_chunk::{DataChunk, VectorCollection};
+use crate::data_chunk::VectorCollection;
 use crate::enums::FunctionProperty;
 use crate::logical_type::LogicalType;
 use crate::signature::SignatureBuilder;

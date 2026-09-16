@@ -3,8 +3,8 @@
 use libduckdb_sys as ffi;
 
 use crate::{
-    Parameters, Result, check_api_call, check_api_call_no_err, connection::Connection, logical_type::LogicalType,
-    qualified_name::QualifiedName, schema::Schema,
+    Result, check_api_call, check_api_call_no_err, connection::Connection, logical_type::LogicalType,
+    qualified_name::QualifiedName,
 };
 
 pub struct ColumnDescription {
