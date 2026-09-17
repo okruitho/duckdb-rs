@@ -1,8 +1,6 @@
 //! File access through DuckDB's file system.
 
-use crate::{
-    Result, builder_helpers::context_and_connection_fn, check_api_call, check_api_call_no_err, ffi, value::Value,
-};
+use crate::{Result, check_api_call, check_api_call_no_err, ffi, links::FileSystemLink, value::Value};
 
 /// A borrowed handle to DuckDB's file system.
 pub struct FileSystem {
@@ -11,14 +9,10 @@ pub struct FileSystem {
 }
 
 impl FileSystem {
-    context_and_connection_fn! {
-        /// Borrow the file system associated with a connection or callback context.
-        pub fn from_[context, connection]() -> Result<Self>
-        {
-            context_fn: ffi::duckdb_v2_file_system_get_from_context,
-            connection_fn: ffi::duckdb_v2_file_system_get_from_connection,
-        }
-        let handle = check_api_call!(api_fn!(), **api_arg!(), RET)?;
+    /// Borrow the file system associated with a connection or callback context.
+    #[allow(private_bounds)]
+    pub fn new<C: FileSystemLink>(link: &C) -> Result<Self> {
+        let handle = link.get_file_system()?;
 
         Ok(FileSystem { handle })
     }
@@ -152,7 +146,7 @@ impl Drop for FileBuilder<'_> {
 /// let env = Environment::new()?;
 /// let db = env.open(StorageLocation::InMemory)?;
 /// let conn = db.connect()?;
-/// let fs = FileSystem::from_connection(&conn)?;
+/// let fs = FileSystem::new(&conn)?;
 /// let path = std::env::temp_dir().join("duckdb-rs-file-example.txt");
 /// let file = FileBuilder::new(&fs, path.to_str().unwrap())?
 ///         .write()?
@@ -294,7 +288,7 @@ mod tests {
         let db = env.open(StorageLocation::InMemory)?;
         let conn = db.connect()?;
 
-        let fs = FileSystem::from_connection(&conn)?;
+        let fs = FileSystem::new(&conn)?;
 
         let file = FileBuilder::new(&fs, "test_file.txt")?
             .write()?

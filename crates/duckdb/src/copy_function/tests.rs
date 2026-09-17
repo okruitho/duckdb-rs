@@ -31,8 +31,12 @@ impl CopyToFunctionCallbacks for RapidCopy {
         Ok(10)
     }
 
+    fn batch_size(&self, _context: Context, _bind_data: &Self::BindData) -> Option<usize> {
+        Some(1)
+    }
+
     fn init(&self, context: Context, _bind_data: &Self::BindData, file_path: &str) -> crate::Result<Self::InitData> {
-        let fs = FileSystem::from_context(&context)?;
+        let fs = FileSystem::new(&context)?;
 
         let file = FileBuilder::new(&fs, file_path)?.write()?.create()?.open()?;
 
@@ -109,7 +113,7 @@ impl CopyToFunctionCallbacks for RapidCopy {
     }
 }
 
-// #[test]
+#[test]
 pub fn test_copy_function() -> crate::Result<()> {
     let env = Environment::new().expect("Failed to create environment");
     let db = env
@@ -250,12 +254,12 @@ impl CopyToFunctionCallbacks for EchoFormat {
         Ok(())
     }
 
-    fn batch_size(&self, context: Context, bind_data: &Self::BindData) -> Option<usize> {
+    fn batch_size(&self, _context: Context, _bind_data: &Self::BindData) -> Option<usize> {
         Some(1)
     }
 
     fn init(&self, context: Context, _bind_data: &Self::BindData, file_path: &str) -> crate::Result<Self::InitData> {
-        let fs = FileSystem::from_context(&context)?;
+        let fs = FileSystem::new(&context)?;
         FileBuilder::new(&fs, file_path)?.write()?.create()?.open()
     }
 

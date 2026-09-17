@@ -92,15 +92,13 @@ unsafe extern "C" fn exec_callback<T: ScalarCallbacks>(
             let result_vec = Vector::from_handle(&result_handle, true)?;
 
             let arg_count = check_api_call!(ffi::duckdb_v2_scalar_function_exec_get_arg_count, info, RET)? as usize;
+            let row_count = check_api_call!(ffi::duckdb_v2_scalar_function_exec_get_row_count, info, RET)? as usize;
 
             let mut handles = Vec::with_capacity(arg_count);
-
             for i in 0..arg_count {
                 let handle = check_api_call!(ffi::duckdb_v2_scalar_function_exec_get_arg, info, i as u32, RET)?;
                 handles.push(handle);
             }
-
-            let mut row_count = check_api_call!(ffi::duckdb_v2_scalar_function_exec_get_row_count, info, RET)? as usize;
 
             let collection = VectorCollection {
                 handles: handles,

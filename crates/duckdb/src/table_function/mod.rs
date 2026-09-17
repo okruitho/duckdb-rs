@@ -15,8 +15,7 @@ use crate::{
     Result,
     bind_arguments::{BindMetadata, BindType, BindView},
     builder_helpers::{
-        OpaqueHandle, get_bind_data, get_global_state, get_local_state, get_opaque_data_ref, get_user_data,
-        handle_unwind, into_opaque,
+        OpaqueHandle, get_bind_data, get_global_state, get_local_state, get_user_data, handle_unwind, into_opaque,
     },
     check_api_call,
     connection::Context,
@@ -319,30 +318,6 @@ unsafe extern "C" fn progress_callback<T: TableFunctionCallbacks>(
     );
 }
 
-unsafe extern "C" fn cardinality_callback<T: TableFunctionCallbacks>(
-    bind_data: *mut ::std::os::raw::c_void,
-    out_estimated: *mut ffi::idx_t,
-    out_is_exact: *mut bool,
-    context: ffi::duckdb_v2_context_handle,
-    err: *mut ffi::duckdb_v2_error_info_handle,
-) {
-    handle_unwind(
-        || {
-            let bind_data = unsafe { get_opaque_data_ref::<T::BindData>(bind_data) };
-
-            if let Some(cardinality) = T::cardinality(bind_data, Context(context))? {
-                unsafe {
-                    *out_estimated = cardinality.cardinality as u64;
-                    *out_is_exact = cardinality.is_exact;
-                }
-            }
-
-            Ok(())
-        },
-        err,
-    );
-}
-
 unsafe extern "C" fn filter_pushdown_callback<T: TableFunctionCallbacks>(
     info: ffi::duckdb_v2_table_function_filter_pushdown_info_handle,
     ctx: ffi::duckdb_v2_context_handle,
@@ -502,14 +477,6 @@ pub trait TableFunctionCallbacks: Send + Sync + 'static {
         arguments: Vec<BindView>,
         bind_handle: BindFunctionHandle,
     ) -> Result<(Self::BindData, Option<TableFunctionCardinality>)>;
-
-    /// **Estimate:** report an output row count for optimization.
-    ///
-    /// This callback may run multiple times and should be cheap and
-    /// side-effect-free.
-    fn cardinality(_bind_data: Option<&Self::BindData>, _context: Context) -> Result<Option<TableFunctionCardinality>> {
-        Ok(None)
-    }
 
     /// **Progress:** report execution progress from `0.0` to `1.0`.
     fn progress(

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, hash::Hash};
+use std::collections::HashMap;
 
 use crate::logical_type::LogicalTypeID;
 use crate::types::{Any, StructValue};
@@ -18,7 +18,7 @@ use crate::{
         TimestampNsValue, TimestampSecValue, TimestampTzNsValue, TimestampTzValue, TimestampValue, Union, UnionSchema,
         UnionValue, UuidValue, Variant, structs::StructWrite, union::UnionWriter,
     },
-    vector::{StorageKind, Unknown},
+    vector::StorageKind,
 };
 
 use crate::{scalar::ScalarFunctionBuilder, signature::SignatureBuilder};
@@ -1074,7 +1074,7 @@ pub fn test_vector_set_value() -> crate::Result<()> {
 
                 if let Some(value) = value {
                     let lt = LogicalType::from_text(&ctx, "VARIANT")?;
-                    let result = value.cast_with_context(&ctx, lt)?;
+                    let result = value.cast(&ctx, lt)?;
                     output.write_value_slow(idx, result)?;
                 } else {
                     output.set_null_slow(idx)?

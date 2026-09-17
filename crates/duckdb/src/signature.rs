@@ -304,7 +304,6 @@ impl SignatureBuilder {
 mod test {
     use crate::Parameters;
     use crate::builder_helpers::scalar_callback;
-    use crate::logical_type::LogicalTypeID;
     use crate::scalar::ScalarFunctionBuilder;
     use crate::{
         DuckDBType, ToValue,

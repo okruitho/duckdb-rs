@@ -23,6 +23,7 @@ use crate::{
     database::DatabaseHandle,
     error::{DuckDBError, Error, check_api_call, check_api_call_no_err},
     ffi,
+    links::LogicalTypeFromTextLink,
     logical_type::{LogicalType, LogicalTypeID},
     parameter::ParameterValue,
     query_result::QueryResult,
@@ -282,19 +283,20 @@ pub trait FFILink {
 
 impl FFILink for Connection {
     fn logical_type_create(&self, name: &str, parameters: Parameters<'_>) -> Result<LogicalType> {
-        LogicalType::create_with_connection(self, name, parameters)
+        LogicalType::create(self, name, parameters)
     }
 
     fn logical_type_create_from_id(&self, type_id: LogicalTypeID, parameters: Parameters<'_>) -> Result<LogicalType> {
-        LogicalType::create_from_id_with_connection(self, type_id, parameters)
+        LogicalType::create_from_id(self, type_id, parameters)
     }
 
     fn logical_type_from_text(&self, text: &str) -> Result<LogicalType> {
-        LogicalType::from_text_with_connection(self, text)
+        self.create_logical_type_from_text(text)
+            .map(|handle| LogicalType { handle })
     }
 
     fn value_cast(&self, value: &Value, target_type: LogicalType) -> Result<Value> {
-        value.cast_with_connection(self, target_type)
+        value.cast(self, target_type)
     }
 
     fn create_value(&self, input: ValueInput<'_>) -> Result<Value> {
@@ -329,19 +331,20 @@ impl Deref for Context {
 
 impl FFILink for Context {
     fn logical_type_create(&self, name: &str, parameters: Parameters<'_>) -> Result<LogicalType> {
-        LogicalType::create_with_context(self, name, parameters)
+        LogicalType::create(self, name, parameters)
     }
 
     fn logical_type_create_from_id(&self, type_id: LogicalTypeID, parameters: Parameters<'_>) -> Result<LogicalType> {
-        LogicalType::create_from_id_with_context(self, type_id, parameters)
+        LogicalType::create_from_id(self, type_id, parameters)
     }
 
     fn logical_type_from_text(&self, text: &str) -> Result<LogicalType> {
-        LogicalType::from_text_with_context(self, text)
+        self.create_logical_type_from_text(text)
+            .map(|handle| LogicalType { handle })
     }
 
     fn value_cast(&self, value: &Value, target_type: LogicalType) -> Result<Value> {
-        value.cast_with_context(self, target_type)
+        value.cast(self, target_type)
     }
 
     fn create_value(&self, input: ValueInput<'_>) -> Result<Value> {

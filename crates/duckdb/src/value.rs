@@ -5,10 +5,9 @@ use std::{fmt::Debug, ops::Deref};
 use libduckdb_sys::{self as ffi};
 
 use crate::{
-    Result,
-    builder_helpers::context_and_connection_fn,
-    check_api_call, check_api_call_no_err, check_api_call_string,
+    Result, check_api_call, check_api_call_no_err, check_api_call_string,
     connection::{Connection, Context, FFILink},
+    links::ValueCastLink,
     logical_type::LogicalType,
     types::FromValue,
 };
@@ -379,23 +378,10 @@ impl Value {
         Ok(Value { handle })
     }
 
-    context_and_connection_fn! {
-        /// Cast a value using a connection or callback context's registered casts.
-        pub fn cast_with_[context, connection](
-            &self,
-            target_type: LogicalType,
-        ) -> Result<Value>
-        {
-            context_fn: ffi::duckdb_v2_value_cast_with_context,
-            connection_fn: ffi::duckdb_v2_value_cast_with_connection,
-        }
-        let handle = check_api_call!(
-            api_fn!(),
-            **api_arg!(),
-            self.handle,
-            target_type.handle,
-            RET
-        )?;
+    /// Cast a value using a connection or callback context's registered casts.
+    #[allow(private_bounds)]
+    pub fn cast<C: ValueCastLink>(&self, link: &C, target_type: LogicalType) -> Result<Value> {
+        let handle = link.cast_value(self.handle, target_type.handle)?;
 
         Ok(Value { handle })
     }

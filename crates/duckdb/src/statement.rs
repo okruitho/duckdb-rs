@@ -8,7 +8,6 @@ use crate::{
     ffi,
     query_result::{QueryResult, StatementType},
     schema::Schema,
-    signature::Parameter,
 };
 
 /// Schemas resolved while binding a statement.
@@ -211,7 +210,7 @@ impl<'a> Drop for PreparedStatement<'a> {
 mod tests {
     use crate::{
         environment::{Environment, StorageLocation},
-        statement::{Statement, Statements},
+        statement::Statements,
     };
 
     #[test]

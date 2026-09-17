@@ -1,15 +1,6 @@
 //! Emit DuckDB log records and register custom log storage.
 
-use crate::{
-    Result,
-    builder_helpers::{ffi_enum_redeclaration, get_opaque_data_ref, handle_unwind},
-    check_api_call,
-    connection::Context,
-    ffi,
-};
-
-#[cfg(feature = "capi-v2-p4")]
-use crate::{builder_helpers::OpaqueHandle, database::Database, handles::LogStorageBuilderHandle};
+use crate::{Result, builder_helpers::ffi_enum_redeclaration, check_api_call, connection::Context, ffi};
 
 ffi_enum_redeclaration! {
     /// The severity of a DuckDB log record.
@@ -39,6 +30,7 @@ impl Log {
     }
 }
 
+#[cfg(feature = "capi-v2-p4")]
 unsafe extern "C" fn log_callback<T: LogStorageCallbacks>(
     user_data: *mut ::std::os::raw::c_void,
     timestamp: i64,
@@ -161,37 +153,18 @@ pub trait LogStorageCallbacks: Send + Sync + 'static {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use std::sync::atomic::AtomicI64;
-
     use crate::{
         Parameters,
         builder_helpers::scalar_callback,
         connection::SettingScope,
         connection_options::ConfigOptionValue,
         environment::{Environment, StorageLocation},
-        log::{Log, LogLevel, LogStorageCallbacks},
+        log::{Log, LogLevel},
         scalar::ScalarFunctionBuilder,
-        signature::{Parameter, ParameterType, SignatureBuilder},
+        signature::{Parameter, SignatureBuilder},
     };
 
-    static IS_CALLED: AtomicI64 = AtomicI64::new(0);
-
-    struct CustomLogger;
-
-    impl LogStorageCallbacks for CustomLogger {
-        fn log(&self, log_message: &str, level: LogLevel, _timestamp: i64, log_type: &str) -> crate::Result<()> {
-            assert_eq!(log_type, "cpp_api_test");
-            assert_ne!(log_message, "wrong message");
-            assert_eq!(level, LogLevel::Warn);
-
-            let current_count = IS_CALLED.load(std::sync::atomic::Ordering::Relaxed);
-            IS_CALLED.store(current_count + 1, std::sync::atomic::Ordering::Relaxed);
-
-            Ok(())
-        }
-    }
-
-    scalar_callback!(LogCallback, i32, |input, result, ctx, _ud| {
+    scalar_callback!(LogCallback, i32, |_input, _result, ctx, _ud| {
         Log::log_on_context(&ctx, LogLevel::Warn, "first message", "cpp_api_test")
     });
 

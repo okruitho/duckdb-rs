@@ -5,8 +5,11 @@ use std::ops::Deref;
 use libduckdb_sys::{self as ffi, DUCKDB_V2_LOGICAL_TYPE_ID};
 
 use crate::{
-    Parameters, Result, builder_helpers::context_and_connection_fn, check_api_call, check_api_call_no_err,
-    check_api_call_string, connection::FFILink, qualified_name::QualifiedName, value::Value,
+    Parameters, Result, check_api_call, check_api_call_no_err, check_api_call_string,
+    connection::FFILink,
+    links::{LogicalTypeAliasLink, LogicalTypeFromIdLink, LogicalTypeFromNameLink},
+    qualified_name::QualifiedName,
+    value::Value,
 };
 
 /// DuckDB's logical type identifier.
@@ -44,72 +47,34 @@ pub struct LogicalType {
 }
 
 impl LogicalType {
-    context_and_connection_fn! {
-        /// Construct a logical type from a primitive ID and optional parameters.
-        pub fn create_from_id_with_[context, connection](
-            type_id: LogicalTypeID,
-            parameters: Parameters<'_>,
-        ) -> Result<Self>
-        {
-            context_fn: ffi::duckdb_v2_context_create_type_from_id,
-            connection_fn: ffi::duckdb_v2_connection_create_type_from_id,
-        }
-        let (names, values) = parameters.into_values(api_arg!())?;
+    /// Construct a logical type from a primitive ID and optional parameters
+    /// using a connection or callback context.
+    #[allow(private_bounds)]
+    pub fn create_from_id<C: FFILink + LogicalTypeFromIdLink>(
+        link: &C,
+        type_id: LogicalTypeID,
+        parameters: Parameters<'_>,
+    ) -> Result<Self> {
+        let (names, parameter_values) = parameters.into_values(link)?;
         let names = names.map(|names| {
             names
                 .iter()
                 .map(|name| (*name).into())
                 .collect::<Vec<ffi::duckdb_v2_str>>()
         });
-        let values = values
+        let values = parameter_values
             .iter()
             .map(|value| value.as_value().handle)
             .collect::<Vec<_>>();
-        let handle = check_api_call!(
-            api_fn!(),
-            **api_arg!(),
-            type_id,
-            names
-                .as_ref()
-                .map_or(std::ptr::null(), |names| names.as_ptr()),
-            values.as_ptr(),
-            values.len() as u64,
-            RET
-        )?;
+        let handle = link.create_logical_type_from_id(type_id, names.as_deref(), &values)?;
 
         Ok(LogicalType { handle })
     }
 
-    context_and_connection_fn! {
-        pub(crate) fn from_text_with_[context, connection](text: &str) -> Result<Self>
-        {
-            context_fn: ffi::duckdb_v2_context_create_type_from_text,
-            connection_fn: ffi::duckdb_v2_connection_create_type_from_text,
-        }
-        let handle = check_api_call!(
-            api_fn!(),
-            **api_arg!(),
-            text.into(),
-            RET
-        )?;
-
-        Ok(LogicalType { handle })
-    }
-
-    context_and_connection_fn! {
-        /// Return an alias with the same representation.
-        pub fn to_alias_with_[context, connection](&self, alias: &str) -> Result<Self>
-        {
-            context_fn: ffi::duckdb_v2_context_create_type_with_alias,
-            connection_fn: ffi::duckdb_v2_connection_create_type_with_alias,
-        }
-        let handle = check_api_call!(
-            api_fn!(),
-            **api_arg!(),
-            self.handle,
-            alias.into(),
-            RET
-        )?;
+    /// Return an alias with the same representation using a connection or callback context.
+    #[allow(private_bounds)]
+    pub fn to_alias<C: LogicalTypeAliasLink>(&self, link: &C, alias: &str) -> Result<Self> {
+        let handle = link.create_logical_type_with_alias(self.handle, alias)?;
 
         Ok(LogicalType { handle })
     }
@@ -119,41 +84,29 @@ impl LogicalType {
         handle.logical_type_from_text(text)
     }
 
-    context_and_connection_fn! {
-        /// Construct a logical type from a name and optional parameters.
-        pub fn create_with_[context, connection](
-            name: &str,
-            parameters: Parameters<'_>,
-        ) -> Result<Self>
-        {
-            context_fn: ffi::duckdb_v2_context_create_type_from_name,
-            connection_fn: ffi::duckdb_v2_connection_create_type_from_name,
-        }
-        let (names, values) = parameters.into_values(api_arg!())?;
+    /// Construct a logical type from a name and optional parameters
+    /// using a connection or callback context.
+    #[allow(private_bounds)]
+    pub fn create<C: FFILink + LogicalTypeFromNameLink>(
+        link: &C,
+        name: &str,
+        parameters: Parameters<'_>,
+    ) -> Result<Self> {
+        let (names, parameter_values) = parameters.into_values(link)?;
         let names = names.map(|names| {
             names
                 .iter()
                 .map(|name| (*name).into())
                 .collect::<Vec<ffi::duckdb_v2_str>>()
         });
-        let values = values
+        let values = parameter_values
             .iter()
             .map(|value| value.as_value().handle)
             .collect::<Vec<_>>();
 
         let qname = QualifiedName::from_sql(name)?;
 
-        let handle = check_api_call!(
-            api_fn!(),
-            **api_arg!(),
-            *qname,
-            names
-                .as_ref()
-                .map_or(std::ptr::null(), |names| names.as_ptr()),
-            values.as_ptr(),
-            values.len() as u64,
-            RET
-        )?;
+        let handle = link.create_logical_type_from_name(*qname, names.as_deref(), &values)?;
 
         Ok(LogicalType { handle })
     }
@@ -275,8 +228,7 @@ mod test {
 
         let key_type = Value::from_logical_type(&conn, &i32::logical_type(&conn)?)?;
         let value_type = Value::from_logical_type(&conn, &String::logical_type(&conn)?)?;
-        let ltype =
-            LogicalType::create_with_connection(&conn, "map", Parameters::positional(&[&key_type, &value_type]))?;
+        let ltype = LogicalType::create(&conn, "map", Parameters::positional(&[&key_type, &value_type]))?;
 
         assert_eq!(ltype.name()?, "MAP");
         assert_eq!(ltype.param_count()?, 2);
@@ -300,7 +252,7 @@ mod test {
 
         let ltype = MapValue::<i32, String>::logical_type(&conn)?;
 
-        let alias_ltype = ltype.to_alias_with_connection(&conn, "my_map")?;
+        let alias_ltype = ltype.to_alias(&conn, "my_map")?;
 
         assert_eq!(alias_ltype.name()?, "my_map");
         assert_eq!(alias_ltype.param_count()?, 2);

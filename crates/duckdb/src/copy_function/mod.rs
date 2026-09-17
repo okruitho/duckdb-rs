@@ -734,17 +734,18 @@ pub trait CopyToFunctionCallbacks: Send + Sync + 'static {
     fn bind(&self, context: Context, bind_info: CopyToBindInfo) -> Result<Self::BindData>;
 
     /// **Initialize:** open the output path and create file-level state.
-    fn init(&self, _context: Context, _bind_data: &Self::BindData, file_path: &str) -> Result<Self::InitData>;
+    fn init(&self, context: Context, bind_data: &Self::BindData, file_path: &str) -> Result<Self::InitData>;
 
     /// **Batch:** prepare one input collection for flushing.
     fn batch(
         &self,
-        _context: Context,
-        _bind_data: &Self::BindData,
-        _init_data: &Self::InitData,
+        context: Context,
+        bind_data: &Self::BindData,
+        init_data: &Self::InitData,
         input: ColumnDataCollection,
     ) -> Result<Self::BatchData>;
 
+    #[allow(unused_variables)]
     fn batch_size(&self, context: Context, bind_data: &Self::BindData) -> Option<usize> {
         return None;
     }
@@ -752,14 +753,14 @@ pub trait CopyToFunctionCallbacks: Send + Sync + 'static {
     /// **Flush:** write one prepared batch to the output.
     fn flush(
         &self,
-        _context: Context,
-        _bind_data: &Self::BindData,
-        _init_data: &Self::InitData,
-        _batch_data: &Self::BatchData,
+        context: Context,
+        bind_data: &Self::BindData,
+        init_data: &Self::InitData,
+        batch_data: &Self::BatchData,
     ) -> Result<()>;
 
     /// **Finalize:** finish and close the output after all batches are flushed.
-    fn finalize(&self, _context: Context, _bind_data: &Self::BindData, _init_data: &Self::InitData) -> Result<()>;
+    fn finalize(&self, context: Context, bind_data: &Self::BindData, init_data: &Self::InitData) -> Result<()>;
 }
 
 #[cfg(test)]

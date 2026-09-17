@@ -109,33 +109,6 @@ impl Drop for ArrowImporter {
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::{
-        arrow::{ArrowExporter, ArrowImporter},
-        builder_helpers::scalar_callback,
-        data_chunk::DataChunk,
-        environment::{Environment, StorageLocation},
-    };
-
-    use crate::types::DuckDBType;
-
-    fn test_arrow_roundtrip() -> crate::Result<()> {
-        let env = Environment::new()?;
-        let db = env.open(StorageLocation::InMemory)?;
-        let conn = db.connect()?;
-
-        let data_chunk = DataChunk::create(&[i32::logical_type(&conn)?], false)?;
-        let mut vec = data_chunk.get_vector_at::<i32>(0)?;
-        vec.set_size(10)?;
-        for i in 0..10 {
-            vec.write(i, Some(i as i32))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(false)]
 mod tests {

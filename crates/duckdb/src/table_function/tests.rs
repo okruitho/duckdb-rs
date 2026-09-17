@@ -5,7 +5,7 @@ use crate::{
     bind_arguments::BindView,
     connection::{Context, SettingScope},
     connection_options::ConfigOptionValue,
-    data_chunk::{DataChunk, DataChunkRef},
+    data_chunk::DataChunkRef,
     environment::{Environment, StorageLocation},
     error::{DuckDBError, Error},
     logical_type::LogicalTypeID,
@@ -35,16 +35,6 @@ fn test_table_function() -> crate::Result<()> {
         type BindData = BindData;
         type GlobalState = GlobalStateCounter;
         type LocalState = i32;
-
-        fn cardinality(
-            _bind_data: Option<&Self::BindData>,
-            _context: Context,
-        ) -> crate::Result<Option<TableFunctionCardinality>> {
-            Ok(Some(TableFunctionCardinality {
-                is_exact: true,
-                cardinality: 10_000_000,
-            }))
-        }
 
         fn bind(
             &self,

@@ -3,12 +3,12 @@ use std::fmt::Display;
 use libduckdb_sys::{DUCKDB_V2_FUNCTION_PROPERTY_KEY, DUCKDB_V2_FUNCTION_PROPERTY_VALUE};
 
 use crate::{
-    DuckDBType, Parameters, ToValue,
-    aggregate::{AggregateCallbacks, AggregateFunctionBuilder, BindMetadata, States},
+    DuckDBType, Parameters,
+    aggregate::{AggregateCallbacks, AggregateFunctionBuilder},
     bind_arguments::BindView,
     connection::Context,
-    connection_options::{ConfigOption, ConfigOptionValue},
-    data_chunk::{DataChunk, DataChunkRef, VectorCollection},
+    connection_options::ConfigOptionValue,
+    data_chunk::VectorCollection,
     environment::{Environment, StorageLocation},
     signature::{Parameter, SignatureBuilder},
     vector::Vector,
@@ -43,10 +43,12 @@ impl<T: Display + Send + Sync + 'static> AggregateCallbacks for BasicAggregate<T
         Ok(bind_data)
     }
 
+    #[allow(unused_variables)]
     fn init(&self, bind_data: Option<&Self::BindData>) -> crate::Result<Self::StateItem> {
         Ok(vec![])
     }
 
+    #[allow(unused_variables)]
     fn size(&self, bind_data: Option<&Self::BindData>) -> crate::Result<usize> {
         Ok(std::mem::size_of::<Self::StateItem>())
     }
