@@ -118,7 +118,7 @@ pub fn basic_aggregate_test() -> crate::Result<()> {
         ),
         BasicAggregate::<f32> { item: 0.0 },
     )
-    .register_with_connection(&conn)?;
+    .register(&conn)?;
 
     let result = conn.query(
         "SELECT to_concatenated(i) AS result FROM (VALUES (1), (2), (NULL), (3), (4), (5)) AS t(i)",
@@ -161,7 +161,7 @@ pub fn aggregate_test_invalid_build() -> crate::Result<()> {
         DUCKDB_V2_FUNCTION_PROPERTY_VALUE::DUCKDB_V2_FUNCTION_PROPERTY_VALUE_MAX_ENUM,
     );
 
-    let result = result.register_with_connection(&conn);
+    let result = result.register(&conn);
 
     assert!(result.is_err());
 
@@ -173,7 +173,7 @@ pub fn aggregate_test_invalid_build() -> crate::Result<()> {
         ),
         BasicAggregate::<i32> { item: 0 },
     )
-    .register_with_connection(&conn);
+    .register(&conn);
 
     assert!(result.is_err());
 
@@ -194,7 +194,7 @@ fn aggregate_test_groups() -> crate::Result<()> {
         ),
         BasicAggregate::<i32> { item: 0 },
     )
-    .register_with_connection(&conn)?;
+    .register(&conn)?;
 
     let result = conn.query(
         "SELECT

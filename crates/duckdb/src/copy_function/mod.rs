@@ -8,19 +8,20 @@
 //! chunks. A type may implement either trait, or both to support the format's
 //! name on both sides of `COPY`. Register with [`CopyFunctionBuilder`].
 
-use std::{any::Any, collections::HashMap, ops::Deref};
+use std::{any::Any, collections::HashMap};
 
 use crate::{
     Result,
     builder_helpers::{
-        OpaqueHandle, context_and_connection_fn, get_bind_data, get_global_state, get_init_data, get_local_state,
-        get_opaque_data_ref, get_user_data, handle_unwind, into_opaque,
+        OpaqueHandle, get_bind_data, get_global_state, get_init_data, get_local_state, get_opaque_data_ref,
+        get_user_data, handle_unwind, into_opaque,
     },
-    check_api_call, check_api_call_no_err,
+    check_api_call,
     column_data_collection::ColumnDataCollection,
     connection::Context,
     data_chunk::DataChunkRef,
     ffi,
+    handles::{CopyFunctionBuilderHandle, CopyFunctionBuilderLink},
     logical_type::LogicalType,
     value::Value,
 };
@@ -189,22 +190,6 @@ unsafe extern "C" fn finalize_to_callback<T: CopyToFunctionCallbacks>(
     );
 }
 
-struct CopyFunctionBuilderHandle(ffi::duckdb_v2_copy_function_handle);
-
-impl Deref for CopyFunctionBuilderHandle {
-    type Target = ffi::duckdb_v2_copy_function_handle;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl Drop for CopyFunctionBuilderHandle {
-    fn drop(&mut self) {
-        check_api_call_no_err!(ffi::duckdb_v2_copy_function_destroy, &mut self.0).unwrap();
-    }
-}
-
 /// Builds and registers a user-defined `COPY TO` format.
 pub struct CopyFunctionBuilder<T> {
     user_data: OpaqueHandle<T>,
@@ -225,7 +210,7 @@ impl<T> CopyFunctionBuilder<T> {
     fn build_common(&self, handle: &CopyFunctionBuilderHandle) -> Result<()> {
         check_api_call!(
             ffi::duckdb_v2_copy_function_set_name,
-            handle.0,
+            **handle,
             &mut (&self.name).into()
         )?;
 
@@ -282,23 +267,13 @@ impl<T: CopyToFunctionCallbacks> CopyFunctionBuilder<T> {
         Ok(())
     }
 
-    context_and_connection_fn! {
-        /// Register the copy function through a connection or extension.
-        pub fn register_with_[extension, connection](self) -> Result<()>
-        {
-            extension_fn: ffi::duckdb_v2_copy_function_create_with_extension,
-            connection_fn: ffi::duckdb_v2_copy_function_create_with_connection,
-        }
-        let handle = CopyFunctionBuilderHandle(check_api_call!(api_fn!(), **api_arg!(), RET)?);
-
+    /// Register the `COPY TO` side through a connection or extension, consuming the builder.
+    #[allow(private_bounds)]
+    pub fn register<C: CopyFunctionBuilderLink>(self, link: &C) -> Result<()> {
+        let handle = link.create_copy_function_handle()?;
         self.build(&handle)?;
 
-        check_api_call!(
-        ffi::duckdb_v2_copy_function_register,
-            *handle,
-        )?;
-
-        Ok(())
+        check_api_call!(ffi::duckdb_v2_copy_function_register, *handle)
     }
 }
 
@@ -342,45 +317,25 @@ impl<T: CopyFromFunctionCallbacks> CopyFunctionBuilder<T> {
         self.set_from_callbacks(handle)
     }
 
-    context_and_connection_fn! {
-        /// Register the copy function's `COPY ... FROM` side through a connection or extension.
-        pub fn register_from_with_[extension, connection](self) -> Result<()>
-        {
-            extension_fn: ffi::duckdb_v2_copy_function_create_with_extension,
-            connection_fn: ffi::duckdb_v2_copy_function_create_with_connection,
-        }
-        let handle = CopyFunctionBuilderHandle(check_api_call!(api_fn!(), **api_arg!(), RET)?);
-
+    /// Register the `COPY FROM` side through a connection or extension, consuming the builder.
+    #[allow(private_bounds)]
+    pub fn register_from<C: CopyFunctionBuilderLink>(self, link: &C) -> Result<()> {
+        let handle = link.create_copy_function_handle()?;
         self.build_from(&handle)?;
 
-        check_api_call!(
-            ffi::duckdb_v2_copy_function_register,
-            *handle,
-        )?;
-
-        Ok(())
+        check_api_call!(ffi::duckdb_v2_copy_function_register, *handle)
     }
 }
 
 impl<T: CopyToFunctionCallbacks + CopyFromFunctionCallbacks> CopyFunctionBuilder<T> {
-    context_and_connection_fn! {
-        /// Register both the `COPY ... TO` and `COPY ... FROM` sides through a connection or extension.
-        pub fn register_to_and_from_with_[extension, connection](self) -> Result<()>
-        {
-            extension_fn: ffi::duckdb_v2_copy_function_create_with_extension,
-            connection_fn: ffi::duckdb_v2_copy_function_create_with_connection,
-        }
-        let handle = CopyFunctionBuilderHandle(check_api_call!(api_fn!(), **api_arg!(), RET)?);
-
+    /// Register both `COPY TO` and `COPY FROM` through a connection or extension, consuming the builder.
+    #[allow(private_bounds)]
+    pub fn register_to_and_from<C: CopyFunctionBuilderLink>(self, link: &C) -> Result<()> {
+        let handle = link.create_copy_function_handle()?;
         self.build(&handle)?;
         self.set_from_callbacks(&handle)?;
 
-        check_api_call!(
-            ffi::duckdb_v2_copy_function_register,
-            *handle,
-        )?;
-
-        Ok(())
+        check_api_call!(ffi::duckdb_v2_copy_function_register, *handle)
     }
 }
 
@@ -700,8 +655,7 @@ pub struct CopyFromCardinality {
 ///
 /// A type may also implement [`CopyToFunctionCallbacks`] to support `COPY
 /// ... TO` under the same format name; register both sides at once with
-/// [`CopyFunctionBuilder::register_to_and_from_with_connection`] or
-/// [`CopyFunctionBuilder::register_to_and_from_with_extension`].
+/// [`CopyFunctionBuilder::register_to_and_from`].
 pub trait CopyFromFunctionCallbacks: Send + Sync + 'static {
     /// Data resolved while binding the file path, columns, and options.
     type BindData: Any + Send + Sync;
@@ -767,8 +721,7 @@ pub trait CopyFromFunctionCallbacks: Send + Sync + 'static {
 ///
 /// A type may also implement [`CopyFromFunctionCallbacks`] to support `COPY
 /// ... FROM` under the same format name; register both sides at once with
-/// [`CopyFunctionBuilder::register_to_and_from_with_connection`] or
-/// [`CopyFunctionBuilder::register_to_and_from_with_extension`].
+/// [`CopyFunctionBuilder::register_to_and_from`].
 pub trait CopyToFunctionCallbacks: Send + Sync + 'static {
     /// State created once for the bound copy operation.
     type InitData: Any + Send + Sync;

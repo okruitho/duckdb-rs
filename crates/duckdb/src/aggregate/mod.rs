@@ -8,7 +8,7 @@
 use std::{
     any::Any,
     collections::HashMap,
-    ops::{Deref, Index, IndexMut},
+    ops::{Index, IndexMut},
 };
 
 use libduckdb_sys::{self as ffi};
@@ -16,13 +16,12 @@ use libduckdb_sys::{self as ffi};
 use crate::{
     Result,
     bind_arguments::{BindMetadata, BindType, BindView},
-    builder_helpers::{
-        OpaqueHandle, context_and_connection_fn, get_bind_data, get_user_data, handle_unwind, into_opaque,
-    },
-    check_api_call, check_api_call_no_err,
+    builder_helpers::{OpaqueHandle, get_bind_data, get_user_data, handle_unwind, into_opaque},
+    check_api_call,
     connection::Context,
     data_chunk::VectorCollection,
     enums::FunctionProperty,
+    handles::{AggregateFunctionBuilderHandle, AggregateFunctionBuilderLink},
     signature::SignatureBuilder,
     vector::{Vector, VectorElement},
 };
@@ -188,10 +187,13 @@ unsafe extern "C" fn update_callback<T: AggregateCallbacks>(
 
             let arg_count =
                 check_api_call!(ffi::duckdb_v2_aggregate_function_update_get_arg_count, info, RET)? as usize;
+            let row_count =
+                check_api_call!(ffi::duckdb_v2_aggregate_function_update_get_row_count, info, RET)? as usize;
 
             let mut vector_collection = VectorCollection {
                 handles: Vec::with_capacity(arg_count),
                 is_writable: false,
+                row_count,
             };
 
             for i in 0..arg_count {
@@ -315,22 +317,6 @@ unsafe extern "C" fn destroy_callback<T: AggregateCallbacks>(
     );
 }
 
-struct AggregateFunctionBuilderHandle(ffi::duckdb_v2_aggregate_function_handle);
-
-impl Drop for AggregateFunctionBuilderHandle {
-    fn drop(&mut self) {
-        check_api_call_no_err!(ffi::duckdb_v2_aggregate_function_destroy, &mut self.0).unwrap();
-    }
-}
-
-impl Deref for AggregateFunctionBuilderHandle {
-    type Target = ffi::duckdb_v2_aggregate_function_handle;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
 /// Builds and registers a user-defined aggregate function.
 pub struct AggregateFunctionBuilder<T: AggregateCallbacks> {
     name: String,
@@ -423,22 +409,13 @@ impl<T: AggregateCallbacks> AggregateFunctionBuilder<T> {
         Ok(())
     }
 
-    context_and_connection_fn! {
-        /// Register the function through a connection or callback context.
-        pub fn register_with_[extension, connection](self) -> Result<()>
-        {
-            extension_fn: ffi::duckdb_v2_aggregate_function_create_with_extension,
-            connection_fn: ffi::duckdb_v2_aggregate_function_create_with_connection,
-        }
-        let handle = AggregateFunctionBuilderHandle(check_api_call!(api_fn!(), **api_arg!(), RET)?);
-
+    /// Register through a connection or extension, consuming the builder.
+    #[allow(private_bounds)]
+    pub fn register<C: AggregateFunctionBuilderLink>(self, link: &C) -> Result<()> {
+        let handle = link.create_aggregate_function_handle()?;
         self.build(&handle)?;
 
-        check_api_call!(
-            ffi::duckdb_v2_aggregate_function_register,
-            *handle
-        )?;
-        Ok(())
+        check_api_call!(ffi::duckdb_v2_aggregate_function_register, *handle)
     }
 }
 

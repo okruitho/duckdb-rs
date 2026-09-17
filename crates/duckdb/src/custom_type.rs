@@ -1,11 +1,10 @@
 //! Registration of named custom logical types.
 
-use std::ops::Deref;
-
 use libduckdb_sys as ffi;
 
 use crate::{
-    Result, builder_helpers::context_and_connection_fn, check_api_call, check_api_call_no_err,
+    Result, check_api_call,
+    handles::{CustomTypeBuilderHandle, CustomTypeBuilderLink},
     logical_type::LogicalType,
 };
 
@@ -27,7 +26,7 @@ use crate::{
 /// let conn = db.connect()?;
 ///
 /// let temperature = CustomType::new("TEMPERATURE", i32::logical_type(&conn)?)?;
-/// temperature.register_with_connection(&conn)?;
+/// temperature.register(&conn)?;
 ///
 /// let logical_type = i32::logical_type(&conn)?.to_alias_with_connection(&conn, "TEMPERATURE")?;
 /// assert_eq!(logical_type.to_string()?, "TEMPERATURE");
@@ -37,21 +36,6 @@ use crate::{
 pub struct CustomType {
     base_type: LogicalType,
     name: String,
-}
-
-struct CustomTypeBuilderHandle(ffi::duckdb_v2_custom_type_handle);
-
-impl Deref for CustomTypeBuilderHandle {
-    type Target = ffi::duckdb_v2_custom_type_handle;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl Drop for CustomTypeBuilderHandle {
-    fn drop(&mut self) {
-        check_api_call_no_err!(ffi::duckdb_v2_custom_type_destroy, &mut self.0).unwrap();
-    }
 }
 
 impl CustomType {
@@ -75,25 +59,13 @@ impl CustomType {
         Ok(())
     }
 
-    context_and_connection_fn! {
-        /// Register the type through a connection or callback context.
-        pub fn register_with_[extension, connection](self) -> Result<()>
-        {
-            extension_fn: ffi::duckdb_v2_custom_type_create_with_extension,
-            connection_fn: ffi::duckdb_v2_custom_type_create_with_connection,
-        }
-        let handle = CustomTypeBuilderHandle(check_api_call!(
-            api_fn!(),
-            **api_arg!(),
-            RET,
-        )?);
-
+    /// Register through a connection or extension, consuming the builder.
+    #[allow(private_bounds)]
+    pub fn register<C: CustomTypeBuilderLink>(self, link: &C) -> Result<()> {
+        let handle = link.create_custom_type_handle()?;
         self.build(&handle)?;
 
-        check_api_call!(
-            ffi::duckdb_v2_custom_type_register,
-            *handle
-        )
+        check_api_call!(ffi::duckdb_v2_custom_type_register, *handle)
     }
 }
 
@@ -115,7 +87,7 @@ mod tests {
 
         let custom_type = CustomType::new("TEMPERATURE", i32::logical_type(&conn)?)?;
 
-        custom_type.register_with_connection(&conn)?;
+        custom_type.register(&conn)?;
 
         let integer = i32::logical_type(&conn)?;
         let temperature = integer.to_alias_with_connection(&conn, "TEMPERATURE")?;

@@ -159,7 +159,7 @@ impl LogicalType {
     }
 
     /// Return the logical type ID.
-    pub fn type_id(&self) -> DUCKDB_V2_LOGICAL_TYPE_ID {
+    pub fn type_id(&self) -> LogicalTypeID {
         let type_id: DUCKDB_V2_LOGICAL_TYPE_ID = check_api_call!(ffi::duckdb_v2_logical_type_get_id, self.handle, RET)
             .expect("Failed to get logical type id");
         type_id

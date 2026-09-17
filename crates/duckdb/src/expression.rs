@@ -230,7 +230,7 @@ mod tests {
 
         let signature = SignatureBuilder::without_return_type(vec![]);
 
-        TableFunctionBuilder::new("test_function", signature, TableFunctionTest {}).register_with_connection(&conn)?;
+        TableFunctionBuilder::new("test_function", signature, TableFunctionTest {}).register(&conn)?;
 
         use crate::Parameters;
 

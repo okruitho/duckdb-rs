@@ -1,27 +1,30 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, hash::Hash};
 
+use crate::logical_type::LogicalTypeID;
+use crate::types::{Any, StructValue};
 use crate::{
     Parameters, ToValue,
     builder_helpers::scalar_callback,
+    connection::FFILink,
     data_chunk::DataChunk,
     environment::{Environment, StorageLocation},
-    error::DuckDBError,
+    error::{DuckDBError, Error},
+    logical_type::LogicalType,
+    query_result::QueryResultStep,
+    signature::Parameter,
     types::{
         Array, BigNum, BigNumValue, BitValue, BlobValue, DateValue, Decimal, DecimalValue, DuckDBType, IntervalValue,
-        Map, Struct, TimeNsValue, TimeTzValue, TimeValue, TimestampMsValue, TimestampNsValue, TimestampSecValue,
-        TimestampTzNsValue, TimestampTzValue, TimestampValue, Union, UuidValue, structs::StructWrite,
-        union::UnionWriter,
+        List, Map, MapValue, Struct, StructSchema, TimeNsValue, TimeTzValue, TimeValue, TimestampMsValue,
+        TimestampNsValue, TimestampSecValue, TimestampTzNsValue, TimestampTzValue, TimestampValue, Union, UnionSchema,
+        UnionValue, UuidValue, Variant, structs::StructWrite, union::UnionWriter,
     },
     vector::{StorageKind, Unknown},
 };
 
-#[cfg(feature = "capi-v2-p2")]
 use crate::{scalar::ScalarFunctionBuilder, signature::SignatureBuilder};
 
-#[cfg(feature = "capi-v2-p2")]
 struct TestStruct;
 
-#[cfg(feature = "capi-v2-p2")]
 impl StructSchema for TestStruct {
     fn fields<C: FFILink + ?Sized>(link: &C) -> crate::Result<Vec<(&'static str, LogicalType)>> {
         Ok(vec![
@@ -30,10 +33,8 @@ impl StructSchema for TestStruct {
         ])
     }
 }
-#[cfg(feature = "capi-v2-p2")]
 
 struct TestUnion;
-#[cfg(feature = "capi-v2-p2")]
 
 impl UnionSchema for TestUnion {
     fn members<C: FFILink + ?Sized>(link: &C) -> crate::Result<Vec<(&'static str, LogicalType)>> {
@@ -171,7 +172,7 @@ scalar_callback!(ConstantScalar, i32, |_input, result, ctx, _user_data| {
 });
 
 scalar_callback!(SequenceScalar, i32, |input, result, _ctx, _user_data| {
-    let input_len = input.get_vector_at::<Unknown>(0)?.len();
+    let input_len = input.vectors()?[0].len();
 
     let mut result = result;
     result.make_sequence(42, 10, input_len)?;
@@ -192,7 +193,6 @@ scalar_callback!(CopyStringScalar, String, |input, result, _ctx, _user_data| {
 });
 
 #[test]
-#[cfg(feature = "capi-v2-p2")]
 fn test_vector_read_write() -> crate::Result<()> {
     let env = Environment::new().expect("Failed to create environment");
     let db = env
@@ -253,7 +253,6 @@ fn test_logical_type_cast() -> crate::Result<()> {
 }
 
 #[test]
-#[cfg(feature = "capi-v2-p2")]
 fn test_vector_string() -> crate::Result<()> {
     let env = Environment::new()?;
     let db = env.open(StorageLocation::InMemory)?;
@@ -295,7 +294,6 @@ fn test_vector_string() -> crate::Result<()> {
 }
 
 #[test]
-#[cfg(feature = "capi-v2-p2")]
 fn test_vector_list() -> crate::Result<()> {
     scalar_callback!(ListMultScalar, List<i32>, |input, output, _ctx, _user_data| {
         let input = input.get_vector_at::<List<i32>>(0)?;
@@ -528,7 +526,6 @@ pub fn test_vector_map() -> crate::Result<()> {
 }
 
 #[test]
-#[cfg(feature = "capi-v2-p2")]
 pub fn vector_complex_write() -> crate::Result<()> {
     let env = Environment::new()?;
     let db = env.open(StorageLocation::InMemory)?;
@@ -560,7 +557,7 @@ pub fn vector_complex_write() -> crate::Result<()> {
     for item in result {
         let item = item?;
 
-        let res = item.get_vector_at::<crate::vector::Map<i32, String>>(0)?;
+        let res = item.get_vector_at::<Map<i32, String>>(0)?;
 
         assert!(res.len() == 2);
         let mut reader = res.iter()?;
@@ -581,7 +578,7 @@ pub fn vector_complex_write() -> crate::Result<()> {
     if let Some(item) = result.next() {
         let item = item?;
 
-        let res = item.get_vector_at::<crate::vector::Map<i32, String>>(0)?;
+        let res = item.get_vector_at::<Map<i32, String>>(0)?;
 
         assert_eq!(res.len(), 3);
         let expected = [(1, "A"), (2, "B"), (3, "C")];
@@ -599,7 +596,6 @@ pub fn vector_complex_write() -> crate::Result<()> {
 }
 
 #[test]
-#[cfg(feature = "capi-v2-p2")]
 pub fn vector_union_write() -> crate::Result<()> {
     let env = Environment::new()?;
     let db = env.open(StorageLocation::InMemory)?;
@@ -646,7 +642,6 @@ pub fn vector_union_write() -> crate::Result<()> {
 }
 
 #[test]
-#[cfg(feature = "capi-v2-p2")]
 pub fn vector_struct_write() -> crate::Result<()> {
     let env = Environment::new()?;
     let db = env.open(StorageLocation::InMemory)?;
@@ -909,7 +904,6 @@ pub fn vector_writable_value_types() -> crate::Result<()> {
 }
 
 #[test]
-#[cfg(feature = "capi-v2-p2")]
 pub fn test_vector_make_constant() -> crate::Result<()> {
     let env = Environment::new()?;
     let db = env.open(StorageLocation::InMemory)?;
@@ -951,7 +945,6 @@ pub fn test_vector_make_constant() -> crate::Result<()> {
 }
 
 #[test]
-#[cfg(feature = "capi-v2-p2")]
 pub fn test_vector_make_sequence() -> crate::Result<()> {
     let env = Environment::new()?;
     let db = env.open(StorageLocation::InMemory)?;
@@ -993,7 +986,6 @@ pub fn test_vector_make_sequence() -> crate::Result<()> {
 }
 
 #[test]
-#[cfg(feature = "capi-v2-p2")]
 pub fn test_vector_types() -> crate::Result<()> {
     let env = Environment::new()?;
     let db = env.open(StorageLocation::InMemory)?;
@@ -1046,11 +1038,11 @@ pub fn test_vector_types() -> crate::Result<()> {
 
 // TODO: This should not be a scalar, but an table function.
 #[test]
-#[cfg(feature = "capi-v2-p2")]
 pub fn test_vector_set_value() -> crate::Result<()> {
     scalar_callback!(ToVariant, Variant, |input, output, ctx, _user_data| {
         let mut output = output;
-        output.set_size(input.row_count()? * input.vectors_count()?)?;
+
+        output.set_size(input.row_count() * input.vectors_count())?;
 
         let mut idx = 0;
 
@@ -1058,20 +1050,20 @@ pub fn test_vector_set_value() -> crate::Result<()> {
             for i in 0..vec.len() {
                 let value = if !vec.is_null(i)? {
                     match vec.logical_type().type_id() {
-                        DUCKDB_V2_LOGICAL_TYPE_ID_INTEGER => {
+                        LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_INTEGER => {
                             let val = vec.get_as_checked::<i32>(i)?.unwrap();
 
                             Some(val.value(&ctx)?)
                         }
-                        DUCKDB_V2_LOGICAL_TYPE_ID_BOOLEAN => {
+                        LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_BOOLEAN => {
                             let val = vec.get_as_checked::<bool>(i)?.unwrap();
 
                             Some(val.value(&ctx)?)
                         }
-                        DUCKDB_V2_LOGICAL_TYPE_ID_GEOMETRY => {
+                        LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_GEOMETRY => {
                             todo!()
                         }
-                        DUCKDB_V2_LOGICAL_TYPE_ID_VARCHAR => {
+                        LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_VARCHAR => {
                             todo!()
                         }
                         _ => None,
@@ -1152,7 +1144,6 @@ scalar_callback!(RefScalar, String, |input, output, _ctx, _user_data| {
 });
 
 #[test]
-#[cfg(feature = "capi-v2-p2")]
 pub fn test_vector_reference_input() -> crate::Result<()> {
     let env = Environment::new()?;
     let db = env.open(StorageLocation::InMemory)?;

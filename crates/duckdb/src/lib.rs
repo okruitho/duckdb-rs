@@ -32,6 +32,8 @@ use libduckdb_sys as ffi;
 
 mod builder_helpers;
 pub mod connection_options;
+mod handles;
+mod links;
 
 pub(crate) mod bytes;
 pub mod connection;
@@ -168,7 +170,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "capi-v2-p2")]
     fn test_prepared_statement() -> crate::Result<()> {
         let env = Environment::new()?;
         let db = env.open(StorageLocation::InMemory)?;
@@ -216,12 +217,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "capi-v2-p2")]
     fn test_identifier_render_quoted() -> crate::Result<()> {
         let identifier = ffi::duckdb_v2_str {
             ptr: "10".as_ptr() as *const i8,
             len: "10".len() as u64,
-            _marker: std::marker::PhantomData,
         };
 
         let quoted = render_identifier_quoted(identifier.into())?;

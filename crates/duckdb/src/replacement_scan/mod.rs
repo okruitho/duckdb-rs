@@ -1,16 +1,13 @@
 //! Replacing unresolved table references with table-function calls.
 
-use std::ops::Deref;
-
 use crate::{
     Result,
     builder_helpers::{OpaqueHandle, get_user_data, handle_unwind},
     check_api_call,
     column_data_collection::ColumnDataCollection,
-    connection::{Connection, Context, Extension},
-    database::Database,
-    error::check_api_call_no_err,
+    connection::Context,
     ffi,
+    handles::{ReplacementScanBuilderHandle, ReplacementScanBuilderLink},
     qualified_name::QualifiedName,
     value::Value,
 };
@@ -94,21 +91,6 @@ unsafe extern "C" fn replacement_callback<T: ReplacementScanCallbacks>(
     );
 }
 
-struct ReplacementScanBuilderHandle(ffi::duckdb_v2_replacement_scan_handle);
-
-impl Deref for ReplacementScanBuilderHandle {
-    type Target = ffi::duckdb_v2_replacement_scan_handle;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl Drop for ReplacementScanBuilderHandle {
-    fn drop(&mut self) {
-        check_api_call_no_err!(ffi::duckdb_v2_replacement_scan_destroy, &mut self.0).unwrap();
-    }
-}
-
 /// Registers a replacement scan callback.
 ///
 /// Registered callbacks are consulted in order whenever binding cannot resolve
@@ -144,43 +126,13 @@ where
         Ok(())
     }
 
-    fn register(&self, handle: &ReplacementScanBuilderHandle) -> Result<()> {
-        check_api_call!(ffi::duckdb_v2_replacement_scan_register, **handle)
-    }
-
-    pub fn register_with_connection(&self, connection: &Connection) -> Result<()> {
-        let handle = ReplacementScanBuilderHandle(check_api_call!(
-            ffi::duckdb_v2_replacement_scan_create_with_connection,
-            **connection,
-            RET,
-        )?);
-
+    /// Register through a connection, extension, or database, consuming the builder.
+    #[allow(private_bounds)]
+    pub fn register<C: ReplacementScanBuilderLink>(self, link: &C) -> Result<()> {
+        let handle = link.create_replacement_scan_handle()?;
         self.build(&handle)?;
-        self.register(&handle)
-    }
 
-    /// Register the callback on the context's database.
-    pub fn register_with_extension(self, extension: &Extension) -> Result<()> {
-        let handle = ReplacementScanBuilderHandle(check_api_call!(
-            ffi::duckdb_v2_replacement_scan_create_with_extension,
-            **extension,
-            RET,
-        )?);
-
-        self.build(&handle)?;
-        self.register(&handle)
-    }
-
-    /// Register the callback on a database.
-    pub fn register_with_database(self, database: &Database) -> Result<()> {
-        let handle = ReplacementScanBuilderHandle(check_api_call!(
-            ffi::duckdb_v2_replacement_scan_create_with_database,
-            database.handle.lock().unwrap().handle,
-            RET,
-        )?);
-
-        self.build(&handle)?;
-        self.register(&handle)
+        check_api_call!(ffi::duckdb_v2_replacement_scan_register, *handle)
     }
 }
 
@@ -265,9 +217,9 @@ mod tests {
         let db = env.open(StorageLocation::InMemory)?;
         let conn = db.connect()?;
 
-        ReplacementScanBuilder::new(CustomReplacementScan { count: 42 }).register_with_database(&db)?;
+        ReplacementScanBuilder::new(CustomReplacementScan { count: 42 }).register(&db)?;
 
-        ReplacementScanBuilder::new(CustomNamedParameters {}).register_with_connection(&conn)?;
+        ReplacementScanBuilder::new(CustomNamedParameters {}).register(&conn)?;
 
         let mut query = conn.query("SELECT * FROM test.main.num_10_20", Parameters::None)?;
 

@@ -14,6 +14,7 @@ use crate::{
 pub struct VectorCollection {
     pub(crate) handles: Vec<ffi::duckdb_v2_vector_handle>,
     pub(crate) is_writable: bool,
+    pub(crate) row_count: usize,
 }
 
 impl VectorCollection {
@@ -39,8 +40,12 @@ impl VectorCollection {
     }
 
     /// Return the number of vectors, which is the column count.
-    pub fn vectors_count(&self) -> Result<usize> {
-        Ok(self.handles.len())
+    pub fn vectors_count(&self) -> usize {
+        self.handles.len()
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.row_count
     }
 }
 
@@ -140,14 +145,6 @@ impl<'a> DataChunkRef<'a> {
         let vec = Vector::from_handle(&vector, self.is_writable)?;
 
         vec.cast::<T>()
-    }
-
-    #[cfg(feature = "capi-v2-p2")]
-    /// Convert the chunk to an Arrow C Data Interface array.
-    ///
-    /// The caller must invoke the returned array's `release` callback.
-    pub fn to_arrow_array(&self, context: &crate::Context) -> Result<ffi::ArrowArray> {
-        check_api_call!(ffi::duckdb_v2_data_chunk_to_arrow_array, **context, self.handle, RET)
     }
 }
 

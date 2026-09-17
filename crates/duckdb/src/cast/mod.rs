@@ -1,13 +1,12 @@
 //! User-defined casts between logical types.
 
-use std::ops::Deref;
-
 use libduckdb_sys::{self as ffi};
 
 use crate::{
     Result,
-    builder_helpers::{OpaqueHandle, context_and_connection_fn, ffi_enum_redeclaration, get_user_data, handle_unwind},
-    check_api_call, check_api_call_no_err,
+    builder_helpers::{OpaqueHandle, ffi_enum_redeclaration, get_user_data, handle_unwind},
+    check_api_call,
+    handles::{CastFunctionHandle, CastFunctionLink},
     logical_type::LogicalType,
     vector::{Vector, VectorElement},
 };
@@ -19,22 +18,6 @@ ffi_enum_redeclaration! {
         Normal = DUCKDB_V2_CAST_MODE_NORMAL,
         /// Write `NULL` for values that cannot be converted.
         Try = DUCKDB_V2_CAST_MODE_TRY
-    }
-}
-
-/// An owned cast-function builder handle.
-pub struct CastFunctionHandle(ffi::duckdb_v2_cast_function_handle);
-
-impl Drop for CastFunctionHandle {
-    fn drop(&mut self) {
-        check_api_call_no_err!(ffi::duckdb_v2_cast_function_destroy, &mut self.0).unwrap();
-    }
-}
-
-impl Deref for CastFunctionHandle {
-    type Target = ffi::duckdb_v2_cast_function_handle;
-    fn deref(&self) -> &Self::Target {
-        &self.0
     }
 }
 
@@ -123,19 +106,13 @@ impl<T: CastFunctionCallbacks> CastFunctionBuilder<T> {
         Ok(handle)
     }
 
-    context_and_connection_fn! {
-        /// Register the cast through a connection or callback context.
-        pub fn register_with_[extension, connection](self) -> Result<()>
-        {
-            extension_fn: ffi::duckdb_v2_cast_function_create_with_extension,
-            connection_fn: ffi::duckdb_v2_cast_function_create_with_connection,
-        }
-        let handle = CastFunctionHandle(check_api_call!(api_fn!(), **api_arg!(), RET)?);
-
+    /// Register through a connection or extension, consuming the builder.
+    #[allow(private_bounds)]
+    pub fn register<C: CastFunctionLink>(self, link: &C) -> Result<()> {
+        let handle = link.create_cast_function_handle()?;
         let handle = self.build(handle)?;
 
-        check_api_call!(
-            ffi::duckdb_v2_cast_function_register, *handle)
+        check_api_call!(ffi::duckdb_v2_cast_function_register, *handle)
     }
 }
 
@@ -208,7 +185,7 @@ mod tests {
         let conn = db.connect()?;
 
         let custom_type = custom_type::CustomType::new("TEMPERATURE", f32::logical_type(&conn)?)?;
-        custom_type.register_with_connection(&conn)?;
+        custom_type.register(&conn)?;
         let logical_type = f32::logical_type(&conn)?;
         let temperature_type = logical_type.to_alias_with_connection(&conn, "TEMPERATURE")?;
 
@@ -218,7 +195,7 @@ mod tests {
             0,
             CastToFloat { offset: 10 },
         )
-        .register_with_connection(&conn)?;
+        .register(&conn)?;
 
         let result = conn.query(
             "SELECT CAST(x as TEMPERATURE) FROM VALUES ('32'), (NULL)  as t(x)",

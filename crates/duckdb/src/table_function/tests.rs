@@ -166,7 +166,7 @@ fn test_table_function() -> crate::Result<()> {
         SignatureBuilder::without_return_type([Parameter::normal("offset", i32::logical_type(&conn)?)]),
         MyTableFunction { base: 42 },
     )
-    .register_with_connection(&conn)?;
+    .register(&conn)?;
 
     conn.execute("SET preserve_insertion_order=false", Parameters::None)?;
     let result = conn.query("SELECT * FROM my_table_function(10)", Parameters::None)?;

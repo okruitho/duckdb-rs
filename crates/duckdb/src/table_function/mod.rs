@@ -7,7 +7,7 @@
 //! query plans, while progress and complex-filter callbacks expose additional
 //! execution and pushdown behavior.
 
-use std::{any::Any, ops::Deref};
+use std::any::Any;
 
 use libduckdb_sys as ffi;
 
@@ -15,33 +15,18 @@ use crate::{
     Result,
     bind_arguments::{BindMetadata, BindType, BindView},
     builder_helpers::{
-        OpaqueHandle, context_and_connection_fn, get_bind_data, get_global_state, get_local_state, get_opaque_data_ref,
-        get_user_data, handle_unwind, into_opaque,
+        OpaqueHandle, get_bind_data, get_global_state, get_local_state, get_opaque_data_ref, get_user_data,
+        handle_unwind, into_opaque,
     },
-    check_api_call, check_api_call_no_err,
+    check_api_call,
     connection::Context,
     data_chunk::DataChunkRef,
     expression::Expression,
+    handles::{TableFunctionBuilderHandle, TableFunctionBuilderLink},
     logical_type::LogicalType,
     signature::SignatureBuilder,
     table_function::InitColumnHandle::{Global, Local},
 };
-
-/// An owned table-function builder handle.
-pub struct TableFunctionBuilderHandle(ffi::duckdb_v2_table_function_handle);
-
-impl Drop for TableFunctionBuilderHandle {
-    fn drop(&mut self) {
-        check_api_call_no_err!(ffi::duckdb_v2_table_function_destroy, &mut self.0).unwrap();
-    }
-}
-
-impl Deref for TableFunctionBuilderHandle {
-    type Target = ffi::duckdb_v2_table_function_handle;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
 
 /// Callback-scoped output-schema builder.
 pub struct BindFunctionHandle<'a>(&'a ffi::duckdb_v2_table_function_bind_info_handle);
@@ -404,7 +389,7 @@ impl<T: TableFunctionCallbacks> TableFunctionBuilder<T> {
     }
 
     /// Build an owned table-function builder handle.
-    pub fn build(&self, handle: &TableFunctionBuilderHandle) -> Result<()> {
+    fn build(&self, handle: &TableFunctionBuilderHandle) -> Result<()> {
         check_api_call!(
             ffi::duckdb_v2_table_function_set_name,
             **handle,
@@ -467,19 +452,13 @@ impl<T: TableFunctionCallbacks> TableFunctionBuilder<T> {
         Ok(())
     }
 
-    context_and_connection_fn! {
-        /// Register the function through a connection or callback context.
-        pub fn register_with_[extension, connection](self) -> Result<()>
-        {
-            extension_fn: ffi::duckdb_v2_table_function_create_with_extension,
-            connection_fn: ffi::duckdb_v2_table_function_create_with_connection,
-        }
-        let handle = TableFunctionBuilderHandle(check_api_call!(api_fn!(), **api_arg!(), RET)?);
-
+    /// Register through a connection or extension, consuming the builder.
+    #[allow(private_bounds)]
+    pub fn register<C: TableFunctionBuilderLink>(self, link: &C) -> Result<()> {
+        let handle = link.create_table_function_handle()?;
         self.build(&handle)?;
 
-        check_api_call!(
-            ffi::duckdb_v2_table_function_register, *handle)
+        check_api_call!(ffi::duckdb_v2_table_function_register, *handle)
     }
 }
 

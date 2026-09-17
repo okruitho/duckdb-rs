@@ -8,6 +8,9 @@ use crate::{
     ffi,
 };
 
+#[cfg(feature = "capi-v2-p4")]
+use crate::{builder_helpers::OpaqueHandle, database::Database, handles::LogStorageBuilderHandle};
+
 ffi_enum_redeclaration! {
     /// The severity of a DuckDB log record.
     #[allow(missing_docs)]
@@ -55,25 +58,6 @@ unsafe extern "C" fn log_callback<T: LogStorageCallbacks>(
 }
 
 #[cfg(feature = "capi-v2-p4")]
-struct LogStorageBuilderHandle(ffi::duckdb_v2_log_storage_builder_handle);
-
-#[cfg(feature = "capi-v2-p4")]
-impl Drop for LogStorageBuilderHandle {
-    fn drop(&mut self) {
-        check_api_call_no_err!(ffi::duckdb_v2_log_storage_builder_destroy, &mut self.0).unwrap()
-    }
-}
-
-#[cfg(feature = "capi-v2-p4")]
-impl Deref for LogStorageBuilderHandle {
-    type Target = ffi::duckdb_v2_log_storage_builder_handle;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-#[cfg(feature = "capi-v2-p4")]
 /// Registers a named Rust implementation as DuckDB log storage.
 ///
 /// DuckDB calls the implementation for records routed to the registered
@@ -81,7 +65,7 @@ impl Deref for LogStorageBuilderHandle {
 ///
 /// # Example
 /// ```
-/// use duckdb::{Environment, StorageLocation};
+/// use duckdb::environment::{Environment, StorageLocation};
 /// use duckdb::log::{LogStorageBuilder, LogStorageCallbacks, LogLevel};
 ///
 /// struct StdoutLogger;
@@ -122,7 +106,7 @@ impl<T: LogStorageCallbacks> LogStorageBuilder<T> {
     }
 
     fn build(&self) -> Result<LogStorageBuilderHandle> {
-        let handle = LogStorageBuilderHandle(check_api_call!(ffi::duckdb_v2_log_storage_builder_create, RET)?);
+        let handle = LogStorageBuilderHandle::new()?;
 
         check_api_call!(
             ffi::duckdb_v2_log_storage_builder_set_name,

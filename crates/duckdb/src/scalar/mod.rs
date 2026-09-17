@@ -11,27 +11,14 @@ use std::collections::HashMap;
 use crate::ffi;
 
 use crate::bind_arguments::{BindMetadata, BindType};
-use crate::builder_helpers::{
-    OpaqueHandle, define_handle, get_bind_data, get_init_data, get_user_data, handle_unwind, into_opaque,
-};
+use crate::builder_helpers::{OpaqueHandle, get_bind_data, get_init_data, get_user_data, handle_unwind, into_opaque};
 use crate::data_chunk::VectorCollection;
 use crate::enums::FunctionProperty;
+use crate::handles::{ScalarFunctionBuilderHandle, ScalarFunctionBuilderLink};
 use crate::logical_type::LogicalType;
 use crate::signature::SignatureBuilder;
 use crate::vector::{Unknown, Vector, VectorElement};
 use crate::{Result, check_api_call, connection::Context};
-
-define_handle! {
-    name: ScalarFunctionBuilderHandle,
-    link: ScalarFunctionBuilderLink,
-    create: create_scalar_function_handle,
-    handle: ffi::duckdb_v2_scalar_function_handle,
-    destroy: ffi::duckdb_v2_scalar_function_destroy,
-    factories: {
-        crate::connection::Connection => ffi::duckdb_v2_scalar_function_create_with_connection,
-        crate::connection::Extension => ffi::duckdb_v2_scalar_function_create_with_extension,
-    },
-}
 
 unsafe extern "C" fn bind_callback<T: ScalarCallbacks>(
     info: ffi::duckdb_v2_scalar_function_bind_info_handle,
@@ -113,9 +100,12 @@ unsafe extern "C" fn exec_callback<T: ScalarCallbacks>(
                 handles.push(handle);
             }
 
+            let mut row_count = check_api_call!(ffi::duckdb_v2_scalar_function_exec_get_row_count, info, RET)? as usize;
+
             let collection = VectorCollection {
                 handles: handles,
                 is_writable: false,
+                row_count,
             };
 
             T::exec(
