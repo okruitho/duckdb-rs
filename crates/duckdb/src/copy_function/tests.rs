@@ -20,7 +20,7 @@ impl CopyToFunctionCallbacks for RapidCopy {
     type InitData = File;
     type BatchData = Vec<i32>;
 
-    fn bind(&self, _context: Context, column_info: super::ColumnInfo) -> crate::Result<Self::BindData> {
+    fn bind(&self, _context: Context, column_info: super::CopyToBindInfo) -> crate::Result<Self::BindData> {
         assert_eq!(column_info.len()?, 1);
         assert_eq!(column_info.get_column(0)?.0, "i");
         assert_eq!(
@@ -247,7 +247,7 @@ impl CopyToFunctionCallbacks for EchoFormat {
     type BindData = ();
     type BatchData = Vec<i64>;
 
-    fn bind(&self, _context: Context, _column_info: super::ColumnInfo) -> crate::Result<Self::BindData> {
+    fn bind(&self, _context: Context, _column_info: super::CopyToBindInfo) -> crate::Result<Self::BindData> {
         Ok(())
     }
 

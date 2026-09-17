@@ -246,7 +246,7 @@ mod tests {
             ),
             LogCallback,
         )
-        .register_with_connection(&conn)?;
+        .register(&conn)?;
 
         conn.execute("SELECT log_it(1)", Parameters::None)?;
 

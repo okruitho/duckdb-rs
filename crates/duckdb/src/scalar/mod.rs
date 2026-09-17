@@ -7,34 +7,30 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::ops::Deref;
 
 use crate::ffi;
 
 use crate::bind_arguments::{BindMetadata, BindType};
 use crate::builder_helpers::{
-    OpaqueHandle, context_and_connection_fn, get_bind_data, get_init_data, get_user_data, handle_unwind, into_opaque,
+    OpaqueHandle, define_handle, get_bind_data, get_init_data, get_user_data, handle_unwind, into_opaque,
 };
 use crate::data_chunk::VectorCollection;
 use crate::enums::FunctionProperty;
 use crate::logical_type::LogicalType;
 use crate::signature::SignatureBuilder;
 use crate::vector::{Unknown, Vector, VectorElement};
-use crate::{Result, check_api_call, check_api_call_no_err, connection::Context};
+use crate::{Result, check_api_call, connection::Context};
 
-struct ScalarFunctionBuilderHandle(ffi::duckdb_v2_scalar_function_handle);
-
-impl Drop for ScalarFunctionBuilderHandle {
-    fn drop(&mut self) {
-        check_api_call_no_err!(ffi::duckdb_v2_scalar_function_destroy, &mut self.0).unwrap();
-    }
-}
-
-impl Deref for ScalarFunctionBuilderHandle {
-    type Target = ffi::duckdb_v2_scalar_function_handle;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+define_handle! {
+    name: ScalarFunctionBuilderHandle,
+    link: ScalarFunctionBuilderLink,
+    create: create_scalar_function_handle,
+    handle: ffi::duckdb_v2_scalar_function_handle,
+    destroy: ffi::duckdb_v2_scalar_function_destroy,
+    factories: {
+        crate::connection::Connection => ffi::duckdb_v2_scalar_function_create_with_connection,
+        crate::connection::Extension => ffi::duckdb_v2_scalar_function_create_with_extension,
+    },
 }
 
 unsafe extern "C" fn bind_callback<T: ScalarCallbacks>(
@@ -224,24 +220,17 @@ impl<T: ScalarCallbacks> ScalarFunctionBuilder<T> {
         Ok(())
     }
 
-    context_and_connection_fn! {
-        /// Register the function through a connection or callback context.
-        pub fn register_with_[extension, connection](self) -> Result<()>
-        {
-            extension_fn: ffi::duckdb_v2_scalar_function_create_with_extension,
-            connection_fn: ffi::duckdb_v2_scalar_function_create_with_connection,
-        }
-        let handle =        ScalarFunctionBuilderHandle(check_api_call!(
-            api_fn!(),
-            **api_arg!(),
-            RET
-        )?);
-
+    /// Register through a [`Connection`](crate::connection::Connection) or
+    /// [`Extension`](crate::connection::Extension), consuming the builder and
+    /// transferring ownership of its callback implementation to DuckDB.
+    ///
+    /// A builder cannot be registered more than once.
+    #[allow(private_bounds)] // Keep the handle factory private while accepting both supported link types.
+    pub fn register<C: ScalarFunctionBuilderLink>(self, link: &C) -> Result<()> {
+        let handle = link.create_scalar_function_handle()?;
         self.build(&handle)?;
 
-        check_api_call!(ffi::duckdb_v2_scalar_function_register, *handle)?;
-
-        Ok(())
+        check_api_call!(ffi::duckdb_v2_scalar_function_register, *handle)
     }
 }
 

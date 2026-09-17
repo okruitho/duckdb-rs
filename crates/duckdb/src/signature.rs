@@ -349,7 +349,7 @@ mod test {
 
         assert_eq!(sig.parameters.len(), 3);
 
-        ScalarFunctionBuilder::new("test", sig, DefaultParameterScalar).register_with_connection(&conn)?;
+        ScalarFunctionBuilder::new("test", sig, DefaultParameterScalar).register(&conn)?;
 
         let statements = conn.query("SELECT test(10, 'AA')", Parameters::None)?;
 
@@ -381,7 +381,7 @@ mod test {
 
         assert_eq!(sig.parameters.len(), 3);
 
-        ScalarFunctionBuilder::new("test", sig, VarargScalar).register_with_connection(&conn)?;
+        ScalarFunctionBuilder::new("test", sig, VarargScalar).register(&conn)?;
 
         let statements = conn.query("SELECT test(10, 'AA', 1, 2, 3, 4, 5, 6, 7, 8, 9)", Parameters::None)?;
 

@@ -219,7 +219,7 @@ mod tests {
             ),
             ToArrowTest,
         )
-        .register_with_connection(&conn)?;
+        .register(&conn)?;
 
         let result = conn.query(
             "SELECT to_arrow(a, b, c) FROM (VALUES (2, true, 'hello'), (1, false, 'world')) AS t(a, b, c)",

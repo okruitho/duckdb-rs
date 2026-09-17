@@ -208,7 +208,7 @@ fn test_vector_read_write() -> crate::Result<()> {
         ),
         NegateScalar,
     )
-    .register_with_connection(&conn)
+    .register(&conn)
     .expect("Failed to register scalar function");
 
     let statements = conn
@@ -267,7 +267,7 @@ fn test_vector_string() -> crate::Result<()> {
         ),
         UpperScalar,
     )
-    .register_with_connection(&conn)?;
+    .register(&conn)?;
 
     let res = conn
         .query(
@@ -324,7 +324,7 @@ fn test_vector_list() -> crate::Result<()> {
         SignatureBuilder::new([Parameter::normal("IN", list_logical_type.clone())], list_logical_type),
         ListMultScalar,
     )
-    .register_with_connection(&conn)?;
+    .register(&conn)?;
 
     let res = conn
         .query(
@@ -547,7 +547,7 @@ pub fn vector_complex_write() -> crate::Result<()> {
         ),
         MapScalar,
     )
-    .register_with_connection(&conn)?;
+    .register(&conn)?;
 
     let mut statements = conn.parse(
         "SELECT UNNEST([to_map(12, 'AA'), to_map(15, 'BB')]); SELECT to_map(unnest([1,2,3]), unnest(['A', 'B', 'C']))",
@@ -618,7 +618,7 @@ pub fn vector_union_write() -> crate::Result<()> {
         ),
         UnionScalar,
     )
-    .register_with_connection(&conn)?;
+    .register(&conn)?;
 
     let statement = conn
         .parse("SELECT to_union(unnest([1, 2, 2]), unnest(['WWWADWWWAample', 'OPAOPDAOADWADtablesss', NULL]))")?
@@ -665,7 +665,7 @@ pub fn vector_struct_write() -> crate::Result<()> {
         ),
         StructScalar,
     )
-    .register_with_connection(&conn)?;
+    .register(&conn)?;
 
     let statement = conn
         .parse("SELECT to_struct(unnest([1, 2]), unnest(['A', 'B']))")?
@@ -923,7 +923,7 @@ pub fn test_vector_make_constant() -> crate::Result<()> {
         ),
         ConstantScalar,
     )
-    .register_with_connection(&conn)?;
+    .register(&conn)?;
 
     let mut statements = conn.parse("SELECT to_constant(unnest([1,2,3]));")?;
 
@@ -965,7 +965,7 @@ pub fn test_vector_make_sequence() -> crate::Result<()> {
         ),
         SequenceScalar,
     )
-    .register_with_connection(&conn)?;
+    .register(&conn)?;
 
     let mut statements = conn.parse("SELECT to_sequence(unnest([1,2,3]));")?;
 
@@ -1007,7 +1007,7 @@ pub fn test_vector_types() -> crate::Result<()> {
         ),
         CopyStringScalar,
     )
-    .register_with_connection(&conn)?;
+    .register(&conn)?;
 
     let result = conn.query(
         r#"SELECT test(x) from test_vector_types(null::VARCHAR) as t(x);"#,
@@ -1105,7 +1105,7 @@ pub fn test_vector_set_value() -> crate::Result<()> {
         SignatureBuilder::new([Parameter::tail_vararg("in", Any::logical_type(&conn)?)], rt),
         ToVariant,
     )
-    .register_with_connection(&conn)?;
+    .register(&conn)?;
 
     let result = conn.query(
         r#"SELECT to_variant(bool, "int") from test_all_types();"#, // r#"SELECT to_variant(x) from test_vector_types("TESTER") as t(x);"#
@@ -1166,7 +1166,7 @@ pub fn test_vector_reference_input() -> crate::Result<()> {
         ),
         RefScalar,
     )
-    .register_with_connection(&conn)?;
+    .register(&conn)?;
 
     let result = conn.query(
         r#"SELECT reference(x) from test_vector_types(null::VARCHAR) as t(x);"#,

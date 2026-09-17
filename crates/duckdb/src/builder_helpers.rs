@@ -457,6 +457,50 @@ macro_rules! scalar_callback {
 #[cfg(test)]
 pub(crate) use scalar_callback;
 
+macro_rules! define_handle {
+    (
+        name: $name:ident,
+        link: $link:ident,
+        create: $create:ident,
+        handle: $handle:ty,
+        destroy: $destroy:expr,
+        factories: {
+            $( $type:ty => $func:expr ),* $(,)?
+        } $(,)?
+    ) => {
+        struct $name($handle);
+
+        trait $link {
+            fn $create(&self) -> $crate::Result<$name>;
+        }
+
+        $(
+            impl $link for $type {
+                fn $create(&self) -> $crate::Result<$name> {
+                    Ok($name($crate::check_api_call!($func, **self, RET)?))
+                }
+            }
+        )*
+
+        impl ::std::ops::Drop for $name {
+            fn drop(&mut self) {
+                $crate::check_api_call_no_err!($destroy, &mut self.0)
+                    .expect(concat!("Failed to destroy ", stringify!($name)));
+            }
+        }
+
+        impl ::std::ops::Deref for $name {
+            type Target = $handle;
+
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+    };
+}
+
+pub(crate) use define_handle;
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(feature = "capi-v2-p2")]
