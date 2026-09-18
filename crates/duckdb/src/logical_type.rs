@@ -46,6 +46,9 @@ pub struct LogicalType {
     pub handle: ffi::duckdb_v2_logical_type_handle,
 }
 
+unsafe impl Send for LogicalType {}
+unsafe impl Sync for LogicalType {}
+
 impl LogicalType {
     /// Construct a logical type from a primitive ID and optional parameters
     /// using a connection or callback context.

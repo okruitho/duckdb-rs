@@ -10,8 +10,10 @@ use crate::{
     connection_options::ConfigOptionValue,
     data_chunk::VectorCollection,
     environment::{Environment, StorageLocation},
+    logical_type::LogicalType,
+    scalar::ReturnTypeHandle,
     signature::{Parameter, SignatureBuilder},
-    vector::Vector,
+    vector::{Unknown, Vector},
 };
 
 struct BasicAggregate<T> {
@@ -24,10 +26,16 @@ impl<T: Display + Send + Sync + 'static> AggregateCallbacks for BasicAggregate<T
     type BindData = Vec<f32>;
     type StateItem = Vec<i32>;
     type IncomingType = i32;
-    type ResultType = String;
 
-    fn bind(&self, context: Context, arguments: Vec<BindArgument>) -> crate::Result<Self::BindData> {
+    fn bind(
+        &self,
+        context: Context,
+        arguments: Vec<BindArgument>,
+        result_type_handle: ReturnTypeHandle,
+    ) -> crate::Result<Self::BindData> {
         let mut bind_data: Vec<f32> = Vec::new();
+
+        result_type_handle.override_return(LogicalType::from_text(&context, "VARCHAR")?)?;
 
         for argument in arguments {
             let name = argument.value;
@@ -43,13 +51,11 @@ impl<T: Display + Send + Sync + 'static> AggregateCallbacks for BasicAggregate<T
         Ok(bind_data)
     }
 
-    #[allow(unused_variables)]
-    fn init(&self, bind_data: Option<&Self::BindData>) -> crate::Result<Self::StateItem> {
+    fn init(&self, _bind_data: Option<&Self::BindData>) -> crate::Result<Self::StateItem> {
         Ok(vec![])
     }
 
-    #[allow(unused_variables)]
-    fn size(&self, bind_data: Option<&Self::BindData>) -> crate::Result<usize> {
+    fn size(&self, _bind_data: Option<&Self::BindData>) -> crate::Result<usize> {
         Ok(std::mem::size_of::<Self::StateItem>())
     }
 
@@ -88,9 +94,11 @@ impl<T: Display + Send + Sync + 'static> AggregateCallbacks for BasicAggregate<T
         &self,
         bind_data: Option<&Self::BindData>,
         states: &[&Self::StateItem],
-        result: &mut Vector<'_, Self::ResultType>,
+        result: Vector<'_, Unknown>,
         result_offset: usize,
     ) -> crate::Result<()> {
+        let mut result = result.cast::<String>()?;
+
         for (index, state) in states.iter().enumerate() {
             let mut to_write = state.iter().map(|value| value.to_string()).collect::<String>();
             to_write += &format!(
@@ -116,7 +124,7 @@ pub fn basic_aggregate_test() -> crate::Result<()> {
         "to_concatenated",
         SignatureBuilder::new(
             [Parameter::normal("IN", i32::logical_type(&conn)?)],
-            String::logical_type(&conn)?,
+            u8::logical_type(&conn)?, // Will be overwritten to String
         ),
         BasicAggregate::<f32> { item: 0.0 },
     )

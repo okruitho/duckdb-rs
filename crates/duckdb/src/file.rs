@@ -1,20 +1,25 @@
 //! File access through DuckDB's file system.
 
+use std::marker::PhantomData;
+
 use crate::{Result, check_api_call, check_api_call_no_err, ffi, links::FileSystemLink, value::Value};
 
 /// A borrowed handle to DuckDB's file system.
-pub struct FileSystem {
-    /// The borrowed DuckDB file-system handle.
-    pub handle: ffi::duckdb_v2_file_system_handle,
+pub struct FileSystem<'a> {
+    handle: ffi::duckdb_v2_file_system_handle,
+    _marker: PhantomData<&'a ()>,
 }
 
-impl FileSystem {
+impl<'a> FileSystem<'a> {
     /// Borrow the file system associated with a connection or callback context.
     #[allow(private_bounds)]
-    pub fn new<C: FileSystemLink>(link: &C) -> Result<Self> {
+    pub fn new<C: FileSystemLink>(link: &'a C) -> Result<Self> {
         let handle = link.get_file_system()?;
 
-        Ok(FileSystem { handle })
+        Ok(FileSystem {
+            handle,
+            _marker: PhantomData,
+        })
     }
 }
 
@@ -23,7 +28,7 @@ impl FileSystem {
 /// Access and creation flags are disabled by default and can be composed with
 /// the builder methods before calling [`FileBuilder::open`].
 pub struct FileBuilder<'a> {
-    fs: &'a FileSystem,
+    fs: &'a FileSystem<'a>,
     handle: ffi::duckdb_v2_file_open_options_handle,
     path: String,
 }
@@ -169,7 +174,7 @@ impl Drop for FileBuilder<'_> {
 /// ```
 pub struct File {
     /// The owned DuckDB file handle.
-    pub handle: ffi::duckdb_v2_file_handle,
+    handle: ffi::duckdb_v2_file_handle,
 }
 
 // TODO verify

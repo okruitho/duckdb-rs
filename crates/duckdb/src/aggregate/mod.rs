@@ -22,8 +22,9 @@ use crate::{
     data_chunk::VectorCollection,
     enums::FunctionProperty,
     handles::{AggregateFunctionBuilderHandle, AggregateFunctionBuilderLink},
+    scalar::{FunctionBindHandles, ReturnTypeHandle},
     signature::SignatureBuilder,
-    vector::{Vector, VectorElement},
+    vector::{Unknown, Vector, VectorElement},
 };
 
 /// [`States`] is a view over the aggregate states DuckDB passes to a callback.
@@ -113,7 +114,14 @@ unsafe extern "C" fn bind_callback<T: AggregateCallbacks>(
 
             let user_data = get_user_data!(ffi::duckdb_v2_aggregate_function_bind_get_user_data, info);
 
-            let result = T::bind(user_data, Context(context), metadata.get_arguments()?)?;
+            let result = T::bind(
+                user_data,
+                Context(context),
+                metadata.get_arguments()?,
+                ReturnTypeHandle {
+                    handle: FunctionBindHandles::Aggregate(&info),
+                },
+            )?;
 
             dbg!("AA");
 
@@ -269,12 +277,10 @@ unsafe extern "C" fn finalize_callback<T: AggregateCallbacks>(
 
             let result_vector = Vector::from_handle(&result_vector_handle, true)?;
 
-            let mut result_vector = result_vector.cast::<T::ResultType>()?;
-
             let result_offset: u64 =
                 check_api_call!(ffi::duckdb_v2_aggregate_function_finalize_get_result_offset, info, RET)?;
 
-            T::finalize(user_data, bind_data, states, &mut result_vector, result_offset as usize)
+            T::finalize(user_data, bind_data, states, result_vector, result_offset as usize)
         },
         err,
     );
@@ -431,11 +437,14 @@ pub trait AggregateCallbacks: Send + Sync + 'static {
     type StateItem: Any + Send + Sync;
     /// The aggregate's declared input element type.
     type IncomingType: VectorElement;
-    /// The element type written during finalization.
-    type ResultType: VectorElement;
 
     /// **Bind:** validate a call site and create data shared by later phases.
-    fn bind(&self, context: Context, metadata: Vec<BindArgument>) -> Result<Self::BindData>;
+    fn bind(
+        &self,
+        context: Context,
+        metadata: Vec<BindArgument>,
+        result_type_handle: ReturnTypeHandle,
+    ) -> Result<Self::BindData>;
 
     /// **Size:** return the allocation size of one aggregate state.
     fn size(&self, _bind_data: Option<&Self::BindData>) -> Result<usize> {
@@ -464,7 +473,7 @@ pub trait AggregateCallbacks: Send + Sync + 'static {
         &self,
         bind_data: Option<&Self::BindData>,
         states: &[&Self::StateItem],
-        result: &mut Vector<'_, Self::ResultType>,
+        result: Vector<'_, Unknown>,
         result_offset: usize,
     ) -> Result<()>;
 

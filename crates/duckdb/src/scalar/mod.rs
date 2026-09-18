@@ -3,7 +3,7 @@
 //! Implement [`ScalarCallbacks`] to bind each call site, optionally initialize
 //! worker-local state, and evaluate input chunks into an output vector. Register
 //! the implementation with [`ScalarFunctionBuilder`]. Bind callbacks can use
-//! [`ResultTypeHandle`] when the concrete result type depends on the arguments.
+//! [`ReturnTypeHandle`] when the concrete result type depends on the arguments.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -17,7 +17,7 @@ use crate::enums::FunctionProperty;
 use crate::handles::{ScalarFunctionBuilderHandle, ScalarFunctionBuilderLink};
 use crate::logical_type::LogicalType;
 use crate::signature::SignatureBuilder;
-use crate::vector::{Unknown, Vector, VectorElement};
+use crate::vector::{Unknown, Vector};
 use crate::{Result, check_api_call, connection::Context};
 
 unsafe extern "C" fn bind_callback<T: ScalarCallbacks>(
@@ -37,7 +37,9 @@ unsafe extern "C" fn bind_callback<T: ScalarCallbacks>(
                 user_data,
                 Context(context),
                 metadata,
-                ResultTypeHandle { handle: &info },
+                ReturnTypeHandle {
+                    handle: FunctionBindHandles::Scalar(&info),
+                },
             )?;
 
             check_api_call!(
@@ -121,23 +123,35 @@ unsafe extern "C" fn exec_callback<T: ScalarCallbacks>(
     );
 }
 
-/// Callback-scoped control over a scalar function's resolved result type.
-pub struct ResultTypeHandle<'a> {
-    handle: &'a ffi::duckdb_v2_scalar_function_bind_info_handle,
+pub(crate) enum FunctionBindHandles<'a> {
+    Scalar(&'a ffi::duckdb_v2_scalar_function_bind_info_handle),
+    Aggregate(&'a ffi::duckdb_v2_aggregate_function_bind_info_handle),
 }
 
-impl<'a> ResultTypeHandle<'a> {
+/// Callback-scoped control over a scalar function's resolved result type.
+pub struct ReturnTypeHandle<'a> {
+    pub(crate) handle: FunctionBindHandles<'a>,
+}
+
+impl<'a> ReturnTypeHandle<'a> {
     /// Override the result type for the current bound call site.
     ///
     /// For example, a function declared to return `ANY` can derive a concrete
-    /// type from its bound arguments. DuckDB copies `result_type`, and the
+    /// type from its bound arguments. DuckDB copies `return`, and the
     /// override is valid only during binding.
-    pub fn override_result_type(&self, result_type: LogicalType) -> Result<()> {
-        check_api_call!(
-            ffi::duckdb_v2_scalar_function_bind_set_return_type,
-            *self.handle,
-            result_type.handle
-        )
+    pub fn override_return(&self, return_type: LogicalType) -> Result<()> {
+        match self.handle {
+            FunctionBindHandles::Scalar(handle) => check_api_call!(
+                ffi::duckdb_v2_scalar_function_bind_set_return_type,
+                *handle,
+                *return_type
+            ),
+            FunctionBindHandles::Aggregate(handle) => check_api_call!(
+                ffi::duckdb_v2_aggregate_function_bind_set_return_type,
+                *handle,
+                *return_type
+            ),
+        }
     }
 }
 
@@ -231,15 +245,13 @@ pub trait ScalarCallbacks: Send + Sync + 'static {
     type BindData: Any + Send + Sync + Default;
     /// Worker-local data shared across execution batches.
     type InitData: Any + Send + Sync + Default;
-    /// The typed element written to the result vector.
-    type ResultType: VectorElement;
 
     /// **Bind:** validate a call site and create data shared by later phases.
     fn bind(
         &self,
         _context: Context,
         _metadata: BindMetadata,
-        _result_type_handle: ResultTypeHandle,
+        _result_type_handle: ReturnTypeHandle,
     ) -> Result<Self::BindData> {
         Ok(Self::BindData::default())
     }

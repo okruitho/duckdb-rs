@@ -85,6 +85,26 @@ unsafe extern "C" fn bind_callback<T: TableFunctionCallbacks>(
     );
 }
 
+pub struct ExecColumnInfo<'a> {
+    handle: &'a ffi::duckdb_v2_table_function_exec_info_handle,
+}
+
+impl<'a> ExecColumnInfo<'a> {
+    pub fn count(&self) -> Result<usize> {
+        check_api_call!(ffi::duckdb_v2_table_function_exec_get_column_count, *self.handle, RET).map(|x| x as usize)
+    }
+
+    pub fn get_column_index(&self, index: usize) -> Result<usize> {
+        check_api_call!(
+            ffi::duckdb_v2_table_function_exec_get_column_index,
+            *self.handle,
+            index as u64,
+            RET
+        )
+        .map(|x| x as usize)
+    }
+}
+
 unsafe extern "C" fn exec_callback<T: TableFunctionCallbacks>(
     info: ffi::duckdb_v2_table_function_exec_info_handle,
     context: ffi::duckdb_v2_context_handle,
@@ -93,7 +113,6 @@ unsafe extern "C" fn exec_callback<T: TableFunctionCallbacks>(
     handle_unwind(
         || {
             let user_data = get_user_data!(ffi::duckdb_v2_table_function_exec_get_user_data, info);
-
             let bind_data = get_bind_data!(ffi::duckdb_v2_table_function_exec_get_bind_data, info);
 
             let global_state = get_global_state!(ffi::duckdb_v2_table_function_exec_get_global_state, info);
@@ -111,6 +130,7 @@ unsafe extern "C" fn exec_callback<T: TableFunctionCallbacks>(
                 local_state,
                 Context(context),
                 output_chunk,
+                ExecColumnInfo { handle: &info },
             )?;
 
             Ok(())
@@ -473,6 +493,7 @@ pub trait TableFunctionCallbacks: Send + Sync + 'static {
         local_state: Option<&mut Self::LocalState>,
         context: Context,
         output: DataChunkRef<'_>,
+        column_info: ExecColumnInfo,
     ) -> Result<()>;
 
     /// **Bind:** validate arguments, declare columns, and create shared data.

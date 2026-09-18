@@ -208,7 +208,6 @@ macro_rules! scalar_callback {
         impl $crate::scalar::ScalarCallbacks for $name {
             type BindData = ();
             type InitData = ();
-            type ResultType = $result_type;
 
             fn exec(
                 &self,
@@ -218,7 +217,7 @@ macro_rules! scalar_callback {
                 $input: &$crate::data_chunk::VectorCollection,
                 $result: $crate::vector::Vector<crate::vector::Unknown>,
             ) -> $crate::Result<()> {
-                let $result = $result.cast::<Self::ResultType>()?;
+                let $result = $result.cast::<$result_type>()?;
                 $body
             }
         }

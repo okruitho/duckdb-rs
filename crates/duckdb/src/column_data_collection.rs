@@ -115,6 +115,9 @@ impl Drop for ColumnDataCollection {
     }
 }
 
+unsafe impl Send for ColumnDataCollection {}
+unsafe impl Sync for ColumnDataCollection {}
+
 /// An iterator over the chunks stored in a [`ColumnDataCollection`].
 ///
 /// The scan owns the collection and its progress state. It can be consumed to
@@ -263,6 +266,7 @@ mod test {
         DuckDBType, Parameters,
         builder_helpers::scalar_callback,
         environment::{Environment, StorageLocation},
+        replacement_scan::{ReplacementScanBuilder, ReplacementScanCallbacks, ReplacementType},
         scalar::ScalarFunctionBuilder,
         signature::SignatureBuilder,
     };
@@ -295,9 +299,7 @@ mod test {
         Ok(())
     }
 
-    //TODO FIX
     #[test]
-    #[ignore]
     fn test_collection_add() -> crate::Result<()> {
         let env = Environment::new()?;
         let db = env.open(StorageLocation::InMemory)?;
@@ -310,7 +312,7 @@ mod test {
             is_active    BOOLEAN
          );
 
-         INSERT INTO employees FROM buf;
+         INSERT INTO employees FROM A;
 
          SELECT * FROM employees;
         "#,
@@ -370,37 +372,60 @@ mod test {
 
         collection.combine(collection_2.to_normal())?;
 
-        panic!();
+        struct A {
+            cdc: ColumnDataCollection,
+        }
 
-        // let statement = statements.next().unwrap()?;
-        // let statement =
-        //     statement.add_collection("buf", &collection.collection, Some(&["id".into(), "is_active".into()]))?;
+        impl ReplacementScanCallbacks for A {
+            fn scan(
+                &self,
+                _context: crate::connection::Context,
+                name: &crate::qualified_name::QualifiedName,
+                handle: crate::replacement_scan::ReplacementHandle,
+            ) -> Result<()> {
+                if name.get_view()?.table == Some("A".into()) {
+                    handle.set_reference(ReplacementType::ColumnDataCollection((
+                        &self.cdc,
+                        ["id".to_string(), "is_active".to_string()].into(),
+                    )))?;
+                }
 
-        // let rows_changed = conn.execute(statement, Parameters::None)?;
-        // assert_eq!(rows_changed, 3);
+                Ok(())
+            }
+        }
 
-        // let statement = statements.next().unwrap()?;
-        // let result = conn.query(statement, Parameters::None)?;
+        ReplacementScanBuilder::new(A {
+            cdc: collection.to_normal(),
+        })
+        .register(&conn)?;
 
-        // if let Some(chunk) = result.into_iter().next() {
-        //     let chunk = chunk?;
+        let statement = statements.next().unwrap()?;
 
-        //     let id = chunk.get_vector_at::<i32>(0)?;
-        //     let is_active = chunk.get_vector_at::<bool>(1)?;
+        let rows_changed = conn.execute(statement, Parameters::None)?;
+        assert_eq!(rows_changed, 3);
 
-        //     assert_eq!(id.get(0)?, Some(&10));
-        //     assert_eq!(is_active.get(0)?, Some(&false));
+        let statement = statements.next().unwrap()?;
+        let result = conn.query(statement, Parameters::None)?;
 
-        //     assert_eq!(id.get(1)?, Some(&12));
-        //     assert_eq!(is_active.get(1)?, None);
+        if let Some(chunk) = result.into_iter().next() {
+            let chunk = chunk?;
 
-        //     assert_eq!(id.get(2)?, Some(&14));
-        //     assert_eq!(is_active.get(2)?, Some(&true));
-        // } else {
-        //     assert!(false, "Expected a result chunk, but got none");
-        // }
+            let id = chunk.get_vector_at::<i32>(0)?;
+            let is_active = chunk.get_vector_at::<bool>(1)?;
 
-        // Ok(())
+            assert_eq!(id.get(0)?, Some(&10));
+            assert_eq!(is_active.get(0)?, Some(&false));
+
+            assert_eq!(id.get(1)?, Some(&12));
+            assert_eq!(is_active.get(1)?, None);
+
+            assert_eq!(id.get(2)?, Some(&14));
+            assert_eq!(is_active.get(2)?, Some(&true));
+        } else {
+            assert!(false, "Expected a result chunk, but got none");
+        }
+
+        Ok(())
     }
 
     #[test]

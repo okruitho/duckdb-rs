@@ -154,7 +154,7 @@ mod tests {
         environment::{Environment, StorageLocation},
         expression::ExpressionType,
         signature::SignatureBuilder,
-        table_function::{TableFunctionBuilder, TableFunctionCallbacks},
+        table_function::{ExecColumnInfo, TableFunctionBuilder, TableFunctionCallbacks},
     };
 
     struct TableFunctionTest;
@@ -184,6 +184,7 @@ mod tests {
             _local_state: Option<&mut Self::LocalState>,
             _context: Context,
             output: DataChunkRef,
+            _column_info: ExecColumnInfo,
         ) -> crate::Result<()> {
             let mut vec = output.get_vector_at::<i32>(0)?;
 

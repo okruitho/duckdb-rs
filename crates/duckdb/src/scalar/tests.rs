@@ -12,13 +12,12 @@ struct ScalarWithData {
 impl ScalarCallbacks for ScalarWithData {
     type BindData = Vec<i32>;
     type InitData = i32;
-    type ResultType = i32;
 
     fn bind(
         &self,
         _context: Context,
         _metadata: BindMetadata,
-        _result_type_handle: ResultTypeHandle,
+        _result_type_handle: ReturnTypeHandle,
     ) -> Result<Self::BindData> {
         Ok(vec![1, 2, 3])
     }
@@ -36,7 +35,7 @@ impl ScalarCallbacks for ScalarWithData {
         input: &VectorCollection,
         output: Vector<Unknown>,
     ) -> Result<()> {
-        let mut output: Vector<'_, i32> = output.cast::<Self::ResultType>()?;
+        let mut output: Vector<'_, i32> = output.cast::<i32>()?;
 
         let in_vector = input.get_vector_at::<i32>(0)?;
         let in_data = in_vector
@@ -60,7 +59,6 @@ struct BasicScalarFunction;
 impl ScalarCallbacks for BasicScalarFunction {
     type BindData = ();
     type InitData = ();
-    type ResultType = i32;
 
     fn exec(
         &self,
@@ -70,7 +68,7 @@ impl ScalarCallbacks for BasicScalarFunction {
         _input: &VectorCollection,
         output: Vector<'_, Unknown>,
     ) -> Result<()> {
-        let mut output: Vector<'_, i32> = output.cast::<Self::ResultType>()?;
+        let mut output: Vector<'_, i32> = output.cast::<i32>()?;
 
         output.set_size(1)?;
         output.write(0, Some(42))?;
@@ -83,7 +81,6 @@ struct BasicScalarPanicFunction;
 impl ScalarCallbacks for BasicScalarPanicFunction {
     type BindData = ();
     type InitData = ();
-    type ResultType = i32;
 
     fn exec(
         &self,
@@ -289,15 +286,14 @@ struct OverrideAbleScalar;
 impl ScalarCallbacks for OverrideAbleScalar {
     type BindData = ();
     type InitData = ();
-    type ResultType = i32;
 
     fn bind(
         &self,
         context: Context,
         _metadata: BindMetadata,
-        result_type_handle: ResultTypeHandle,
+        result_type_handle: ReturnTypeHandle,
     ) -> Result<Self::BindData> {
-        result_type_handle.override_result_type(i8::logical_type(&context)?)?;
+        result_type_handle.override_return(i8::logical_type(&context)?)?;
         Ok(())
     }
 

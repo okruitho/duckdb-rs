@@ -10,7 +10,7 @@ use crate::{
     error::{DuckDBError, Error},
     logical_type::LogicalTypeID,
     signature::{Parameter, SignatureBuilder},
-    table_function::{BindFunctionHandle, TableFunctionCallbacks, TableFunctionCardinality},
+    table_function::{BindFunctionHandle, ExecColumnInfo, TableFunctionCallbacks, TableFunctionCardinality},
 };
 
 #[test]
@@ -118,6 +118,7 @@ fn test_table_function() -> crate::Result<()> {
             local_state: Option<&mut Self::LocalState>,
             _context: Context,
             output: DataChunkRef,
+            _column_info: ExecColumnInfo,
         ) -> crate::Result<()> {
             let mut output_vector = output.get_vector_at::<i32>(0)?;
 
