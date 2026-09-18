@@ -130,7 +130,7 @@ unsafe extern "C" fn batch_size_callback<T: CopyToFunctionCallbacks>(
             let user_data = get_user_data!(ffi::duckdb_v2_copy_to_batch_size_get_user_data, info);
             let bind_data = get_bind_data!(ffi::duckdb_v2_copy_to_batch_size_get_bind_data, info).unwrap();
 
-            let target = T::batch_size(user_data, Context(context), &bind_data);
+            let target = T::batch_size(user_data, Context(context), bind_data);
 
             if let Some(target) = target {
                 check_api_call!(ffi::duckdb_v2_copy_to_batch_size_set_target, info, target as u64)
@@ -339,7 +339,7 @@ impl<T: CopyToFunctionCallbacks + CopyFromFunctionCallbacks> CopyFunctionBuilder
     }
 }
 
-/// Columns supplied to a copy function during binding.
+/// Input columns, output path, and options available while binding `COPY TO`.
 ///
 /// Column order matches the input relation being copied. Returned logical
 /// types are owned copies.
@@ -386,13 +386,16 @@ impl CopyToBindInfo {
             index as u64,
             RET
         )?;
-        let logical_type = LogicalType {
-            handle: check_api_call!(ffi::duckdb_v2_logical_type_copy, borrowed_type, RET)?,
-        };
+
+        let logical_type = LogicalType { handle: borrowed_type };
 
         Ok((name.into(), logical_type))
     }
 
+    /// Return the output path as written in the `COPY TO` statement.
+    ///
+    /// The initialization callback receives the actual file path, which may
+    /// differ for temporary files or partitioned output.
     pub fn file_path(&self) -> Result<String> {
         check_api_call!(ffi::duckdb_v2_copy_to_bind_get_file_path, self.handle, RET).map(|x| x.into())
     }
@@ -401,6 +404,10 @@ impl CopyToBindInfo {
         check_api_call!(ffi::duckdb_v2_copy_to_bind_get_option_count, self.handle, RET).map(|x| x as usize)
     }
 
+    /// Return owned names and values of the format-specific `COPY TO` options.
+    ///
+    /// Engine-handled options such as `USE_TMP_FILE` and `BATCH_SIZE` are excluded.
+    /// Bare options yield `true`; parenthesized lists yield unnamed struct values.
     pub fn options(&self) -> Result<HashMap<String, Value>> {
         let len = self.option_count()?;
         let mut items: HashMap<String, Value> = HashMap::with_capacity(len);
@@ -745,9 +752,13 @@ pub trait CopyToFunctionCallbacks: Send + Sync + 'static {
         input: ColumnDataCollection,
     ) -> Result<Self::BatchData>;
 
+    /// **Batch size:** choose the target number of rows per batch during planning.
+    ///
+    /// Skipped when the statement supplies `BATCH_SIZE`. A supplied count must be positive.
+    /// The final batch or a batch limited by `BATCH_SIZE_BYTES` may be smaller.
     #[allow(unused_variables)]
     fn batch_size(&self, context: Context, bind_data: &Self::BindData) -> Option<usize> {
-        return None;
+        None
     }
 
     /// **Flush:** write one prepared batch to the output.

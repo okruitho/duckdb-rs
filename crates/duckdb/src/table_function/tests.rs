@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use crate::{
     DuckDBType, Parameters,
-    bind_arguments::BindView,
+    bind_arguments::BindArgument,
     connection::{Context, SettingScope},
     connection_options::ConfigOptionValue,
     data_chunk::DataChunkRef,
@@ -39,7 +39,7 @@ fn test_table_function() -> crate::Result<()> {
         fn bind(
             &self,
             context: Context,
-            arguments: Vec<BindView>,
+            arguments: Vec<BindArgument>,
             bind_handle: BindFunctionHandle,
         ) -> Result<(Self::BindData, Option<crate::table_function::TableFunctionCardinality>)> {
             let arg = &arguments[0];

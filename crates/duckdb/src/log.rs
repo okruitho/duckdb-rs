@@ -19,6 +19,7 @@ ffi_enum_redeclaration! {
 pub struct Log;
 
 impl Log {
+    /// Log a message in the context's connection scope, subject to DuckDB's logging configuration.
     pub fn log_on_context(ctx: &Context, level: LogLevel, message: &str, log_type: &str) -> Result<()> {
         check_api_call!(
             ffi::duckdb_v2_context_log,

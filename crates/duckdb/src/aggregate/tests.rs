@@ -5,7 +5,7 @@ use libduckdb_sys::{DUCKDB_V2_FUNCTION_PROPERTY_KEY, DUCKDB_V2_FUNCTION_PROPERTY
 use crate::{
     DuckDBType, Parameters,
     aggregate::{AggregateCallbacks, AggregateFunctionBuilder},
-    bind_arguments::BindView,
+    bind_arguments::BindArgument,
     connection::Context,
     connection_options::ConfigOptionValue,
     data_chunk::VectorCollection,
@@ -26,7 +26,7 @@ impl<T: Display + Send + Sync + 'static> AggregateCallbacks for BasicAggregate<T
     type IncomingType = i32;
     type ResultType = String;
 
-    fn bind(&self, context: Context, arguments: Vec<BindView>) -> crate::Result<Self::BindData> {
+    fn bind(&self, context: Context, arguments: Vec<BindArgument>) -> crate::Result<Self::BindData> {
         let mut bind_data: Vec<f32> = Vec::new();
 
         for argument in arguments {

@@ -13,7 +13,7 @@ use libduckdb_sys as ffi;
 
 use crate::{
     Result,
-    bind_arguments::{BindMetadata, BindType, BindView},
+    bind_arguments::{BindArgument, BindMetadata, BindType},
     builder_helpers::{
         OpaqueHandle, get_bind_data, get_global_state, get_local_state, get_user_data, handle_unwind, into_opaque,
     },
@@ -60,7 +60,7 @@ unsafe extern "C" fn bind_callback<T: TableFunctionCallbacks>(
             let (bind_data, cardinality) = T::bind(
                 user_data,
                 Context(context),
-                metadata.get_view()?,
+                metadata.get_arguments()?,
                 BindFunctionHandle(&info),
             )?;
 
@@ -190,6 +190,7 @@ impl<'a> FilterColumnData<'a> {
         Ok(original_index as usize)
     }
 
+    /// Return the number of filter predicates offered for pushdown, combined with `AND`.
     pub fn filter_count(&self) -> Result<usize> {
         let value = check_api_call!(
             ffi::duckdb_v2_table_function_filter_pushdown_get_filter_count,
@@ -200,7 +201,7 @@ impl<'a> FilterColumnData<'a> {
         Ok(value as usize)
     }
 
-    /// Borrow a candidate filter expression.
+    /// Borrow the bound boolean filter expression at `index` for the duration of the callback.
     pub fn filter(&self, index: usize) -> Result<Expression<'a>> {
         let expression_handle = check_api_call!(
             ffi::duckdb_v2_table_function_filter_pushdown_get_filter,
@@ -215,6 +216,10 @@ impl<'a> FilterColumnData<'a> {
         })
     }
 
+    /// Accept responsibility for applying the filter at `index` in the table function.
+    ///
+    /// DuckDB stops applying accepted filters, so every emitted row must satisfy
+    /// them. Unaccepted filters remain enforced by DuckDB.
     pub fn accept_pushdown(&self, index: usize) -> Result<()> {
         check_api_call!(
             ffi::duckdb_v2_table_function_filter_pushdown_accept,
@@ -474,7 +479,7 @@ pub trait TableFunctionCallbacks: Send + Sync + 'static {
     fn bind(
         &self,
         context: Context,
-        arguments: Vec<BindView>,
+        arguments: Vec<BindArgument>,
         bind_handle: BindFunctionHandle,
     ) -> Result<(Self::BindData, Option<TableFunctionCardinality>)>;
 

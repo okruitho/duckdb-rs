@@ -11,6 +11,10 @@ use crate::{
     vector::{Unknown, Vector},
 };
 
+/// Read-only input vectors and their row count for scalar and aggregate callbacks.
+///
+/// Vectors follow argument order and borrow DuckDB's data for the duration of
+/// the callback.
 pub struct VectorCollection {
     pub(crate) handles: Vec<ffi::duckdb_v2_vector_handle>,
     pub(crate) is_writable: bool,
@@ -23,7 +27,7 @@ impl VectorCollection {
         let mut vectors = vec![];
 
         for handle in &self.handles {
-            vectors.push(Vector::from_handle(&handle, self.is_writable)?);
+            vectors.push(Vector::from_handle(handle, self.is_writable)?);
         }
 
         Ok(vectors)
@@ -31,8 +35,11 @@ impl VectorCollection {
 
     /// Return the vector at `index`, narrowed to `T`.
     ///
-    /// An out-of-range index or a logical type incompatible with `T` returns an
-    /// error.
+    /// A logical type incompatible with `T` returns an error.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is out of range.
     pub fn get_vector_at<T: VectorElement>(&self, index: usize) -> Result<Vector<'_, T>> {
         let vec = Vector::from_handle(&self.handles[index], self.is_writable)?;
 
@@ -44,11 +51,16 @@ impl VectorCollection {
         self.handles.len()
     }
 
+    /// Return the number of input rows in this callback batch.
     pub fn row_count(&self) -> usize {
         self.row_count
     }
 }
 
+/// A non-owning view of a DuckDB data chunk.
+///
+/// Provides vector access for both owned [`DataChunk`] values and borrowed
+/// callback chunks. Vectors borrowed from this view cannot outlive it.
 #[derive(Debug)]
 pub struct DataChunkRef<'a> {
     pub(crate) handle: ffi::duckdb_v2_data_chunk_handle,

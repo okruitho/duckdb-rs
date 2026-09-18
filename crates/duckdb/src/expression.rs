@@ -44,8 +44,7 @@ ffi_enum_redeclaration! {
 /// A borrowed node in DuckDB's bound expression tree.
 ///
 /// The lifetime ties the node and its children to the callback data that
-/// exposes them. Use [`Expression::class`] before calling class-specific
-/// accessors; traversal and general type information work for every node.
+/// exposes them.
 pub struct Expression<'a> {
     /// The borrowed DuckDB expression handle.
     pub handle: ffi::duckdb_v2_expression_handle,
@@ -83,11 +82,16 @@ impl<'a> Expression<'a> {
         Ok(children)
     }
 
+    /// Return whether this node is a regular `CAST` or a `TRY_CAST`.
+    ///
+    /// Returns an error if the node is not a cast.
     pub fn cast_mode(&self) -> Result<CastMode> {
         check_api_call!(ffi::duckdb_v2_expression_cast_get_mode, self.handle, RET)?.try_into()
     }
 
     /// Return the owned value of a bound constant expression.
+    ///
+    /// Returns an error if the node is not a constant.
     pub fn get_constant_value(&self) -> Result<Value> {
         Ok(Value {
             handle: check_api_call!(ffi::duckdb_v2_expression_constant_get_value, self.handle, RET)?,
@@ -96,9 +100,9 @@ impl<'a> Expression<'a> {
 
     /// Return the registered name of a bound function expression.
     ///
-    /// Comparison operators may return an internal name such as
-    /// `__comparison`; use [`Expression::expression_type`] to distinguish their
-    /// semantic operation.
+    /// Comparisons return their operator, such as `<`. Casts and `BETWEEN`
+    /// return internal names; use [`Self::expression_type`] to distinguish them.
+    /// Returns an error for nodes that do not represent function calls.
     pub fn function_name(&self) -> Result<String> {
         let name: ffi::duckdb_v2_str = check_api_call!(ffi::duckdb_v2_expression_function_get_name, self.handle, RET)?;
 
@@ -106,13 +110,19 @@ impl<'a> Expression<'a> {
         Ok(name.to_string())
     }
 
+    /// Return the function's owned name, qualified by catalog and schema where known.
+    ///
+    /// Accepts the same node types as [`Self::function_name`] and returns an
+    /// error for other nodes.
     pub fn qname(&self) -> Result<QualifiedName> {
         Ok(QualifiedName {
             handle: check_api_call!(ffi::duckdb_v2_expression_function_get_qname, self.handle, RET)?,
         })
     }
 
-    /// Return the input chunk column index of a physical bound reference.
+    /// Return the column reference's index in the operator's current column list.
+    ///
+    /// Returns an error if the node is not a column reference.
     pub fn reference_index(&self) -> Result<usize> {
         let index = check_api_call!(ffi::duckdb_v2_expression_column_ref_get_index, self.handle, RET)?;
 
@@ -138,7 +148,7 @@ mod tests {
 
     use crate::{
         DuckDBType, ToValue,
-        bind_arguments::BindView,
+        bind_arguments::BindArgument,
         connection::Context,
         data_chunk::DataChunkRef,
         environment::{Environment, StorageLocation},
@@ -157,7 +167,7 @@ mod tests {
         fn bind(
             &self,
             context: Context,
-            _metadata: Vec<BindView>,
+            _metadata: Vec<BindArgument>,
             bind_handle: crate::table_function::BindFunctionHandle,
         ) -> crate::Result<(Self::BindData, Option<crate::table_function::TableFunctionCardinality>)> {
             for i in 0..3 {

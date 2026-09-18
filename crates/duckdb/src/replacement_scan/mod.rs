@@ -1,4 +1,4 @@
-//! Replacing unresolved table references with table-function calls.
+//! Replacing unresolved table references with table functions, column data collections, or subqueries.
 
 use crate::{
     Result,
@@ -14,15 +14,19 @@ use crate::{
 
 /// Callback-scoped controls for claiming an unresolved table reference.
 ///
-/// Calling [`Self::set_function_name`] claims the reference. Parameters added
-/// before returning are passed to that table function.
+/// Use [`Self::set_reference`] to replace it with a table function, column data
+/// collection, or subquery. Parameters can be added only after selecting a
+/// table function.
 pub struct ReplacementHandle<'a> {
     info: &'a ffi::duckdb_v2_replacement_scan_info_handle,
 }
 
-pub enum ReplacementType {
+/// A replacement source for an unresolved table reference, selected with
+/// [`ReplacementHandle::set_reference`].
+pub enum ReplacementType<'a> {
+    /// A table function's name, optionally qualified by schema and catalog.
     Table(QualifiedName),
-    ColumnDataCollection((ColumnDataCollection, Vec<String>)),
+    ColumnDataCollection((&'a ColumnDataCollection, Vec<String>)),
     Subquery(String),
 }
 
@@ -42,8 +46,14 @@ impl<'a> ReplacementHandle<'a> {
         )
     }
 
-    /// Claim the reference with a table function.
-    pub fn set_reference(&self, replacement_type: ReplacementType) -> Result<()> {
+    /// Claim the reference with a table function, column data collection, or SELECT subquery.
+    ///
+    /// Returns an error if a different replacement kind has already claimed the
+    /// reference. A subquery must contain exactly one SELECT statement.
+    pub fn set_reference<'b>(&'a self, replacement_type: ReplacementType<'b>) -> Result<()>
+    where
+        'b: 'a,
+    {
         match replacement_type {
             ReplacementType::Table(name) => {
                 check_api_call!(ffi::duckdb_v2_replacement_scan_set_function_name, *self.info, *name)
@@ -51,8 +61,8 @@ impl<'a> ReplacementHandle<'a> {
             ReplacementType::ColumnDataCollection((cdc, names)) => check_api_call!(
                 ffi::duckdb_v2_replacement_scan_set_collection,
                 *self.info,
-                *cdc,
-                (&names).iter().map(|n| n.into()).collect::<Vec<_>>().as_ptr(),
+                **cdc,
+                names.iter().map(|n| n.into()).collect::<Vec<_>>().as_ptr(),
                 names.len() as u64
             ),
             ReplacementType::Subquery(query) => {
@@ -65,6 +75,7 @@ impl<'a> ReplacementHandle<'a> {
         }
     }
 
+    /// Set the replacement's alias unless the query supplies one.
     pub fn set_alias(&self, name: &str) -> Result<()> {
         check_api_call!(ffi::duckdb_v2_replacement_scan_set_alias, *self.info, name.into())
     }
@@ -83,8 +94,6 @@ unsafe extern "C" fn replacement_callback<T: ReplacementScanCallbacks>(
                 handle: check_api_call!(ffi::duckdb_v2_replacement_scan_get_name, info, RET)?,
             };
 
-            dbg!("replacement_callback called with qualified_name: {}", &qname,);
-
             T::scan(user_data, Context(context), &qname, ReplacementHandle { info: &info })
         },
         err,
@@ -93,8 +102,13 @@ unsafe extern "C" fn replacement_callback<T: ReplacementScanCallbacks>(
 
 /// Registers a replacement scan callback.
 ///
-/// Registered callbacks are consulted in order whenever binding cannot resolve
-/// a table name. Registration lasts until the database closes.
+/// Callbacks are consulted when binding cannot resolve a table name, in
+/// registration order within each scope. Connection-local scans run before
+/// database-wide scans; the first to claim the reference wins.
+///
+/// Registering through a connection keeps the scan local to that connection
+/// until it closes. Registering through a database or extension makes the scan
+/// visible to all connections until the database closes.
 pub struct ReplacementScanBuilder<T> {
     implementation: OpaqueHandle<T>,
 }
@@ -140,8 +154,9 @@ where
 pub trait ReplacementScanCallbacks: Send + Sync + 'static {
     /// **Bind:** claim, decline, or reject an unresolved table reference.
     ///
-    /// Set a function name to claim it, return without doing so to let the next
-    /// replacement scan try, or return an error to reject the query.
+    /// Call [`ReplacementHandle::set_reference`] to claim it, return without
+    /// doing so to let the next replacement scan try, or return an error to
+    /// reject the query.
     fn scan(&self, context: Context, name: &QualifiedName, parameters: ReplacementHandle) -> Result<()>;
 }
 

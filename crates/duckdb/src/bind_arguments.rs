@@ -18,39 +18,36 @@ pub struct BindMetadata<'a> {
     pub(crate) bind_type: BindType<'a>,
 }
 
-pub struct BindView {
+/// An owned argument type and optional constant value supplied to a bind callback.
+pub struct BindArgument {
+    /// The argument's resolved logical type.
     pub logical_type: LogicalType,
+    /// The constant value, if the argument can be folded at bind time.
+    ///
+    /// SQL NULL is represented by `Some` containing a null [`Value`], not `None`.
     pub value: Option<Value>,
 }
 
 impl<'a> BindMetadata<'a> {
-    pub fn get_view(&self) -> Result<Vec<BindView>> {
+    pub(crate) fn get_arguments(&self) -> Result<Vec<BindArgument>> {
         match self.bind_type {
-            BindType::Aggregate(handle) => self.from_aggregate(handle),
-            BindType::Scalar(handle) => self.from_scalar(handle),
-            BindType::Table(handle) => self.from_table(handle),
+            BindType::Aggregate(handle) => self.aggregate(handle),
+            BindType::Scalar(handle) => self.scalar(handle),
+            BindType::Table(handle) => self.table(handle),
         }
     }
 
-    pub(crate) fn from_scalar(
-        &self,
-        handle: &ffi::duckdb_v2_scalar_function_bind_info_handle,
-    ) -> Result<Vec<BindView>> {
+    fn scalar(&self, handle: &ffi::duckdb_v2_scalar_function_bind_info_handle) -> Result<Vec<BindArgument>> {
         let count = check_api_call!(ffi::duckdb_v2_scalar_function_bind_get_arg_count, *handle, RET)?;
 
         let mut bind_views = vec![];
 
         for i in 0..count {
             let logical_type = LogicalType {
-                handle: check_api_call!(ffi::duckdb_v2_scalar_function_bind_get_arg_type, *handle, i as u64, RET)?,
+                handle: check_api_call!(ffi::duckdb_v2_scalar_function_bind_get_arg_type, *handle, i, RET)?,
             };
 
-            let value_handle = check_api_call!(
-                ffi::duckdb_v2_scalar_function_bind_get_arg_value,
-                *handle,
-                i as u64,
-                RET
-            );
+            let value_handle = check_api_call!(ffi::duckdb_v2_scalar_function_bind_get_arg_value, *handle, i, RET);
             let value = match value_handle {
                 Ok(v) => Some(Value { handle: v }),
                 Err(e) => {
@@ -62,35 +59,22 @@ impl<'a> BindMetadata<'a> {
                 }
             };
 
-            bind_views.push(BindView { logical_type, value });
+            bind_views.push(BindArgument { logical_type, value });
         }
 
         Ok(bind_views)
     }
 
-    pub(crate) fn from_aggregate(
-        &self,
-        handle: &ffi::duckdb_v2_aggregate_function_bind_info_handle,
-    ) -> Result<Vec<BindView>> {
+    fn aggregate(&self, handle: &ffi::duckdb_v2_aggregate_function_bind_info_handle) -> Result<Vec<BindArgument>> {
         let count = check_api_call!(ffi::duckdb_v2_aggregate_function_bind_get_arg_count, *handle, RET)?;
 
         let mut bind_views = vec![];
 
         for i in 0..count {
             let logical_type = LogicalType {
-                handle: check_api_call!(
-                    ffi::duckdb_v2_aggregate_function_bind_get_arg_type,
-                    *handle,
-                    i as u64,
-                    RET
-                )?,
+                handle: check_api_call!(ffi::duckdb_v2_aggregate_function_bind_get_arg_type, *handle, i, RET)?,
             };
-            let value_handle = check_api_call!(
-                ffi::duckdb_v2_aggregate_function_bind_get_arg_value,
-                *handle,
-                i as u64,
-                RET
-            );
+            let value_handle = check_api_call!(ffi::duckdb_v2_aggregate_function_bind_get_arg_value, *handle, i, RET);
             let value = match value_handle {
                 Ok(v) => Some(Value { handle: v }),
                 Err(e) => {
@@ -102,26 +86,26 @@ impl<'a> BindMetadata<'a> {
                 }
             };
 
-            bind_views.push(BindView { logical_type, value });
+            bind_views.push(BindArgument { logical_type, value });
         }
 
         Ok(bind_views)
     }
 
-    pub(crate) fn from_table(&self, handle: &ffi::duckdb_v2_table_function_bind_info_handle) -> Result<Vec<BindView>> {
+    fn table(&self, handle: &ffi::duckdb_v2_table_function_bind_info_handle) -> Result<Vec<BindArgument>> {
         let count = check_api_call!(ffi::duckdb_v2_table_function_bind_get_arg_count, *handle, RET)?;
 
         let mut bind_views = vec![];
 
         for i in 0..count {
             let logical_type = LogicalType {
-                handle: check_api_call!(ffi::duckdb_v2_table_function_bind_get_arg_type, *handle, i as u64, RET)?,
+                handle: check_api_call!(ffi::duckdb_v2_table_function_bind_get_arg_type, *handle, i, RET)?,
             };
             let value = Value {
-                handle: check_api_call!(ffi::duckdb_v2_table_function_bind_get_arg_value, *handle, i as u64, RET)?,
+                handle: check_api_call!(ffi::duckdb_v2_table_function_bind_get_arg_value, *handle, i, RET)?,
             };
 
-            bind_views.push(BindView {
+            bind_views.push(BindArgument {
                 logical_type,
                 value: Some(value),
             });

@@ -7,6 +7,10 @@ use crate::{
     qualified_name::QualifiedName,
 };
 
+/// An owned snapshot of a table column's name, type, and default or generated status.
+///
+/// Obtained from [`TableDescription::column`] or [`TableDescription::columns`]
+/// and independent of the table description's lifetime.
 pub struct ColumnDescription {
     handle: ffi::duckdb_v2_column_description_handle,
 }
@@ -19,22 +23,26 @@ impl Drop for ColumnDescription {
 }
 
 impl ColumnDescription {
+    /// Return the column's name with its declared casing.
     pub fn name(&self) -> Result<&str> {
         let name = check_api_call!(ffi::duckdb_v2_column_description_get_name, self.handle, RET)?;
 
         Ok(name.into())
     }
 
+    /// Return an owned copy of the column's logical type.
     pub fn logical_type(&self) -> Result<LogicalType> {
         let mut handle = check_api_call!(ffi::duckdb_v2_column_description_get_type, self.handle, RET)?;
 
         LogicalType::copy_handle(&mut handle)
     }
 
+    /// Return whether the column declares a default expression; false for generated columns.
     pub fn has_default(&self) -> Result<bool> {
         check_api_call!(ffi::duckdb_v2_column_description_has_default, self.handle, RET)
     }
 
+    /// Return whether the column is generated from an expression.
     pub fn has_generated(&self) -> Result<bool> {
         check_api_call!(ffi::duckdb_v2_column_description_has_generated, self.handle, RET)
     }
@@ -43,8 +51,7 @@ impl ColumnDescription {
 /// An owned snapshot of a base table's catalog metadata.
 ///
 /// The snapshot records the fully resolved name, columns, and per-column
-/// properties at creation time; later DDL does not update it. Column property
-/// indices align with the fields returned by [`Self::schema`].
+/// properties at creation time; later DDL does not update it.
 ///
 /// # Example
 /// ```
@@ -94,10 +101,14 @@ impl TableDescription {
         Ok(QualifiedName { handle })
     }
 
+    /// Return the number of columns, including generated columns.
     pub fn column_count(&self) -> Result<usize> {
         Ok(check_api_call!(ffi::duckdb_v2_table_description_get_column_count, self.handle, RET)? as usize)
     }
 
+    /// Return an owned description of the column at the zero-based index.
+    ///
+    /// Columns follow declaration order, including generated columns.
     pub fn column(&self, index: usize) -> Result<ColumnDescription> {
         Ok(ColumnDescription {
             handle: check_api_call!(
@@ -109,6 +120,7 @@ impl TableDescription {
         })
     }
 
+    /// Return owned descriptions of all columns in declaration order, including generated columns.
     pub fn columns(&self) -> Result<Vec<ColumnDescription>> {
         let count = self.column_count()?;
 
@@ -118,14 +130,6 @@ impl TableDescription {
             columns.push(self.column(i)?);
         }
         Ok(columns)
-    }
-
-    #[cfg(feature = "capi-v2-p4")]
-    /// Return the columns in declaration order, including generated columns.
-    pub fn schema(&self) -> Result<Schema> {
-        let handle = check_api_call!(ffi::duckdb_v2_table_description_get_schema, self.handle, RET)?;
-
-        Ok(Schema { handle })
     }
 
     /// Return whether the table belongs to a read-only catalog.
@@ -172,8 +176,8 @@ mod tests {
 
         let id_col = &columns[0];
 
-        assert_eq!(id_col.has_default()?, false);
-        assert_eq!(id_col.has_generated()?, false);
+        assert!(!id_col.has_default()?);
+        assert!(!id_col.has_generated()?);
         assert_eq!(
             id_col.logical_type()?.type_id(),
             LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_INTEGER
@@ -182,8 +186,8 @@ mod tests {
 
         let name = &columns[1];
 
-        assert_eq!(name.has_default()?, true);
-        assert_eq!(name.has_generated()?, false);
+        assert!(name.has_default()?);
+        assert!(!name.has_generated()?);
         assert_eq!(
             name.logical_type()?.type_id(),
             LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_VARCHAR
@@ -192,8 +196,8 @@ mod tests {
 
         let td = &columns[2];
 
-        assert_eq!(td.has_generated()?, true);
-        assert_eq!(td.has_default()?, false);
+        assert!(td.has_generated()?);
+        assert!(!td.has_default()?);
 
         Ok(())
     }

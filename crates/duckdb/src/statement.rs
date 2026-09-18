@@ -81,8 +81,8 @@ impl Iterator for Statements {
 
 /// A single parsed SQL statement.
 ///
-/// A statement can be bound to inspect its input and output schemas, extended
-/// with in-memory collections, prepared for repeated execution, or passed to
+/// A statement can be bound to inspect its input and output schemas,
+/// prepared for repeated execution, or passed to
 /// [`Connection::query`].
 pub struct Statement {
     /// The owned DuckDB statement handle.
@@ -127,19 +127,29 @@ impl Statement {
         })
     }
 
+    /// Return a copy of this statement's SQL text.
+    ///
+    /// Includes the trailing terminator and whitespace, but excludes whitespace
+    /// and comments before the first token.
     pub fn get_text(&self) -> Result<String> {
         check_api_call!(ffi::duckdb_v2_sql_statement_get_text, self.handle, RET).map(|x| x.into())
     }
 
+    /// Return the statement type as classified by the parser, before execution-time rewrites.
     pub fn get_type(&self) -> Result<StatementType> {
         let val = check_api_call!(ffi::duckdb_v2_sql_statement_get_type, self.handle, RET)?;
         val.try_into()
     }
 
+    /// Return the number of distinct parameters found by the parser, counting repeated uses once.
     pub fn parameter_count(&self) -> Result<usize> {
         check_api_call!(ffi::duckdb_v2_sql_statement_get_parameter_count, self.handle, RET).map(|x| x as usize)
     }
 
+    /// Return the parameter's binding key at the zero-based index in binding order.
+    ///
+    /// Keys omit the `$` prefix: `"1"` for `$1`, or `"name"` for `$name`.
+    /// Positional keys may have gaps.
     pub fn parameter_name(&self, index: usize) -> Result<String> {
         check_api_call!(
             ffi::duckdb_v2_sql_statement_get_parameter_name,
@@ -159,7 +169,7 @@ impl Drop for Statement {
 
 /// A statement bound and planned for repeated execution.
 ///
-/// Execution accepts either named or positional [`Value`] parameters and is
+/// Execution accepts named or positional [`Parameters`] and is
 /// lazy: work begins when the returned [`QueryResult`] is consumed. The
 /// prepared statement remains associated with the connection used to create it.
 pub struct PreparedStatement<'a> {

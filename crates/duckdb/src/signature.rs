@@ -255,7 +255,7 @@ impl SignatureBuilder {
         }
     }
 
-    /// Build on an borrowed signature.
+    /// Append parameters and apply configured types to a borrowed signature.
     pub fn build(&self, handle: &ffi::duckdb_v2_function_signature_handle) -> Result<()> {
         if let Some(return_handle) = self.return_type.as_ref() {
             check_api_call!(

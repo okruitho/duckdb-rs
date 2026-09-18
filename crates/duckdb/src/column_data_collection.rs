@@ -223,13 +223,16 @@ impl ColumnDataCollectionAppender {
         Ok(())
     }
 
-    /// Remove all rows and return the collection with its schema unchanged.
-    pub fn reset(&mut self) -> Result<()> {
-        check_api_call!(ffi::duckdb_v2_column_data_collection_reset, self.collection.handle)
+    /// Consume the appender and return an empty collection with its schema unchanged.
+    pub fn reset(self) -> Result<ColumnDataCollection> {
+        check_api_call!(ffi::duckdb_v2_column_data_collection_reset, self.collection.handle)?;
+        Ok(self.collection)
     }
 
-    pub fn clear(&mut self) -> Result<()> {
-        check_api_call!(ffi::duckdb_v2_column_data_collection_clear, self.collection.handle)
+    /// Return an empty collection, retaining its schema and buffers.
+    pub fn clear(self) -> Result<ColumnDataCollection> {
+        check_api_call!(ffi::duckdb_v2_column_data_collection_clear, self.collection.handle)?;
+        Ok(self.collection)
     }
 
     /// Finish appending and return the underlying collection.
@@ -337,7 +340,7 @@ mod test {
 
         assert_eq!(collection.len()?, 2);
 
-        collection.reset()?;
+        let collection = collection.reset()?;
 
         assert_eq!(collection.len()?, 0);
 
@@ -345,6 +348,8 @@ mod test {
         id.write(1, Some(12))?;
         is_active.write(0, Some(false))?;
         is_active.write(1, None)?;
+
+        let mut collection = collection.to_append()?;
 
         collection.append(&chunk)?;
 

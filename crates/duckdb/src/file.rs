@@ -70,7 +70,7 @@ impl<'a> FileBuilder<'a> {
         Ok(self)
     }
 
-    /// Enable or disable exclusive creation that fails if the file exists.
+    /// Create the file if missing, or truncate it to empty if it exists.
     pub fn create_new(self) -> Result<Self> {
         check_api_call!(
             ffi::duckdb_v2_file_open_options_set_flag,
@@ -80,7 +80,7 @@ impl<'a> FileBuilder<'a> {
         Ok(self)
     }
 
-    /// Enable or disable
+    /// Create the file only if it does not exist, failing if it already does.
     pub fn exclusive_create(self) -> Result<Self> {
         let new = self.create()?;
         check_api_call!(
@@ -101,6 +101,9 @@ impl<'a> FileBuilder<'a> {
         Ok(self)
     }
 
+    /// Permit concurrent reads and writes at explicit offsets.
+    ///
+    /// Set this when [`File::read_at`] or [`File::write_at`] are used from several threads.
     pub fn parallel_access(self) -> Result<Self> {
         check_api_call!(
             ffi::duckdb_v2_file_open_options_set_flag,
@@ -110,6 +113,9 @@ impl<'a> FileBuilder<'a> {
         Ok(self)
     }
 
+    /// Attach a named hint for the file system that handles the path.
+    ///
+    /// Unrecognized names are ignored.
     pub fn set_value(self, name: &str, value: &Value) -> Result<Self> {
         check_api_call!(
             ffi::duckdb_v2_file_open_options_set_value,
@@ -243,7 +249,7 @@ impl File {
         Ok(bytes_written as usize)
     }
 
-    /// Read up to `len` bytes starting from `position`.
+    /// Read exactly `len` bytes from `position`; returns an error when not enough bytes could be read.
     pub fn read_at(&self, position: usize, len: usize) -> Result<Vec<u8>> {
         let mut buffer = vec![0u8; len];
 

@@ -1,6 +1,9 @@
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
-fn generate_bindings(header_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn generate_bindings(header_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let include_dir = header_path.parent().expect("resolved header has a parent");
     let bindings = bindgen::Builder::default()
         .header(header_path.to_string_lossy())

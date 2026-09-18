@@ -15,7 +15,7 @@ use libduckdb_sys::{self as ffi};
 
 use crate::{
     Result,
-    bind_arguments::{BindMetadata, BindType, BindView},
+    bind_arguments::{BindArgument, BindMetadata, BindType},
     builder_helpers::{OpaqueHandle, get_bind_data, get_user_data, handle_unwind, into_opaque},
     check_api_call,
     connection::Context,
@@ -113,7 +113,7 @@ unsafe extern "C" fn bind_callback<T: AggregateCallbacks>(
 
             let user_data = get_user_data!(ffi::duckdb_v2_aggregate_function_bind_get_user_data, info);
 
-            let result = T::bind(user_data, Context(context), metadata.get_view()?)?;
+            let result = T::bind(user_data, Context(context), metadata.get_arguments()?)?;
 
             dbg!("AA");
 
@@ -435,7 +435,7 @@ pub trait AggregateCallbacks: Send + Sync + 'static {
     type ResultType: VectorElement;
 
     /// **Bind:** validate a call site and create data shared by later phases.
-    fn bind(&self, context: Context, metadata: Vec<BindView>) -> Result<Self::BindData>;
+    fn bind(&self, context: Context, metadata: Vec<BindArgument>) -> Result<Self::BindData>;
 
     /// **Size:** return the allocation size of one aggregate state.
     fn size(&self, _bind_data: Option<&Self::BindData>) -> Result<usize> {

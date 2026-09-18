@@ -304,6 +304,9 @@ impl FFILink for Connection {
     }
 }
 
+/// A non-owning handle to the extension being loaded, available during an
+/// extension load callback. Registering through it makes the item visible to
+/// every connection on that database.
 #[repr(transparent)]
 pub struct Extension(pub(crate) ffi::duckdb_v2_extension_handle);
 

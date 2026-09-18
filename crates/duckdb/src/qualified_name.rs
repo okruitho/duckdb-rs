@@ -5,6 +5,7 @@ use std::ops::Deref;
 use crate::{Result, check_api_call, check_api_call_no_err, check_api_call_string, error::Error};
 use libduckdb_sys as ffi;
 
+/// Owned identifier parts extracted from a [`QualifiedName`].
 #[derive(Default, Debug)]
 pub struct QualifiedNameView {
     pub catalog: Option<String>,
@@ -79,6 +80,7 @@ impl QualifiedName {
         Ok(count as usize)
     }
 
+    /// Copy the identifier parts into named fields, leaving absent qualifiers as `None`.
     pub fn get_view(&self) -> Result<QualifiedNameView> {
         let mut view = QualifiedNameView {
             catalog: None,

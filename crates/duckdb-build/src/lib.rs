@@ -38,7 +38,7 @@ pub enum LinkMode {
 }
 
 #[cfg(not(any(feature = "pkg-config", feature = "vcpkg")))]
-fn try_from_user_install() -> Result<(Vec<PathBuf>, Vec<PathBuf>), Box<dyn std::error::Error>> {
+fn try_from_user_install() -> Result<LinkPaths, Box<dyn std::error::Error>> {
     let path = dirs::home_dir()
         .ok_or("Failed to get home directory")?
         .join(format!(".duckdb/lib/{}", ARTIFACT_VERSION));
@@ -75,7 +75,7 @@ fn try_from_pkg_config(
 }
 
 #[cfg(not(any(feature = "pkg-config", feature = "vcpkg")))]
-fn try_from_system_install() -> Result<(Vec<PathBuf>, Vec<PathBuf>), Box<dyn std::error::Error>> {
+fn try_from_system_install() -> Result<LinkPaths, Box<dyn std::error::Error>> {
     let lib_path = PathBuf::from("/usr/local/lib");
     let include_path = PathBuf::from("/usr/local/include");
 
@@ -83,13 +83,13 @@ fn try_from_system_install() -> Result<(Vec<PathBuf>, Vec<PathBuf>), Box<dyn std
 }
 
 #[cfg(all(not(feature = "pkg-config"), feature = "vcpkg"))]
-fn try_from_vcpkg() -> Result<(Vec<PathBuf>, Vec<PathBuf>), Box<dyn std::error::Error>> {
+fn try_from_vcpkg() -> Result<LinkPaths, Box<dyn std::error::Error>> {
     let library = vcpkg::Config::new().cargo_metadata(false).find_package("duckdb")?;
 
     Ok((library.link_paths, library.include_paths))
 }
 
-fn try_from_env() -> Result<Option<(Vec<PathBuf>, Vec<PathBuf>)>, Box<dyn std::error::Error>> {
+fn try_from_env() -> Result<Option<LinkPaths>, Box<dyn std::error::Error>> {
     match (env::var_os("DUCKDB_LIB_DIR"), env::var_os("DUCKDB_INCLUDE_DIR")) {
         (None, None) => Ok(None),
         (Some(lib_path), Some(include_path)) => {
@@ -166,6 +166,8 @@ enum Provider {
     Vcpkg,
 }
 
+type LinkPaths = (Vec<PathBuf>, Vec<PathBuf>);
+
 fn get_paths(
     _target: &Target,
     target_lib_names: &[String],
@@ -210,7 +212,7 @@ fn get_paths(
     }
 }
 
-pub fn emit_rerun_calls(lib_path: &PathBuf, header_path: &PathBuf) {
+pub fn emit_rerun_calls(lib_path: &Path, header_path: &Path) {
     for variable in [
         "DUCKDB_LIB_DIR",
         "DUCKDB_INCLUDE_DIR",
@@ -227,7 +229,7 @@ pub fn emit_rerun_calls(lib_path: &PathBuf, header_path: &PathBuf) {
     println!("cargo:rerun-if-changed={}", header_path.display());
 }
 
-pub fn emit_runtime_path(lib_path: &PathBuf) {
+pub fn emit_runtime_path(lib_path: &Path) {
     match env::var("CARGO_CFG_TARGET_OS").as_deref() {
         Ok("macos") | Ok("ios") => {
             println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_path.display());
@@ -296,7 +298,7 @@ impl ResolvedLibrary {
 
         match self.mode {
             LinkMode::Static => println!("cargo:static=1"),
-            LinkMode::Dynamic => emit_runtime_path(&self.lib_dir().to_path_buf()),
+            LinkMode::Dynamic => emit_runtime_path(self.lib_dir()),
         }
         Ok(())
     }
@@ -304,7 +306,7 @@ impl ResolvedLibrary {
 
 pub fn emit_dynamic_linking_flags() -> Result<(), Box<dyn std::error::Error>> {
     let library = resolve_library()?;
-    emit_runtime_path(&library.lib_dir().to_path_buf());
+    emit_runtime_path(library.lib_dir());
     Ok(())
 }
 

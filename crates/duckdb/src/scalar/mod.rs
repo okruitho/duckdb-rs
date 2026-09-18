@@ -101,7 +101,7 @@ unsafe extern "C" fn exec_callback<T: ScalarCallbacks>(
             }
 
             let collection = VectorCollection {
-                handles: handles,
+                handles,
                 is_writable: false,
                 row_count,
             };
