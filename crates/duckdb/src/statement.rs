@@ -217,6 +217,7 @@ impl<'a> Drop for PreparedStatement<'a> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::{
         environment::{Environment, StorageLocation},

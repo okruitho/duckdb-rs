@@ -227,6 +227,7 @@ pub(crate) use check_api_call_no_err;
 pub(crate) use check_api_call_string;
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::{
         ToValue,

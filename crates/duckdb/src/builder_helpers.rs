@@ -228,6 +228,7 @@ macro_rules! scalar_callback {
 pub(crate) use scalar_callback;
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::panic_message;
     use std::any::Any;

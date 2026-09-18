@@ -775,4 +775,5 @@ pub trait CopyToFunctionCallbacks: Send + Sync + 'static {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests;

@@ -134,7 +134,6 @@ impl Drop for ArrowImporter {
 }
 
 #[cfg(test)]
-#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(false)]
 mod tests {
     use crate::{

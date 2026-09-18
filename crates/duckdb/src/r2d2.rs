@@ -54,6 +54,7 @@ impl r2d2::ManageConnection for ConnectionManager {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::{
         Parameters,

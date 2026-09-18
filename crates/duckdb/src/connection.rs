@@ -379,6 +379,7 @@ impl<T: FFILink + ?Sized> FFILink for &T {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::{
         Parameters,
