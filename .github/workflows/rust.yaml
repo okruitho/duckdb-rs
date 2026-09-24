@@ -11,6 +11,7 @@ on:
     paths-ignore:
       - "**/*.md"
       - "LICENSE"
+  merge_group:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: full
@@ -64,20 +65,18 @@ jobs:
     # crates/libduckdb-sys/.duckdb-release, so this job compiles no C++. The
     # bundled backends are covered by the lint job's clippy step (extensions-full
     # implies bundled), the CMake job, and the sanitizer job on main.
-    name: Test ${{ matrix.crate.name }} (${{ matrix.platform.name }})
+    name: Test ${{ matrix.crate.name }} (${{ matrix.os }})
     strategy:
       fail-fast: true
       matrix:
-        platform:
-          - { name: Linux, target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
-          - { name: macOS, target: aarch64-apple-darwin, os: macos-latest }
-          - { name: Windows, target: x86_64-pc-windows-msvc, os: windows-latest }
+        # PRs test Linux only; the merge queue and main also run macOS and Windows.
+        os: ${{ fromJSON(github.event_name != 'pull_request' && '["ubuntu-latest","macos-latest","windows-latest"]' || '["ubuntu-latest"]') }}
         crate:
           - { name: duckdb, features: "modern-full vscalar vtab-full" }
           - { name: duckdb-neo, features: "r2d2" }
           - { name: libduckdb-sys, features: "" }
           - { name: duckdb-loadable-macros, features: "" }
-    runs-on: ${{ matrix.platform.os }}
+    runs-on: ${{ matrix.os }}
     env:
       # Explicit for clarity; the pin file makes this the default anyway.
       DUCKDB_DOWNLOAD_LIB: "1"
@@ -87,7 +86,6 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          target: ${{ matrix.platform.target }}
           cache-on-failure: false
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: mozilla-actions/sccache-action@v0.0.10
@@ -100,14 +98,12 @@ jobs:
         run: cargo build --example hello-ext --features="loadable-extension" --locked
 
   cmake:
-    name: Bundled CMake ${{ matrix.name }}
+    name: Bundled CMake (${{ matrix.os }})
     strategy:
       fail-fast: true
       matrix:
-        include:
-          - { name: Linux, os: ubuntu-latest }
-          - { name: macOS, os: macos-latest }
-          - { name: Windows, os: windows-latest }
+        # PRs test Linux only; the merge queue and main also run macOS and Windows.
+        os: ${{ fromJSON(github.event_name != 'pull_request' && '["ubuntu-latest","macos-latest","windows-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     env:
       SCCACHE_GHA_ENABLED: "true"
@@ -216,3 +212,14 @@ jobs:
         # We cannot run "modern-full" with asan as the chrono feature will auto-load release binaries of
         # the ICU-extension, which are not built with ASAN and will cause a crash.
         run: cargo test --lib --tests --features "${ASAN_FEATURES}" --target x86_64-unknown-linux-gnu --package duckdb --package duckdb-neo
+
+  # Single required check for branch protection. PRs and the merge queue run
+  # different matrices, so require this job instead of the individual ones.
+  ci-result:
+    name: CI Result
+    if: always()
+    needs: [lint, test, cmake, msrv, sanitizer]
+    runs-on: ubuntu-latest
+    steps:
+      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
