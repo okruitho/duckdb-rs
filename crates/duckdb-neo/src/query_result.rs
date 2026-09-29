@@ -160,15 +160,16 @@ impl<'a> QueryResult<'a> {
     /// zero selects DuckDB's default of 131,072 rows. Dropping the stream
     /// releases it and makes the connection available for another query.
     ///
-    /// The query runs while the stream is read, so the stream borrows the connection:
+    /// The query runs while the stream is read, so the stream borrows the connection,
+    /// and calls such as [`Connection::set_option`] fail with `RESOURCE_IN_USE` until it is dropped:
     ///
     /// ```compile_fail
     /// # use duckdb_neo::{Parameters, environment::{Environment, StorageLocation}};
     /// # fn main() -> duckdb_neo::Result<()> {
     /// # let db = Environment::new()?.open(StorageLocation::InMemory)?;
-    /// let mut conn = db.connect()?;
+    /// let conn = db.connect()?;
     /// let stream = conn.query("SELECT 42", Parameters::None)?.to_arrow_stream(0)?;
-    /// conn.set_option("threads", "1", None)?; // error: `conn` is still borrowed by `stream`
+    /// drop(conn); // error: `conn` is still borrowed by `stream`
     /// drop(stream);
     /// # Ok(())
     /// # }

@@ -54,7 +54,7 @@ mod tests {
     fn test_log_on_context() -> crate::Result<()> {
         let env = Environment::new()?;
         let db = env.open(StorageLocation::InMemory)?;
-        let mut conn = db.connect()?;
+        let conn = db.connect()?;
 
         conn.set_option("enable_logging", "true", Some(SettingScope::Global))?;
         conn.set_option("logging_level", "WARNING", Some(SettingScope::Global))?;

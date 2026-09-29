@@ -207,7 +207,7 @@ fn test_table_function() -> crate::Result<()> {
     }
     let env = Environment::new()?;
     let db = env.open(StorageLocation::InMemory)?;
-    let mut conn = db.connect()?;
+    let conn = db.connect()?;
 
     conn.set_option("enable_progress_bar", "true", Some(SettingScope::Local))?;
 

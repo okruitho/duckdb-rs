@@ -4,6 +4,7 @@ use crate::{
     connection::Context,
     data_chunk::DataChunk,
     environment::{Environment, StorageLocation},
+    error::DuckDBError,
     logical_type::LogicalTypeID,
     qualified_name::QualifiedName,
     replacement_scan::{ReplacementHandle, ReplacementScanBuilder, ReplacementScanCallbacks, ReplacementType},
@@ -235,7 +236,7 @@ fn test_replacement_scan_cdc_unknown_name() -> crate::Result<()> {
 fn test_replacement_scan_cdc_outlives_connection_borrow() -> crate::Result<()> {
     let env = Environment::new()?;
     let db = env.open(StorageLocation::InMemory)?;
-    let mut conn = db.connect()?;
+    let conn = db.connect()?;
 
     ReplacementScanBuilder::new(CustomCdcScan)
         .collection("cdc", single_row_collection(&conn)?)
@@ -247,6 +248,107 @@ fn test_replacement_scan_cdc_outlives_connection_borrow() -> crate::Result<()> {
     let mut query = conn.query("SELECT * FROM cdc", Parameters::None)?;
     let chunk = query.next().unwrap()?;
     assert_eq!(chunk.get_vector_at::<i32>(0)?.get(0)?, Some(&1));
+
+    Ok(())
+}
+
+#[test]
+fn test_replacement_scan_subquery_with_alias() -> crate::Result<()> {
+    struct Squares;
+
+    impl ReplacementScanCallbacks for Squares {
+        fn scan(&self, _context: &Context, name: &QualifiedName, replacement: ReplacementHandle<'_>) -> Result<()> {
+            if name.get_view()?.table.as_deref() == Some("squares") {
+                replacement.set_reference(ReplacementType::Subquery(
+                    "SELECT range AS x, range * range AS y FROM range(4)".to_string(),
+                ))?;
+                replacement.set_alias("sq")?;
+            }
+            Ok(())
+        }
+    }
+
+    let env = Environment::new()?;
+    let db = env.open(StorageLocation::InMemory)?;
+    let conn = db.connect()?;
+
+    ReplacementScanBuilder::new(Squares).register(&conn)?;
+
+    let read = |sql: &str| -> Result<Vec<Option<i64>>> {
+        let chunk = conn.query(sql, Parameters::None)?.next().unwrap()?;
+        Ok(chunk.get_vector_at::<i64>(0)?.iter()?.map(|v| v.copied()).collect())
+    };
+    let expected = vec![Some(0), Some(1), Some(4), Some(9)];
+
+    // The scan's alias applies unless the query supplies its own.
+    assert_eq!(read("SELECT sq.y FROM squares ORDER BY sq.x")?, expected);
+    assert_eq!(read("SELECT s.y FROM squares AS s ORDER BY s.x")?, expected);
+
+    Ok(())
+}
+
+#[test]
+fn test_replacement_scan_register_while_query_runs() -> crate::Result<()> {
+    struct RangeScan {
+        table: &'static str,
+        rows: i64,
+    }
+
+    impl ReplacementScanCallbacks for RangeScan {
+        fn scan(&self, context: &Context, name: &QualifiedName, replacement: ReplacementHandle<'_>) -> Result<()> {
+            if name.get_view()?.table.as_deref() == Some(self.table) {
+                replacement.set_reference(ReplacementType::Table("range".try_into()?))?;
+                replacement.add_parameter(self.rows.value(context)?)?;
+            }
+            Ok(())
+        }
+    }
+
+    let env = Environment::new()?;
+    let db = env.open(StorageLocation::InMemory)?;
+    let conn = db.connect()?;
+
+    ReplacementScanBuilder::new(RangeScan {
+        table: "big",
+        rows: 100_000,
+    })
+    .register(&conn)?;
+
+    // Stream a query that reads through the first scan, and stop after one chunk.
+    let mut running = conn.query("SELECT * FROM big", Parameters::None)?;
+    let mut rows = running.next().unwrap()?.row_count()?;
+    assert!(rows < 100_000, "the query should still be streaming");
+
+    // DuckDB refuses to register while the connection has a live result.
+    let err = ReplacementScanBuilder::new(RangeScan {
+        table: "small",
+        rows: 3,
+    })
+    .register(&conn)
+    .expect_err("registering during a live result should fail");
+    assert_eq!(err.code, DuckDBError::DUCKDB_V2_ERROR_RESOURCE_IN_USE);
+
+    // The running query is unaffected, and registering works once it is done.
+    for chunk in running {
+        rows += chunk?.row_count()?;
+    }
+    assert_eq!(rows, 100_000);
+    ReplacementScanBuilder::new(RangeScan {
+        table: "small",
+        rows: 3,
+    })
+    .register(&conn)?;
+
+    // Both scans resolve for later queries.
+    let chunk = conn
+        .query(
+            "SELECT (SELECT count(*) FROM small), (SELECT count(*) FROM big)",
+            Parameters::None,
+        )?
+        .next()
+        .unwrap()?;
+    assert_eq!(chunk.get_vector_at::<i64>(0)?.get(0)?, Some(&3));
+    assert_eq!(chunk.get_vector_at::<i64>(1)?.get(0)?, Some(&100_000));
 
     Ok(())
 }

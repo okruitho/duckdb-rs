@@ -270,7 +270,8 @@ impl Connection {
     ///
     /// Global writes affect the database; local writes affect only this
     /// session. Unknown options and scopes disallowed by the option return an error.
-    pub fn set_option(&mut self, name: &str, value: &str, scope: Option<SettingScope>) -> Result<()> {
+    /// Fails with `RESOURCE_IN_USE` while a result from this connection is live.
+    pub fn set_option(&self, name: &str, value: &str, scope: Option<SettingScope>) -> Result<()> {
         let scope = scope.unwrap_or(SettingScope::Automatic);
 
         check_api_call!(
@@ -546,6 +547,41 @@ mod tests {
         let chunk = result.into_iter().next().unwrap()?;
 
         assert_eq!(chunk.get_vector_at::<i32>(0)?.get(0)?, Some(&42));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_connection_set_option() -> crate::Result<()> {
+        let conn = Environment::new()?.open(StorageLocation::InMemory)?.connect()?;
+
+        assert!(conn.set_option("user", "rust", None).is_ok());
+
+        let query = conn.query(
+            "SELECT value from duckdb_settings() where name = 'user'",
+            Parameters::None,
+        )?;
+
+        for chunk in query {
+            let chunk = chunk?;
+
+            let vector = chunk.get_vector_at::<String>(0)?;
+
+            assert_eq!(vector.get(0)?, Some("rust"));
+
+            return Ok(());
+        }
+        assert!(false, "No chunks returned from query");
+        Ok(())
+    }
+
+    #[test]
+    fn test_connection_set_option_during_query_gives_err() -> crate::Result<()> {
+        let conn = Environment::new()?.open(StorageLocation::InMemory)?.connect()?;
+
+        let _result = conn.query("SELECT 1", Parameters::None)?;
+
+        assert!(conn.set_option("max_execution_time", "100", None).is_err());
 
         Ok(())
     }

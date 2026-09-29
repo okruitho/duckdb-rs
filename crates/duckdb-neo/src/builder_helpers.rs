@@ -2,6 +2,7 @@ use crate::{
     Result,
     error::{DuckDBError, Error, check_api_call_no_err},
     ffi,
+    ffi_str::DuckDBStr,
 };
 
 pub(crate) struct OpaqueHandle<T> {
