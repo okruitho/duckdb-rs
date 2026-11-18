@@ -29,7 +29,7 @@ use crate::{
     expression::Expression,
     handles::{TableFunctionBuilderHandle, TableFunctionBuilderLink},
     logical_type::LogicalType,
-    raw::RawExt,
+    raw::{FromRaw, RawExt},
     signature::SignatureBuilder,
     table_function::InitColumnHandle::{Global, Local},
     value::Value,
@@ -390,12 +390,13 @@ fn stats_callback<T: TableStatsCallbacks>(
         .ok_or_else(|| Error::api_error("Table function bind data not set"))?;
 
     let stats = check_api_call!(ffi::duckdb_v2_table_function_stats_get_result_stats, info, RET)
-        .map(|handle| Stats { handle })?;
+        // SAFETY: DuckDB keeps the result statistics alive until this callback returns.
+        .map(|handle| unsafe { Stats::from_raw(handle) })?;
 
     let column_index =
         check_api_call!(ffi::duckdb_v2_table_function_stats_get_column_index, info, RET).map(|x| x as usize)?;
 
-    T::stats(&user_data, context, bind_data, &stats, column_index)
+    T::stats(user_data, context, bind_data, &stats, column_index)
 }
 
 ffi_enum_redeclaration! {
@@ -633,6 +634,7 @@ impl<T: TablePartitioningCallbacks> TableFunctionBuilder<T> {
 }
 
 impl<T: TableStatsCallbacks> TableFunctionBuilder<T> {
+    /// Enable [`TableStatsCallbacks::stats`] during query optimization.
     pub fn with_stats(mut self) -> Self {
         self.stats_callback = callback_trampoline! {
             T = TableStatsCallbacks,
@@ -1035,8 +1037,23 @@ pub trait TableClaimBatchCallbacks: TableFunctionCallbacks {
     ) -> Result<bool>;
 }
 
+/// Narrows the statistics of a table function's columns during query optimization.
+///
+/// Enable the callback with [`TableFunctionBuilder::with_stats`]; it is ignored,
+/// and never registered, without it. DuckDB calls it for each declared column the
+/// query reads, possibly more than once per column.
+///
+/// The column statistics start out unknown. Narrowing them is a guarantee DuckDB
+/// uses to simplify the query: output that breaks it produces wrong query results.
 pub trait TableStatsCallbacks: TableFunctionCallbacks {
-    fn stats(&self, context: &Context, bind_data: &Self::BindData, stats: &Stats, column_index: usize) -> Result<()>;
+    /// **Stats:** narrow `stats` for the declared column at `column_index`, in declaration order.
+    fn stats(
+        &self,
+        context: &Context,
+        bind_data: &Self::BindData,
+        stats: &Stats<'_>,
+        column_index: usize,
+    ) -> Result<()>;
 }
 
 #[cfg(test)]
