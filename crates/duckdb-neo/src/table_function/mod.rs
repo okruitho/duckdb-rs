@@ -15,6 +15,7 @@ use std::{any::Any, num::NonZeroUsize};
 
 use crate::ffi;
 
+use crate::stats::Stats;
 use crate::{
     Error, Result,
     bind_arguments::{BindArgument, BindArguments},
@@ -380,6 +381,23 @@ fn claim_batch_callback<T: TableClaimBatchCallbacks>(
     check_api_call!(ffi::duckdb_v2_table_function_claim_batch_set_claimed, info, result)
 }
 
+fn stats_callback<T: TableStatsCallbacks>(
+    context: &Context,
+    info: ffi::duckdb_v2_table_function_stats_info_handle,
+) -> Result<()> {
+    let user_data = get_user_data!(ffi::duckdb_v2_table_function_stats_get_user_data, info);
+    let bind_data = get_bind_data!(ffi::duckdb_v2_table_function_stats_get_bind_data, info)
+        .ok_or_else(|| Error::api_error("Table function bind data not set"))?;
+
+    let stats = check_api_call!(ffi::duckdb_v2_table_function_stats_get_result_stats, info, RET)
+        .map(|handle| Stats { handle })?;
+
+    let column_index =
+        check_api_call!(ffi::duckdb_v2_table_function_stats_get_column_index, info, RET).map(|x| x as usize)?;
+
+    T::stats(&user_data, context, bind_data, &stats, column_index)
+}
+
 ffi_enum_redeclaration! {
     /// Whether, and how, a scan's partitions line up with a set of columns.
     ///
@@ -551,6 +569,7 @@ pub struct TableFunctionBuilder<T: TableFunctionCallbacks> {
     filter_pushdown_callback: ffi::duckdb_v2_table_function_filter_pushdown_callback_fn,
     partition_data_callback: ffi::duckdb_v2_table_function_partition_data_callback_fn,
     partitioning_callback: ffi::duckdb_v2_table_function_partitioning_callback_fn,
+    stats_callback: ffi::duckdb_v2_table_function_stats_callback_fn,
     claim_batch_callback: ffi::duckdb_v2_table_function_claim_batch_callback_fn,
     get_bind_info_callback: ffi::duckdb_v2_table_function_get_bind_info_callback_fn,
 }
@@ -613,6 +632,17 @@ impl<T: TablePartitioningCallbacks> TableFunctionBuilder<T> {
     }
 }
 
+impl<T: TableStatsCallbacks> TableFunctionBuilder<T> {
+    pub fn with_stats(mut self) -> Self {
+        self.stats_callback = callback_trampoline! {
+            T = TableStatsCallbacks,
+            args = (info: ffi::duckdb_v2_table_function_stats_info_handle),
+            exec = stats_callback,
+        };
+        self
+    }
+}
+
 impl<T: TableFunctionCallbacks> TableFunctionBuilder<T> {
     /// Create a builder from a name, signature, and callback implementation.
     pub fn new(name: &str, signature: SignatureBuilder, implementation: T) -> Self {
@@ -626,6 +656,7 @@ impl<T: TableFunctionCallbacks> TableFunctionBuilder<T> {
             partition_data_callback: None,
             partitioning_callback: None,
             claim_batch_callback: None,
+            stats_callback: None,
             get_bind_info_callback: None,
         }
     }
@@ -742,6 +773,14 @@ impl<T: TableFunctionCallbacks> TableFunctionBuilder<T> {
                 ffi::duckdb_v2_table_function_set_get_bind_info_callback,
                 handle.raw(),
                 self.get_bind_info_callback
+            )?;
+        }
+
+        if self.stats_callback.is_some() {
+            check_api_call!(
+                ffi::duckdb_v2_table_function_set_stats_callback,
+                handle.raw(),
+                self.stats_callback
             )?;
         }
 
@@ -994,6 +1033,10 @@ pub trait TableClaimBatchCallbacks: TableFunctionCallbacks {
         local_state: Option<&mut Self::LocalState>,
         global_state: Option<&Self::GlobalState>,
     ) -> Result<bool>;
+}
+
+pub trait TableStatsCallbacks: TableFunctionCallbacks {
+    fn stats(&self, context: &Context, bind_data: &Self::BindData, stats: &Stats, column_index: usize) -> Result<()>;
 }
 
 #[cfg(test)]

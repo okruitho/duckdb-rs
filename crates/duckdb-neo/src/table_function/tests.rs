@@ -19,7 +19,7 @@ use crate::{
     table_function::{
         BindFunctionHandle, ExecColumnInfo, InitColumnData, OrderPreservation, PartitionData, PartitioningData,
         PushdownData, TableClaimBatchCallbacks, TableFilterPushdownCallbacks, TableFunctionBuilder,
-        TableFunctionCallbacks, TablePartitionInfo, TablePartitioningCallbacks,
+        TableFunctionCallbacks, TablePartitionInfo, TablePartitioningCallbacks, TableStatsCallbacks,
     },
     types::HugeInt,
 };
@@ -213,6 +213,20 @@ fn test_table_function() -> Result<()> {
             Ok(())
         }
     }
+
+    impl TableStatsCallbacks for MyTableFunction {
+        fn stats(
+            &self,
+            context: &Context,
+            bind_data: &Self::BindData,
+            stats: &crate::stats::Stats,
+            column_index: usize,
+        ) -> Result<()> {
+            dbg!(stats.can_have_null()?, stats.can_have_valid()?, column_index);
+
+            Ok(())
+        }
+    }
     let env = Environment::new()?;
     let instance = env.open(StorageLocation::InMemory)?;
     let conn = instance.connect()?;
@@ -236,6 +250,7 @@ fn test_table_function() -> Result<()> {
     )
     .with_filter_pushdown()
     .with_progress()
+    .with_stats()
     .register(&conn)?;
 
     // Each batch starts at 142; the pushed filter keeps 146..152.
