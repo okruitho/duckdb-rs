@@ -3,11 +3,10 @@
 use std::sync::Arc;
 
 use crate::column_data_collection::ColumnDataCollection;
-use crate::ffi_str::DuckDBStr;
+use crate::str_from_tuple;
 use crate::{
     AsRaw, DropHandle, FromRaw, Parameters, Result, check_api_call,
     connection::Connection,
-    error::Error,
     ffi,
     parameter::ParameterValue,
     query_result::{ArrowQueryResult, QueryResult, StatementType},
@@ -20,28 +19,13 @@ use crate::{
 /// Owns the converted values, so their handles stay valid for the call.
 struct ParameterBuffers<'a> {
     _values: Vec<ParameterValue<'a>>,
-    handles: Vec<ffi::duckdb_v2_value_handle>,
-    names: Option<Vec<ffi::duckdb_v2_str>>,
+    pub(crate) value_handles: Vec<ffi::duckdb_v2_value_handle>,
+    pub(crate) names: Option<Vec<&'a str>>,
 }
 
 impl ParameterBuffers<'_> {
-    fn names_ptr(&self) -> *const ffi::duckdb_v2_str {
-        self.names
-            .as_ref()
-            .filter(|names| !names.is_empty())
-            .map_or(std::ptr::null(), |names| names.as_ptr())
-    }
-
-    fn values_ptr(&self) -> *const ffi::duckdb_v2_value_handle {
-        if self.handles.is_empty() {
-            std::ptr::null()
-        } else {
-            self.handles.as_ptr()
-        }
-    }
-
     fn len(&self) -> u64 {
-        self.handles.len() as u64
+        self.value_handles.len() as u64
     }
 }
 
@@ -83,11 +67,17 @@ pub struct Statements {
 impl Statements {
     /// Parse SQL using a connection's parser configuration.
     pub fn parse(conn: &Connection, sql: impl AsRef<str>) -> Result<Statements> {
-        let query_str =
-            std::ffi::CString::new(sql.as_ref()).map_err(|_| Error::invalid_input("SQL string contains a NUL byte"))?;
+        let sql = sql.as_ref();
 
-        check_api_call!(ffi::duckdb_v2_parse_sql, conn.raw(), query_str.as_ptr(), false, RET)
-            .map(|handle| Statements { handle })
+        check_api_call!(
+            ffi::duckdb_v2_parse_sql,
+            conn.raw(),
+            sql.as_ptr().cast(),
+            sql.len() as u64,
+            false,
+            RET
+        )
+        .map(|handle| Statements { handle })
     }
 }
 
@@ -161,19 +151,21 @@ impl<'a> Statement<'a> {
     /// Columns use their explicit names from [`ColumnParameter::Named`](crate::column_data_collection::ColumnParameter::Named),
     /// or `col1` through `colN` for positional columns; empty column names are rejected.
     pub fn add_collection(mut self, collection: ColumnDataCollection<'a>, name: &str) -> Result<Self> {
-        let name: ffi::duckdb_v2_str = name.into();
-        let column_name_ptrs: Option<Vec<ffi::duckdb_v2_str>> = collection
-            .column_names
-            .as_ref()
-            .map(|x| x.iter().map(|x| x.into()).collect::<Vec<_>>());
-
         check_api_call!(
             ffi::duckdb_v2_statement_add_collection,
             self.raw(),
-            &name,
+            name.as_ptr().cast(),
+            name.len() as u64,
             collection.raw(),
-            column_name_ptrs.as_ref().map_or(std::ptr::null(), |x| x.as_ptr()),
-            column_name_ptrs.as_ref().map_or(0, |x| x.len() as u64)
+            collection
+                .column_names()
+                .map(|x| x.iter().map(|x| x.as_ptr().cast::<i8>()).collect::<Vec<_>>())
+                .map_or(std::ptr::null_mut::<*const i8>(), |x| x.as_ptr() as *mut *const i8),
+            collection
+                .column_names()
+                .map(|x| x.iter().map(|x| x.len() as u64).collect::<Vec<_>>())
+                .map_or(std::ptr::null::<u64>().cast(), |x| x.as_ptr()),
+            collection.column_names().map_or(0, |x| x.len() as u64)
         )?;
 
         self.collections.0.push(Arc::new(collection));
@@ -187,7 +179,7 @@ impl<'a> Statement<'a> {
 
         Ok(ParameterBuffers {
             _values: values,
-            handles,
+            value_handles: handles,
             names,
         })
     }
@@ -200,15 +192,22 @@ impl<'a> Statement<'a> {
     where
         'a: 'conn,
     {
-        let params = Self::prepare_params(conn, params)?;
+        let (names, values) = params.into_values(conn)?;
 
         check_api_call!(
             ffi::duckdb_v2_statement_execute,
             conn.raw(),
             self.handle,
-            params.names_ptr(),
-            params.values_ptr(),
-            params.len(),
+            names
+                .as_ref()
+                .map_or(std::ptr::null::<*const i8>(), |x| x.as_ptr().cast()),
+            names.as_ref().map_or(std::ptr::null(), |x| x
+                .iter()
+                .map(|x| x.len() as u64)
+                .collect::<Vec<_>>()
+                .as_ptr()),
+            values.iter().map(|x| x.as_value().handle).collect::<Vec<_>>().as_ptr(),
+            values.len() as u64,
             RET
         )
         .map(|handle| QueryResult::new(handle, self.collections.clone()))
@@ -228,15 +227,22 @@ impl<'a> Statement<'a> {
     where
         'a: 'conn,
     {
-        let params = Self::prepare_params(conn, params)?;
+        let (names, values) = params.into_values(conn)?;
 
         check_api_call!(
             ffi::duckdb_v2_statement_execute_arrow,
             conn.raw(),
             self.handle,
-            params.names_ptr(),
-            params.values_ptr(),
-            params.len(),
+            names
+                .as_ref()
+                .map_or(std::ptr::null::<*const i8>(), |x| x.as_ptr().cast()),
+            names.as_ref().map_or(std::ptr::null(), |x| x
+                .iter()
+                .map(|x| x.len() as u64)
+                .collect::<Vec<_>>()
+                .as_ptr()),
+            values.iter().map(|x| x.as_value().handle).collect::<Vec<_>>().as_ptr(),
+            values.len() as u64,
             batch_size.unwrap_or_default() as u64,
             RET
         )
@@ -270,8 +276,7 @@ impl<'a> Statement<'a> {
     /// Includes the trailing terminator and whitespace, but excludes whitespace
     /// and comments before the first token.
     pub fn get_text(&self) -> Result<&str> {
-        check_api_call!(ffi::duckdb_v2_sql_statement_get_text, self.handle, RET)
-            .map(|x| DuckDBStr::from_raw(x).as_str().unwrap_or_default())
+        check_api_call!(ffi::duckdb_v2_sql_statement_get_text, self.handle, RET, RET_2).map(str_from_tuple)
     }
 
     /// Return the statement type as classified by the parser, before execution-time rewrites.
@@ -294,9 +299,10 @@ impl<'a> Statement<'a> {
             ffi::duckdb_v2_sql_statement_get_parameter_name,
             self.handle,
             index as u64,
-            RET
+            RET,
+            RET_2
         )
-        .map(|x| DuckDBStr::from_raw(x).as_str().unwrap_or_default())
+        .map(str_from_tuple)
     }
 
     /// Borrow all parameter binding keys in binding order.
@@ -324,19 +330,21 @@ pub struct PreparedStatement<'a> {
 impl<'a> PreparedStatement<'a> {
     /// Execute with optional positional or named parameters.
     pub fn execute(&self, parameters: Parameters<'_>) -> Result<QueryResult<'a>> {
-        let (param_names, param_values) = parameters.into_values(self.connection)?;
-        let param_values = param_values
-            .iter()
-            .map(|value| value.as_value().handle)
-            .collect::<Vec<_>>();
-        let param_names = param_names.map(|x| x.iter().map(|s| (*s).into()).collect::<Vec<ffi::duckdb_v2_str>>());
+        let (names, values) = parameters.into_values(self.connection)?;
 
         check_api_call!(
             ffi::duckdb_v2_prepared_statement_execute,
             self.handle,
-            param_names.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
-            param_values.as_ptr(),
-            param_values.len() as u64,
+            names
+                .as_ref()
+                .map_or(std::ptr::null::<*const i8>(), |x| x.as_ptr().cast()),
+            names.as_ref().map_or(std::ptr::null(), |x| x
+                .iter()
+                .map(|x| x.len() as u64)
+                .collect::<Vec<_>>()
+                .as_ptr()),
+            values.iter().map(|x| x.as_value().handle).collect::<Vec<_>>().as_ptr(),
+            values.len() as u64,
             RET
         )
         .map(|handle| QueryResult::new(handle, self.collections.clone()))
@@ -347,19 +355,21 @@ impl<'a> PreparedStatement<'a> {
     /// Arrays hold at most `batch_size` rows; `None` or `Some(0)` selects
     /// DuckDB's default of 131,072.
     pub fn execute_arrow(&self, parameters: Parameters<'_>, batch_size: Option<usize>) -> Result<ArrowQueryResult<'a>> {
-        let (param_names, param_values) = parameters.into_values(self.connection)?;
-        let param_values = param_values
-            .iter()
-            .map(|value| value.as_value().handle)
-            .collect::<Vec<_>>();
-        let param_names = param_names.map(|x| x.iter().map(|s| (*s).into()).collect::<Vec<ffi::duckdb_v2_str>>());
+        let (names, values) = parameters.into_values(self.connection)?;
 
         check_api_call!(
             ffi::duckdb_v2_prepared_statement_execute_arrow,
             self.handle,
-            param_names.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
-            param_values.as_ptr(),
-            param_values.len() as u64,
+            names
+                .as_ref()
+                .map_or(std::ptr::null::<*const i8>(), |x| x.as_ptr().cast()),
+            names.as_ref().map_or(std::ptr::null(), |x| x
+                .iter()
+                .map(|x| x.len() as u64)
+                .collect::<Vec<_>>()
+                .as_ptr()),
+            values.iter().map(|x| x.as_value().handle).collect::<Vec<_>>().as_ptr(),
+            values.len() as u64,
             batch_size.unwrap_or_default() as u64,
             RET
         )

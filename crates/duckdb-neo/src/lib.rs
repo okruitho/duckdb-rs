@@ -102,6 +102,22 @@ pub use parameter::{Parameters, QueryParameter};
 pub use raw::{AsRaw, FromRaw};
 pub use types::{DuckDBType, FromValue, ToValue};
 
+pub(crate) fn str_from_tuple<'a>(input: (*const i8, u64)) -> &'a str {
+    unsafe {
+        let slice = std::slice::from_raw_parts(input.0.cast(), input.1 as usize);
+
+        std::str::from_utf8_unchecked(slice)
+    }
+}
+
+pub(crate) fn string_from_tuple(input: (*const i8, u64)) -> String {
+    unsafe {
+        let slice: &[u8] = std::slice::from_raw_parts(input.0.cast(), input.1 as usize);
+
+        String::from_utf8_lossy(slice).into_owned()
+    }
+}
+
 #[doc(hidden)]
 pub mod __derive {
     use std::ptr::NonNull;

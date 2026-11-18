@@ -194,8 +194,9 @@ macro_rules! check_api_call_no_err {
 /// If the return code indicates an error, the macro will convert the error handle into a Rust `Error` type and return it as an `Err` variant of a `Result`.
 ///
 /// Passing the marker `RET` in place of an argument makes the macro allocate an out-parameter at
-/// that position and return its value in the `Ok` variant. Use it only when the callee writes the
-/// out-parameter on every successful return; otherwise pass an initialized local.
+/// that position and return its value in the `Ok` variant. Adding a second marker `RET_2` returns
+/// `(RET, RET_2)` instead, regardless of their argument positions. Use the markers only when the
+/// callee writes the out-parameters on every successful return; otherwise pass initialized locals.
 ///
 /// # Usage
 /// ```ignore
@@ -206,59 +207,55 @@ macro_rules! check_api_call_no_err {
 /// let handle = check_api_call!(ffi::duckdb_v2_environment_create, RET)?;
 ///
 /// println!("Handle address: {:?}", handle);
+///
+/// // With two out-parameters, evaluates to `Result<(T, U)>`
+/// let (index, found) = check_api_call!(ffi::duckdb_v2_function_bind_get_arg_index, handle, &name.into(), RET, RET_2)?;
 /// ```
 macro_rules! check_api_call {
-    // Entry point
+    // Entry point. The out-parameter names are minted here so that every later expansion shares their hygiene.
     ($call:expr $(, $($args:tt)*)?) => {
-        $crate::check_api_call!(@before $call; (); $($($args)*)?)
+        $crate::check_api_call!(@args $call; __ret, __ret_2; [] []; (); $($($args)*)?)
     };
 
-    // `RET` found, more args follow it
-    (@before $call:expr; ($($b:expr),*); RET, $($after:expr),* $(,)?) => {
-        $crate::check_api_call!(@finish_ret $call; ($($b),*); ($($after),*))
+    (@args $call:expr; $r1:ident, $r2:ident; [] [$($s2:ident)?]; ($($b:expr),*); RET $(, $($rest:tt)*)?) => {
+        $crate::check_api_call!(@args $call; $r1, $r2; [$r1] [$($s2)?]; ($($b,)* $r1.as_mut_ptr()); $($($rest)*)?)
     };
-    // `RET` found, nothing follows it
-    (@before $call:expr; ($($b:expr),*); RET) => {
-        $crate::check_api_call!(@finish_ret $call; ($($b),*); ())
+    (@args $call:expr; $r1:ident, $r2:ident; [$($s1:ident)?] []; ($($b:expr),*); RET_2 $(, $($rest:tt)*)?) => {
+        $crate::check_api_call!(@args $call; $r1, $r2; [$($s1)?] [$r2]; ($($b,)* $r2.as_mut_ptr()); $($($rest)*)?)
     };
-    // ordinary arg, more tokens follow
-    (@before $call:expr; ($($b:expr),*); $head:expr, $($rest:tt)*) => {
-        $crate::check_api_call!(@before $call; ($($b,)* $head); $($rest)*)
+    (@args $call:expr; $r1:ident, $r2:ident; [$s1:ident] [$($s2:ident)?]; ($($b:expr),*); RET $(, $($rest:tt)*)?) => {
+        compile_error!("`RET` may only be passed once to `check_api_call!`")
     };
-    // ordinary arg, last token (no trailing comma)
-    (@before $call:expr; ($($b:expr),*); $head:expr) => {
-        $crate::check_api_call!(@before $call; ($($b,)* $head); )
+    (@args $call:expr; $r1:ident, $r2:ident; [$($s1:ident)?] [$s2:ident]; ($($b:expr),*); RET_2 $(, $($rest:tt)*)?) => {
+        compile_error!("`RET_2` may only be passed once to `check_api_call!`")
     };
-    // no more tokens, `RET` never seen
-    (@before $call:expr; ($($b:expr),*); ) => {
-        $crate::check_api_call!(@finish_noret $call; ($($b),*))
+    (@args $call:expr; $r1:ident, $r2:ident; [$($s1:ident)?] [$($s2:ident)?]; ($($b:expr),*); $head:expr $(, $($rest:tt)*)?) => {
+        $crate::check_api_call!(@args $call; $r1, $r2; [$($s1)?] [$($s2)?]; ($($b,)* $head); $($($rest)*)?)
     };
 
-    // No `RET` -> Ok(())
-    (@finish_noret $call:expr; ($($b:expr),*)) => {{
+    (@args $call:expr; $r1:ident, $r2:ident; [] []; ($($b:expr),*); ) => {
+        $crate::check_api_call!(@call $call; (); ($($b),*); ())
+    };
+    (@args $call:expr; $r1:ident, $r2:ident; [$s1:ident] []; ($($b:expr),*); ) => {
+        $crate::check_api_call!(@call $call; ($r1); ($($b),*); $r1.assume_init())
+    };
+    (@args $call:expr; $r1:ident, $r2:ident; [$s1:ident] [$s2:ident]; ($($b:expr),*); ) => {
+        $crate::check_api_call!(@call $call; ($r1, $r2); ($($b),*); ($r1.assume_init(), $r2.assume_init()))
+    };
+    (@args $call:expr; $r1:ident, $r2:ident; [] [$s2:ident]; ($($b:expr),*); ) => {
+        compile_error!("`RET_2` requires `RET` in `check_api_call!`")
+    };
+
+    (@call $call:expr; ($($out:ident),*); ($($b:expr),*); $ok:expr) => {{
         let mut err: $crate::ffi::duckdb_v2_error_info_handle = std::ptr::null_mut();
+        $(let mut $out = std::mem::MaybeUninit::uninit();)*
         unsafe {
             let code = $call($($b,)* &mut err);
             if code != $crate::ffi::DUCKDB_V2_ERROR::DUCKDB_V2_ERROR_NONE {
                 let error = $crate::error::Error::from_code_and_handle(code, &mut err);
                 Err(error)
             } else {
-                Ok(())
-            }
-        }
-    }};
-
-    // `RET` present -> Ok(value)
-    (@finish_ret $call:expr; ($($b:expr),*); ($($a:expr),*)) => {{
-        let mut err: $crate::ffi::duckdb_v2_error_info_handle = std::ptr::null_mut();
-        let mut __out = std::mem::MaybeUninit::uninit();
-        unsafe {
-            let code = $call($($b,)* __out.as_mut_ptr(), $($a,)* &mut err);
-            if code != $crate::ffi::DUCKDB_V2_ERROR::DUCKDB_V2_ERROR_NONE {
-                let error = $crate::error::Error::from_code_and_handle(code, &mut err);
-                Err(error)
-            } else {
-                Ok(__out.assume_init())
+                Ok($ok)
             }
         }
     }};
@@ -385,6 +382,43 @@ mod tests {
             assert_eq!(error.message, message);
         }
         Ok(())
+    }
+
+    unsafe extern "C" fn mock_two_outputs(
+        fail: bool,
+        first: *mut i32,
+        scale: i32,
+        second: *mut bool,
+        err: *mut crate::ffi::duckdb_v2_error_info_handle,
+    ) -> crate::ffi::DUCKDB_V2_ERROR {
+        if fail {
+            // SAFETY: the macro passes a valid error slot.
+            unsafe { *err = std::ptr::null_mut() };
+            return super::DuckDBError::InputInvalid.into();
+        }
+        // SAFETY: the macro passes valid output slots.
+        unsafe {
+            *first = 21 * scale;
+            *second = true;
+        }
+        super::DuckDBError::None.into()
+    }
+
+    #[test]
+    fn test_check_api_call_outputs() {
+        let value: i32 = super::check_api_call!(mock_two_outputs, false, RET, 2, &mut false).unwrap();
+        assert_eq!(value, 42);
+
+        let (value, flag): (i32, bool) = super::check_api_call!(mock_two_outputs, false, RET, 1, RET_2,).unwrap();
+        assert_eq!((value, flag), (21, true));
+
+        let (flag, value): (bool, i32) = super::check_api_call!(mock_two_outputs, false, RET_2, 3, RET).unwrap();
+        assert_eq!((flag, value), (true, 63));
+
+        let error = super::check_api_call!(mock_two_outputs, true, RET, 1, RET_2)
+            .map(|(_, _): (i32, bool)| ())
+            .unwrap_err();
+        assert_eq!(error.code, super::DuckDBError::InputInvalid);
     }
 
     #[test]
