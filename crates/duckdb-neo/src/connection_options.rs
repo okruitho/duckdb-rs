@@ -5,8 +5,8 @@ use std::marker::PhantomData;
 use crate::connection::SettingScope;
 use crate::ffi;
 
-use crate::ffi_str::DuckDBStr;
 use crate::raw::RawExt;
+use crate::string_from_tuple;
 use crate::value::Value;
 use crate::{AsRaw, DropHandle, FromRaw, Result, error::check_api_call};
 
@@ -51,16 +51,14 @@ unsafe impl Sync for ConfigOption {}
 impl ConfigOption {
     /// Return the canonical option name.
     pub fn canonical_name(&self) -> Result<String> {
-        check_api_call!(ffi::duckdb_v2_option_get_name, self.raw(), RET)
-            .map(|name| DuckDBStr::from_raw(name).as_str().unwrap_or_default().to_owned())
+        check_api_call!(ffi::duckdb_v2_option_get_name, self.raw(), RET, RET_2).map(string_from_tuple)
     }
 
     /// Return the alias at `index`.
     ///
     /// An out-of-range index returns an error.
     pub fn alias(&self, index: usize) -> Result<String> {
-        check_api_call!(ffi::duckdb_v2_option_get_alias, self.raw(), index as u64, RET)
-            .map(|alias| DuckDBStr::from_raw(alias).as_str().unwrap_or_default().to_owned())
+        check_api_call!(ffi::duckdb_v2_option_get_alias, self.raw(), index as u64, RET, RET_2).map(string_from_tuple)
     }
 
     /// Return all registered aliases.
@@ -83,8 +81,7 @@ impl ConfigOption {
 
     /// Return the option's human-readable description.
     pub fn description(&self) -> Result<String> {
-        check_api_call!(ffi::duckdb_v2_option_get_description, self.raw(), RET)
-            .map(|description| DuckDBStr::from_raw(description).as_str().unwrap_or_default().to_owned())
+        check_api_call!(ffi::duckdb_v2_option_get_description, self.raw(), RET, RET_2).map(string_from_tuple)
     }
 
     /// Return the GLOBAL or SESSION scope used for a DEFAULT write.
@@ -143,7 +140,8 @@ impl Config<'_> {
         let handle = check_api_call!(
             ffi::duckdb_v2_config_get_option_value,
             self.raw(),
-            &mut name.into(),
+            name.as_ptr().cast(),
+            name.len() as u64,
             RET,
             &mut scope
         )?;
@@ -178,7 +176,8 @@ impl Config<'_> {
         check_api_call!(
             ffi::duckdb_v2_config_set_option_value,
             self.raw(),
-            &name.into(),
+            name.as_ptr().cast(),
+            name.len() as u64,
             value.raw(),
             scope.into()
         )
@@ -189,16 +188,24 @@ impl Config<'_> {
         check_api_call!(
             ffi::duckdb_v2_config_set_option_text,
             self.raw(),
-            &name.into(),
-            &value.into(),
+            name.as_ptr().cast(),
+            name.len() as u64,
+            value.as_ptr().cast(),
+            value.len() as u64,
             scope.into()
         )
     }
 
     /// Describe an option by canonical name or alias; unknown names return INPUT_INVALID.
     pub fn get_by_name(&self, name: &str) -> Result<ConfigOption> {
-        check_api_call!(ffi::duckdb_v2_config_get_option_by_name, self.raw(), &name.into(), RET)
-            .map(|handle| ConfigOption { handle })
+        check_api_call!(
+            ffi::duckdb_v2_config_get_option_by_name,
+            self.raw(),
+            name.as_ptr().cast(),
+            name.len() as u64,
+            RET
+        )
+        .map(|handle| ConfigOption { handle })
     }
 
     /// Describe an option by index; out-of-range indices return INPUT_INVALID.

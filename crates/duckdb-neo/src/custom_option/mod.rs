@@ -91,7 +91,8 @@ impl<T: CustomOptionCallbacks> CustomOptionBuilder<T> {
         check_api_call!(
             ffi::duckdb_v2_custom_option_set_name,
             handle.raw(),
-            &(&self.name).into()
+            self.name.as_ptr().cast(),
+            self.name.len() as u64
         )?;
 
         check_api_call!(
@@ -109,7 +110,8 @@ impl<T: CustomOptionCallbacks> CustomOptionBuilder<T> {
         check_api_call!(
             ffi::duckdb_v2_custom_option_set_description,
             handle.raw(),
-            &(&self.description).into()
+            self.description.as_ptr().cast(),
+            self.description.len() as u64
         )?;
 
         if let Some(default_scope) = self.default_scope.as_ref() {

@@ -33,7 +33,12 @@ fn query_callback<T: PragmaQueryCallbacks>(
 
     let query = T::query(user_data, context, BindArguments { handle: &info })?;
 
-    check_api_call!(ffi::duckdb_v2_pragma_function_query_set_query, result, &(&query).into())
+    check_api_call!(
+        ffi::duckdb_v2_pragma_function_query_set_query,
+        result,
+        query.as_ptr().cast(),
+        query.len() as u64
+    )
 }
 
 fn exec_callback<T: PragmaExecCallbacks>(
@@ -112,7 +117,8 @@ impl<T: Send + Sync + 'static> PragmaFunctionBuilder<T> {
         check_api_call!(
             ffi::duckdb_v2_pragma_function_set_name,
             handle.raw(),
-            &mut (&self.name).into()
+            self.name.as_ptr().cast(),
+            self.name.len() as u64
         )?;
 
         let signature = check_api_call!(ffi::duckdb_v2_pragma_function_get_signature, handle.raw(), RET)?;

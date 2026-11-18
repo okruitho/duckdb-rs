@@ -54,7 +54,12 @@ impl CustomType {
             self.base_type.handle
         )?;
 
-        check_api_call!(ffi::duckdb_v2_custom_type_set_name, handle.raw(), &(&self.name).into(),)
+        check_api_call!(
+            ffi::duckdb_v2_custom_type_set_name,
+            handle.raw(),
+            self.name.as_ptr().cast(),
+            self.name.len() as u64,
+        )
     }
 
     /// Register through a connection, consuming the builder and replacing any same-named type.

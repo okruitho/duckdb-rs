@@ -3,10 +3,9 @@
 pub use crate::enums::LogicalTypeID;
 
 use crate::connection::HasFactory;
-use crate::ffi_str::DuckDBStr;
 use crate::{
     AsRaw, DropHandle, FromRaw, Parameters, Result, check_api_call, check_api_call_string, connection::FFILink, ffi,
-    qualified_name::QualifiedName, raw::RawExt, value::Value,
+    ffi_str::DecomposedArrays, qualified_name::QualifiedName, raw::RawExt, str_from_tuple, value::Value,
 };
 
 /// An owned DuckDB logical type.
@@ -51,24 +50,22 @@ unsafe impl Sync for LogicalType {}
 fn with_type_parameters<C: FFILink + ?Sized, T>(
     link: &C,
     parameters: Parameters<'_>,
-    call: impl FnOnce(*const ffi::duckdb_v2_str, *const ffi::duckdb_v2_value_handle, u64) -> Result<T>,
+    call: impl FnOnce(
+        *mut *const std::os::raw::c_char,
+        *const ffi::idx_t,
+        *const ffi::duckdb_v2_value_handle,
+        u64,
+    ) -> Result<T>,
 ) -> Result<T> {
     let (names, parameter_values) = parameters.into_values(&link)?;
-    let names = names.map(|names| names.into_iter().map(Into::into).collect::<Vec<_>>());
-    let values = parameter_values
-        .iter()
-        .map(|value| value.as_value().handle)
-        .collect::<Vec<_>>();
-    let names_ptr = names
-        .as_ref()
-        .filter(|names| !names.is_empty())
-        .map_or(std::ptr::null(), |names| names.as_ptr());
-    let values_ptr = if values.is_empty() {
-        std::ptr::null()
-    } else {
-        values.as_ptr()
-    };
-    call(names_ptr, values_ptr, values.len() as u64)
+    let names = DecomposedArrays::new(names.iter().flatten());
+    let values = DecomposedArrays::new(&parameter_values);
+    call(
+        names.ptrs().cast_mut(),
+        names.child_lengths(),
+        values.ptrs(),
+        values.len(),
+    )
 }
 
 impl LogicalType {
@@ -79,12 +76,13 @@ impl LogicalType {
         type_id: LogicalTypeID,
         parameters: Parameters<'_>,
     ) -> Result<Self> {
-        with_type_parameters(link, parameters, |names, values, count| {
+        with_type_parameters(link, parameters, |names, names_lengths, values, count| {
             check_api_call!(
                 ffi::duckdb_v2_factory_create_type_from_id,
                 link.factory()?.raw(),
                 type_id.into(),
                 names,
+                names_lengths,
                 values,
                 count,
                 RET
@@ -99,7 +97,8 @@ impl LogicalType {
             ffi::duckdb_v2_factory_create_type_with_alias,
             link.factory()?.raw(),
             self.raw(),
-            &alias.into(),
+            alias.as_ptr().cast(),
+            alias.len() as u64,
             RET
         )
         .map(|handle| LogicalType { handle })
@@ -110,7 +109,8 @@ impl LogicalType {
         check_api_call!(
             ffi::duckdb_v2_factory_create_type_from_text,
             link.factory()?.raw(),
-            &text.into(),
+            text.as_ptr().cast(),
+            text.len() as u64,
             RET
         )
         .map(|handle| Self { handle })
@@ -119,13 +119,14 @@ impl LogicalType {
     /// Resolve a SQL-qualified or quoted type `name`; empty parameter names mean positional arguments.
     /// Child types must be TYPE values from [`Value::from_logical_type`]; catalog types borrow instance storage.
     pub fn create<C: FFILink + ?Sized>(link: &C, name: &str, parameters: Parameters<'_>) -> Result<Self> {
-        with_type_parameters(link, parameters, |names, values, count| {
+        with_type_parameters(link, parameters, |names, names_lengths, values, count| {
             let qname = QualifiedName::from_sql(name)?;
             check_api_call!(
                 ffi::duckdb_v2_factory_create_type_from_name,
                 link.factory()?.raw(),
                 qname.raw(),
                 names,
+                names_lengths,
                 values,
                 count,
                 RET
@@ -141,8 +142,7 @@ impl LogicalType {
 
     /// Return the alias or canonical type name.
     pub fn name(&self) -> Result<&str> {
-        check_api_call!(ffi::duckdb_v2_logical_type_get_name, self.handle, RET)
-            .map(|name| DuckDBStr::from_raw(name).as_str().unwrap_or_default())
+        check_api_call!(ffi::duckdb_v2_logical_type_get_name, self.handle, RET, RET_2).map(str_from_tuple)
     }
 
     /// Render the type as SQL text.
@@ -161,17 +161,15 @@ impl LogicalType {
     pub fn get_param(&self, index: usize) -> Result<(&str, Value)> {
         let mut value = std::ptr::null_mut();
 
-        let name: ffi::duckdb_v2_str = check_api_call!(
+        check_api_call!(
             ffi::duckdb_v2_logical_type_get_param,
             self.handle,
             index as u64,
             RET,
+            RET_2,
             &mut value
-        )?;
-
-        let name = DuckDBStr::from_raw(name).as_str().unwrap_or_default();
-
-        Ok((name, Value { handle: value }))
+        )
+        .map(|name| (str_from_tuple(name), Value { handle: value }))
     }
 
     /// Return all parameter names and values in declaration order.
@@ -269,8 +267,9 @@ mod test {
     fn test_empty_type_parameters_use_null_buffers() -> crate::Result<()> {
         let conn = Environment::new()?.open(StorageLocation::InMemory)?.connect()?;
         for parameters in [Parameters::None, Parameters::positional(&[]), Parameters::named(&[])] {
-            with_type_parameters(&conn, parameters, |names, values, count| {
+            with_type_parameters(&conn, parameters, |names, names_lengths, values, count| {
                 assert!(names.is_null());
+                assert!(names_lengths.is_null());
                 assert!(values.is_null());
                 assert_eq!(count, 0);
                 Ok(())

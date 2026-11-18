@@ -52,7 +52,8 @@ impl<'a> BindFunctionHandle<'a> {
         check_api_call!(
             ffi::duckdb_v2_table_function_bind_add_result_column,
             *self.0,
-            &name.into(),
+            name.as_ptr().cast(),
+            name.len() as u64,
             logical_type.raw()
         )
     }
@@ -689,7 +690,8 @@ impl<T: TableFunctionCallbacks> TableFunctionBuilder<T> {
         check_api_call!(
             ffi::duckdb_v2_table_function_set_name,
             handle.raw(),
-            &mut (&self.name).into()
+            self.name.as_ptr().cast(),
+            self.name.len() as u64
         )?;
 
         let signature = check_api_call!(ffi::duckdb_v2_table_function_get_signature, handle.raw(), RET)?;
@@ -995,7 +997,8 @@ impl<'a> BindInfoApi<'a> {
         check_api_call!(
             ffi::duckdb_v2_table_function_get_bind_info_set_option,
             *self.handle,
-            &mut str.into(),
+            str.as_ptr().cast(),
+            str.len() as u64,
             value.raw()
         )
     }

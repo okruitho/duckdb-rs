@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 
 use duckdb_loadable_macros::{AsRaw, DropHandle, FromRaw};
 
-use crate::{Result, error::check_api_call, ffi, ffi_str::DuckDBStr, raw::RawExt, value::Value};
+use crate::{Result, error::check_api_call, ffi, raw::RawExt, string_from_tuple, value::Value};
 
 /// A query or operator node borrowed from a [`QueryMetrics`] snapshot.
 ///
@@ -33,8 +33,7 @@ impl<'a> QueryMetricsNode<'a> {
 
     /// Return `QUERY` for the root node or an operator name such as `TABLE_SCAN` for other nodes.
     pub fn name(&self) -> Result<String> {
-        check_api_call!(ffi::duckdb_v2_query_metrics_node_get_name, self.raw(), RET)
-            .map(|x| DuckDBStr::from_raw(x).as_str().unwrap_or_default().to_string())
+        check_api_call!(ffi::duckdb_v2_query_metrics_node_get_name, self.raw(), RET, RET_2).map(string_from_tuple)
     }
 
     /// Return the number of child operators.
@@ -54,32 +53,30 @@ impl<'a> QueryMetricsNode<'a> {
             ffi::duckdb_v2_query_metrics_node_get_metric_name,
             self.raw(),
             index as u64,
-            RET
+            RET,
+            RET_2
         )
-        .map(|x| DuckDBStr::from_raw(x).as_str())?
-        .unwrap_or_default();
+        .map(string_from_tuple)?;
 
-        let value = check_api_call!(
+        check_api_call!(
             ffi::duckdb_v2_query_metrics_node_get_metric_value,
             self.raw(),
             index as u64,
             RET
         )
-        .map(|handle| Value { handle })?;
-
-        Ok((name.to_string(), value))
+        .map(|handle| (name, Value { handle }))
     }
 
     /// Look up a metric by its exact name, such as `query.total_time`.
     /// Returns `None` if the metric is absent.
     pub fn get_by_name(&self, name: &str) -> Result<Option<Value>> {
-        let mut name_ptr: ffi::duckdb_v2_str = name.into();
         let mut value_ptr = std::ptr::null_mut();
 
         let present = check_api_call!(
             ffi::duckdb_v2_query_metrics_node_get_metric,
             self.raw(),
-            &mut name_ptr,
+            name.as_ptr().cast(),
+            name.len() as u64,
             &mut value_ptr,
             RET
         )?;

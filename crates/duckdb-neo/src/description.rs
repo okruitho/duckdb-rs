@@ -2,7 +2,7 @@
 
 use crate::ffi;
 
-use crate::ffi_str::DuckDBStr;
+use crate::str_from_tuple;
 use crate::{
     DropHandle, Result, check_api_call, connection::Connection, logical_type::LogicalType,
     qualified_name::QualifiedName, raw::RawExt,
@@ -25,8 +25,7 @@ unsafe impl Sync for ColumnDescription {}
 impl ColumnDescription {
     /// Return the column's name with its declared casing.
     pub fn name(&self) -> Result<&str> {
-        check_api_call!(ffi::duckdb_v2_column_description_get_name, self.handle, RET)
-            .map(|name| DuckDBStr::from_raw(name).as_str().unwrap_or_default())
+        check_api_call!(ffi::duckdb_v2_column_description_get_name, self.handle, RET, RET_2).map(str_from_tuple)
     }
 
     /// Return an owned copy of the column's logical type.

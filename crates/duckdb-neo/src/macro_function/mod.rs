@@ -70,7 +70,8 @@ impl MacroFunctionBuilder {
         check_api_call!(
             ffi::duckdb_v2_macro_function_set_name,
             handle.raw(),
-            &mut (&self.name).into()
+            self.name.as_ptr().cast(),
+            self.name.len() as u64
         )?;
 
         let signature = check_api_call!(ffi::duckdb_v2_macro_function_get_signature, handle.raw(), RET)?;
@@ -79,10 +80,12 @@ impl MacroFunctionBuilder {
 
         std::mem::take(&mut self.signature).build(link, &signature, &docs)?;
 
+        let sql = self.body.sql();
         check_api_call!(
             ffi::duckdb_v2_macro_function_set_body,
             handle.raw(),
-            &mut self.body.sql().into()
+            sql.as_ptr().cast(),
+            sql.len() as u64
         )
     }
 

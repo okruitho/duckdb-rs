@@ -54,14 +54,16 @@ impl MultiFileFunctionBuilder {
         check_api_call!(
             ffi::duckdb_v2_multi_file_function_set_name,
             handle.raw(),
-            &mut (&self.name).into()
+            self.name.as_ptr().cast(),
+            self.name.len() as u64
         )?;
 
         if let Some(extension) = self.file_extension.as_ref() {
             check_api_call!(
                 ffi::duckdb_v2_multi_file_function_set_file_extension,
                 handle.raw(),
-                &mut extension.into()
+                extension.as_ptr().cast(),
+                extension.len() as u64
             )?;
         }
 
@@ -69,14 +71,16 @@ impl MultiFileFunctionBuilder {
             check_api_call!(
                 ffi::duckdb_v2_multi_file_function_set_reader_type,
                 handle.raw(),
-                &mut reader_type.into()
+                reader_type.as_ptr().cast(),
+                reader_type.len() as u64
             )?;
         }
 
         check_api_call!(
             ffi::duckdb_v2_multi_file_function_set_single_file_function,
             handle.raw(),
-            &mut (&self.function_name).into()
+            self.function_name.as_ptr().cast(),
+            self.function_name.len() as u64
         )
     }
 

@@ -5,7 +5,7 @@
 //! All share DuckDB's [`crate::bytes::DuckDBBytes`] wire representation.
 
 use super::{DuckDBType, FromValue, ToValue};
-use crate::ffi_str::{DuckDBStr, bytes_view};
+use crate::ffi_str::{bytes_from_tuple, bytes_view};
 use crate::{
     Parameters, Result,
     bytes::DuckDBBytes,
@@ -19,20 +19,18 @@ use crate::{
     vector::{HasDuckDBBytes, NativeElement, ReadableNativeElement, WritableNativeElement},
 };
 /// Copy bytes DuckDB just returned; `raw` must be null or valid for the duration of the call.
-pub(crate) fn owned_bytes(raw: ffi::duckdb_v2_str) -> Result<Vec<u8>> {
-    if raw.len == 0 {
-        return Ok(Vec::new());
+pub(crate) fn owned_bytes(raw: (*const std::os::raw::c_char, ffi::idx_t)) -> Result<Vec<u8>> {
+    if raw.0.is_null() && raw.1 != 0 {
+        return Err(Error::api_error("DuckDB returned a null pointer for a non-empty value"));
     }
-    DuckDBStr::from_raw(raw)
-        .as_bytes()
-        .map(<[u8]>::to_vec)
-        .ok_or_else(|| Error::api_error("DuckDB returned a null pointer for a non-empty value"))
+    Ok(bytes_from_tuple(raw).to_vec())
 }
 
 impl FromValue for String {
     fn _get_inner(value: &Value) -> Result<Self> {
-        let raw = check_api_call!(ffi::duckdb_v2_value_get_varchar, value.raw(), RET)?;
-        String::from_utf8(owned_bytes(raw)?).map_err(|_| Error::api_error("DuckDB returned invalid UTF-8"))
+        check_api_call!(ffi::duckdb_v2_value_get_varchar, value.raw(), RET, RET_2)
+            .and_then(owned_bytes)
+            .and_then(|bytes| String::from_utf8(bytes).map_err(|_| Error::api_error("DuckDB returned invalid UTF-8")))
     }
 }
 
@@ -70,8 +68,9 @@ pub struct UncheckedString(pub String);
 
 impl FromValue for UncheckedString {
     fn _get_inner(value: &Value) -> Result<Self> {
-        let raw = check_api_call!(ffi::duckdb_v2_value_get_varchar, value.raw(), RET)?;
-        Ok(unsafe { UncheckedString(String::from_utf8_unchecked(owned_bytes(raw)?)) })
+        check_api_call!(ffi::duckdb_v2_value_get_varchar, value.raw(), RET, RET_2)
+            .and_then(owned_bytes)
+            .map(|bytes| unsafe { UncheckedString(String::from_utf8_unchecked(bytes)) })
     }
 }
 
@@ -113,8 +112,9 @@ impl FromValue for BlobValue {
                 logical_type.to_text()?
             )));
         }
-        let raw = check_api_call!(ffi::duckdb_v2_value_get_blob, value.raw(), RET)?;
-        Ok(Self(owned_bytes(raw)?))
+        check_api_call!(ffi::duckdb_v2_value_get_blob, value.raw(), RET, RET_2)
+            .and_then(owned_bytes)
+            .map(Self)
     }
 }
 
@@ -164,8 +164,9 @@ impl FromValue for BitValue {
                 logical_type.to_text()?
             )));
         }
-        let raw = check_api_call!(ffi::duckdb_v2_value_get_blob, value.raw(), RET)?;
-        Ok(Self(owned_bytes(raw)?))
+        check_api_call!(ffi::duckdb_v2_value_get_blob, value.raw(), RET, RET_2)
+            .and_then(owned_bytes)
+            .map(Self)
     }
 }
 

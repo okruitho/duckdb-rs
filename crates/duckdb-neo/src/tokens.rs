@@ -38,8 +38,15 @@ unsafe impl Sync for SqlTokenIterator {}
 impl SqlTokenIterator {
     /// Tokenize `sql` immediately, returning an iterator over the stored tokens.
     pub fn new(conn: &Connection, sql: impl AsRef<str>) -> Result<SqlTokenIterator> {
-        check_api_call!(ffi::duckdb_v2_tokenize_sql, conn.raw(), &sql.as_ref().into(), RET)
-            .map(|handle| Self { handle })
+        let sql = sql.as_ref();
+        check_api_call!(
+            ffi::duckdb_v2_tokenize_sql,
+            conn.raw(),
+            sql.as_ptr().cast(),
+            sql.len() as u64,
+            RET
+        )
+        .map(|handle| Self { handle })
     }
 
     /// Whether the input ends inside an open string, quoted identifier, block comment or

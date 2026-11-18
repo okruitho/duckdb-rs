@@ -205,7 +205,8 @@ impl FunctionDocumentationBuilder {
             check_api_call!(
                 ffi::duckdb_v2_function_docs_set_description,
                 handle,
-                &description.into()
+                description.as_ptr().cast(),
+                description.len() as u64
             )?;
         }
 
@@ -213,13 +214,20 @@ impl FunctionDocumentationBuilder {
             check_api_call!(
                 ffi::duckdb_v2_function_docs_add_example,
                 handle,
-                &(title).into(),
-                &(example).into()
+                title.as_ptr().cast(),
+                title.len() as u64,
+                example.as_ptr().cast(),
+                example.len() as u64
             )?;
         }
 
         for category in &self.categories {
-            check_api_call!(ffi::duckdb_v2_function_docs_add_category, handle, &(category).into(),)?;
+            check_api_call!(
+                ffi::duckdb_v2_function_docs_add_category,
+                handle,
+                category.as_ptr().cast(),
+                category.len() as u64,
+            )?;
         }
 
         Ok(())
@@ -286,7 +294,8 @@ impl SignatureBuilder {
             check_api_call!(
                 ffi::duckdb_v2_function_signature_add_parameter,
                 *handle,
-                &(&param.name).into(),
+                param.name.as_ptr().cast(),
+                param.name.len() as u64,
                 logical_type.handle,
                 default_value.as_ref().map_or(std::ptr::null_mut(), |d| d.handle),
                 param.kind.into(),

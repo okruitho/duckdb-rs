@@ -2,8 +2,6 @@
 
 use std::marker::PhantomData;
 
-use crate::ffi::duckdb_v2_str;
-
 use crate::builder_helpers::copy_render_box;
 use crate::error::Error;
 use crate::{
@@ -379,7 +377,7 @@ impl QueryResult<'_> {
         render_mode: usize,
         limit: usize,
     ) -> Result<String> {
-        let null_value: duckdb_v2_str = "NULL".into();
+        let null_value = "NULL";
 
         let mut string = String::new();
 
@@ -390,7 +388,8 @@ impl QueryResult<'_> {
             max_rows as u64,
             max_width as u64,
             max_col_width as u64,
-            &null_value,
+            null_value.as_ptr().cast(),
+            null_value.len() as u64,
             render_mode as u64,
             limit as u64,
             Some(copy_render_box),

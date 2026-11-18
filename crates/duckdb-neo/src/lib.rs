@@ -102,20 +102,15 @@ pub use parameter::{Parameters, QueryParameter};
 pub use raw::{AsRaw, FromRaw};
 pub use types::{DuckDBType, FromValue, ToValue};
 
-pub(crate) fn str_from_tuple<'a>(input: (*const i8, u64)) -> &'a str {
-    unsafe {
-        let slice = std::slice::from_raw_parts(input.0.cast(), input.1 as usize);
-
-        std::str::from_utf8_unchecked(slice)
-    }
+/// Borrow a `(pointer, length)` string DuckDB produced; only for UTF-8 text, not OS paths.
+pub(crate) fn str_from_tuple<'a>(input: (*const std::os::raw::c_char, ffi::idx_t)) -> &'a str {
+    // SAFETY: the C API returns UTF-8 text.
+    unsafe { std::str::from_utf8_unchecked(ffi_str::bytes_from_tuple(input)) }
 }
 
-pub(crate) fn string_from_tuple(input: (*const i8, u64)) -> String {
-    unsafe {
-        let slice: &[u8] = std::slice::from_raw_parts(input.0.cast(), input.1 as usize);
-
-        String::from_utf8_lossy(slice).into_owned()
-    }
+/// Copy a `(pointer, length)` string, replacing invalid UTF-8.
+pub(crate) fn string_from_tuple(input: (*const std::os::raw::c_char, ffi::idx_t)) -> String {
+    String::from_utf8_lossy(ffi_str::bytes_from_tuple(input)).into_owned()
 }
 
 #[doc(hidden)]
@@ -261,19 +256,22 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Render a name as SQL, quoting and escaping it only when required.
 pub fn render_identifier_quoted(text: &str) -> Result<String> {
-    check_api_call_string!(ffi::duckdb_v2_identifier_render_quoted, &text.into())
+    check_api_call_string!(
+        ffi::duckdb_v2_identifier_render_quoted,
+        text.as_ptr().cast(),
+        text.len() as u64
+    )
 }
 
 /// Return the linked DuckDB library version as a static string owned by the library.
 pub fn library_version() -> Result<&'static str> {
     // The version string is static in the library.
-    check_api_call!(ffi::duckdb_v2_library_version, RET)
-        .map(|v| ffi_str::DuckDBStr::from_raw(v).as_str().unwrap_or_default())
+    check_api_call!(ffi::duckdb_v2_library_version, RET, RET_2).map(str_from_tuple)
 }
 
 /// Validate that `bytes` are well-formed UTF-8, including bytes after any embedded NULs.
 pub fn validate_utf8(bytes: &[u8]) -> Result<()> {
-    check_api_call!(ffi::duckdb_v2_validate_utf8, &ffi_str::bytes_arg(bytes))
+    check_api_call!(ffi::duckdb_v2_validate_utf8, bytes.as_ptr().cast(), bytes.len() as u64)
 }
 
 #[cfg(test)]

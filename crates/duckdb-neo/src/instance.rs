@@ -11,6 +11,7 @@ use crate::{
     connection_options::Config,
     environment::{Environment, EnvironmentHandle, StorageLocation},
     ffi,
+    ffi_str::DecomposedArrays,
     raw::RawExt,
 };
 
@@ -80,17 +81,19 @@ impl InstanceBuilder {
     /// Create an empty instance in an owned or borrowed environment.
     pub fn build(self, environment: impl Borrow<Environment>) -> Result<Instance> {
         let environment = environment.borrow();
-        let names: Vec<ffi::duckdb_v2_str> = self.options.iter().map(|(key, _)| key.into()).collect();
-        let values: Vec<ffi::duckdb_v2_str> = self.options.iter().map(|(_, value)| value.into()).collect();
-        let handle = check_api_call!(
+        let names = DecomposedArrays::new(self.options.iter().map(|(key, _)| key));
+        let values = DecomposedArrays::new(self.options.iter().map(|(_, value)| value));
+        check_api_call!(
             ffi::duckdb_v2_instance_create_with_options,
             environment.handle.handle,
-            names.as_ptr(),
-            values.as_ptr(),
-            self.options.len() as u64,
+            names.ptrs().cast_mut(),
+            names.child_lengths(),
+            values.ptrs().cast_mut(),
+            values.child_lengths(),
+            names.len(),
             RET
-        )?;
-        Ok(Instance {
+        )
+        .map(|handle| Instance {
             handle: Arc::new(Mutex::new(InstanceHandle {
                 handle,
                 _env: environment.handle.clone(),
@@ -261,18 +264,23 @@ impl Instance {
                 check_api_call!(
                     ffi::duckdb_v2_attach_options_set,
                     options.handle,
-                    &key.into(),
-                    &value.into()
+                    key.as_ptr().cast(),
+                    key.len() as u64,
+                    value.as_ptr().cast(),
+                    value.len() as u64
                 )?;
             }
             Some(options)
         };
-        let alias: Option<ffi::duckdb_v2_str> = attachment.alias.as_ref().map(Into::into);
+        let alias = attachment.alias.as_deref();
+        let location = attachment.location.as_str();
         check_api_call!(
             ffi::duckdb_v2_instance_attach,
             self.raw(),
-            alias.as_ref().map_or(std::ptr::null(), |name| name as *const _),
-            &attachment.location.as_str().into(),
+            alias.map_or(std::ptr::null(), |name| name.as_ptr().cast()),
+            alias.map_or(0, |name| name.len() as u64),
+            location.as_ptr().cast(),
+            location.len() as u64,
             options.as_ref().map_or(std::ptr::null_mut(), |options| options.handle),
             attachment.make_default
         )?;
@@ -282,13 +290,23 @@ impl Instance {
     /// Make the database attached under `name` the default for future connections.
     /// Existing connections keep their current default.
     pub fn set_default(&self, name: &str) -> Result<&Self> {
-        check_api_call!(ffi::duckdb_v2_instance_set_default, self.raw(), &(name).into())?;
+        check_api_call!(
+            ffi::duckdb_v2_instance_set_default,
+            self.raw(),
+            name.as_ptr().cast(),
+            name.len() as u64
+        )?;
         Ok(self)
     }
 
     /// Detach the database attached as `name`, checkpointing a file database first.
     pub fn detach(&self, name: &str) -> Result<&Self> {
-        check_api_call!(ffi::duckdb_v2_instance_detach, self.raw(), &name.into())?;
+        check_api_call!(
+            ffi::duckdb_v2_instance_detach,
+            self.raw(),
+            name.as_ptr().cast(),
+            name.len() as u64
+        )?;
         Ok(self)
     }
 

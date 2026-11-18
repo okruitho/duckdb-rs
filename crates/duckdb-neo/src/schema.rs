@@ -2,8 +2,7 @@
 
 use crate::ffi;
 
-use crate::ffi_str::DuckDBStr;
-use crate::{AsRaw, DropHandle, FromRaw, Result, check_api_call, logical_type::LogicalType};
+use crate::{AsRaw, DropHandle, FromRaw, Result, check_api_call, logical_type::LogicalType, str_from_tuple};
 
 /// An owned, ordered list of field names and logical types.
 ///
@@ -79,14 +78,15 @@ impl Schema {
 
     fn field(&self, index: usize) -> Result<(&str, ffi::duckdb_v2_logical_type_handle)> {
         let mut out_type = std::ptr::null_mut();
-        let out_name = check_api_call!(
+        check_api_call!(
             ffi::duckdb_v2_schema_get_field,
             self.handle,
             index as u64,
             RET,
+            RET_2,
             &mut out_type
-        )?;
-        Ok((DuckDBStr::from_raw(out_name).as_str().unwrap_or_default(), out_type))
+        )
+        .map(|name| (str_from_tuple(name), out_type))
     }
 
     /// Iterate over borrowed names and owned logical types in declaration order.

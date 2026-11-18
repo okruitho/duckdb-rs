@@ -101,16 +101,14 @@ impl Error {
     ) -> Self {
         let mut message = String::new();
         if !handle.is_null() {
-            let mut text = ffi::duckdb_v2_str::default();
+            let mut ptr = std::ptr::null();
+            let mut len = 0;
             // SAFETY: the caller supplies a live error handle.
-            if unsafe { ffi::duckdb_v2_error_info_get_text(*handle, &mut text) }
+            if unsafe { ffi::duckdb_v2_error_info_get_text(*handle, &mut ptr, &mut len) }
                 == ffi::DUCKDB_V2_ERROR::DUCKDB_V2_ERROR_NONE
-                && !text.ptr.is_null()
-                && text.len > 0
             {
-                // SAFETY: the borrowed text stays valid until the handle is destroyed below.
-                let bytes = unsafe { std::slice::from_raw_parts(text.ptr.cast::<u8>(), text.len as usize) };
-                message = String::from_utf8_lossy(bytes).into_owned();
+                // The borrowed text stays valid until the handle is destroyed below.
+                message = crate::string_from_tuple((ptr, len));
             }
             // SAFETY: the caller transfers ownership of this live handle.
             unsafe { ffi::duckdb_v2_error_info_destroy(handle) };
@@ -371,10 +369,15 @@ mod tests {
         for message in ["error detail", ""] {
             let mut handle = std::ptr::null_mut();
             // SAFETY: the byte argument and output slot are valid for this call.
-            let code = unsafe { crate::ffi::duckdb_v2_validate_utf8(&crate::ffi_str::bytes_arg(b"\xff"), &mut handle) };
+            let code = unsafe { crate::ffi::duckdb_v2_validate_utf8(b"\xff".as_ptr().cast(), 1, &mut handle) };
             assert_ne!(code, super::DuckDBError::None.into());
             assert!(!handle.is_null());
-            super::check_api_call_no_err!(crate::ffi::duckdb_v2_error_info_set_text, handle, &message.into())?;
+            super::check_api_call_no_err!(
+                crate::ffi::duckdb_v2_error_info_set_text,
+                handle,
+                message.as_ptr().cast(),
+                message.len() as u64
+            )?;
             // SAFETY: this test owns the live error handle.
             let error = unsafe { super::Error::from_code_and_handle(code, &mut handle) };
             assert!(handle.is_null());

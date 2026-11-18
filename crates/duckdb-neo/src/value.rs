@@ -1,7 +1,7 @@
 //! Owned DuckDB values and their typed payloads.
 
 use crate::types::{HugeInt, UHugeInt};
-use crate::{DropHandle, Factory, ffi};
+use crate::{DropHandle, Factory, ffi, ffi_str::DecomposedArrays};
 
 use crate::{
     AsRaw, FromRaw, Result, check_api_call, check_api_call_string, connection::FFILink, error::Error,
@@ -116,10 +116,6 @@ fn check_same_len(what: &str, left: usize, right: usize) -> Result<()> {
     )))
 }
 
-fn value_handles(values: &[Value]) -> Vec<ffi::duckdb_v2_value_handle> {
-    values.iter().map(|value| value.handle).collect()
-}
-
 pub(crate) fn hugeint(value: i128) -> HugeInt {
     HugeInt {
         lower: value as u64,
@@ -167,11 +163,17 @@ pub(crate) fn create(factory: &Factory, input: ValueInput<'_>) -> Result<Value> 
         ValueInput::UHugeInt(value) => {
             create_value!(ffi::duckdb_v2_value_create_uhugeint, factory.raw(), &value)
         }
-        ValueInput::Varchar(value) => create_value!(ffi::duckdb_v2_value_create_varchar, factory.raw(), &value.into()),
+        ValueInput::Varchar(value) => create_value!(
+            ffi::duckdb_v2_value_create_varchar,
+            factory.raw(),
+            value.as_ptr().cast(),
+            value.len() as u64
+        ),
         ValueInput::Blob(value) => create_value!(
             ffi::duckdb_v2_value_create_blob,
             factory.raw(),
-            &crate::ffi_str::bytes_arg(value)
+            value.as_ptr().cast(),
+            value.len() as u64
         ),
         ValueInput::Type(logical_type) => {
             create_value!(ffi::duckdb_v2_value_create_type, factory.raw(), logical_type.handle)
@@ -210,52 +212,55 @@ pub(crate) fn create(factory: &Factory, input: ValueInput<'_>) -> Result<Value> 
         ValueInput::Bit(value) => create_value!(
             ffi::duckdb_v2_value_create_bit,
             factory.raw(),
-            &crate::ffi_str::bytes_arg(value)
+            value.as_ptr().cast(),
+            value.len() as u64
         ),
         ValueInput::BigNum(value) => create_value!(
             ffi::duckdb_v2_value_create_bignum,
             factory.raw(),
-            &crate::ffi_str::bytes_arg(value)
+            value.as_ptr().cast(),
+            value.len() as u64
         ),
         ValueInput::List { child_type, children } => {
-            let children = value_handles(children);
+            let children = DecomposedArrays::new(children);
             create_value!(
                 ffi::duckdb_v2_value_create_list,
                 factory.raw(),
                 child_type.handle,
-                children.as_ptr(),
-                children.len() as u64
+                children.ptrs(),
+                children.len()
             )
         }
         ValueInput::Array { child_type, children } => {
-            let children = value_handles(children);
+            let children = DecomposedArrays::new(children);
             create_value!(
                 ffi::duckdb_v2_value_create_array,
                 factory.raw(),
                 child_type.handle,
-                children.as_ptr(),
-                children.len() as u64
+                children.ptrs(),
+                children.len()
             )
         }
         ValueInput::Struct { names, children } => {
             check_same_len("STRUCT names and children", names.len(), children.len())?;
-            let names = names.iter().map(|name| (*name).into()).collect::<Vec<_>>();
-            let children = value_handles(children);
+            let names = DecomposedArrays::new(names);
+            let children = DecomposedArrays::new(children);
             create_value!(
                 ffi::duckdb_v2_value_create_struct,
                 factory.raw(),
-                names.as_ptr(),
-                children.as_ptr(),
-                children.len() as u64
+                names.ptrs().cast_mut(),
+                names.child_lengths(),
+                children.ptrs(),
+                children.len()
             )
         }
         ValueInput::Tuple(children) => {
-            let children = value_handles(children);
+            let children = DecomposedArrays::new(children);
             create_value!(
                 ffi::duckdb_v2_value_create_tuple,
                 factory.raw(),
-                children.as_ptr(),
-                children.len() as u64
+                children.ptrs(),
+                children.len()
             )
         }
         ValueInput::Map {
@@ -265,16 +270,16 @@ pub(crate) fn create(factory: &Factory, input: ValueInput<'_>) -> Result<Value> 
             values,
         } => {
             check_same_len("MAP keys and values", keys.len(), values.len())?;
-            let keys = value_handles(keys);
-            let values = value_handles(values);
+            let keys = DecomposedArrays::new(keys);
+            let values = DecomposedArrays::new(values);
             create_value!(
                 ffi::duckdb_v2_value_create_map,
                 factory.raw(),
                 key_type.handle,
                 value_type.handle,
-                keys.as_ptr(),
-                values.as_ptr(),
-                keys.len() as u64
+                keys.ptrs(),
+                values.ptrs(),
+                keys.len()
             )
         }
     }

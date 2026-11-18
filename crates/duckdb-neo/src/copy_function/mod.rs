@@ -11,7 +11,6 @@
 
 use std::{any::Any, collections::HashMap, marker::PhantomData, num::NonZeroUsize};
 
-use crate::ffi_str::DuckDBStr;
 use crate::{
     Error, Result,
     builder_helpers::{
@@ -26,6 +25,7 @@ use crate::{
     handles::{CopyFunctionBuilderHandle, CopyFunctionBuilderLink},
     logical_type::LogicalType,
     raw::RawExt,
+    str_from_tuple, string_from_tuple,
     value::Value,
 };
 
@@ -70,8 +70,7 @@ fn init_to_callback<T: CopyToFunctionCallbacks>(
     let bind_data = check_api_call!(ffi::duckdb_v2_copy_to_init_get_bind_data, info, RET)?;
     let bind_data = unsafe { get_opaque_data_ref::<CopyFunctionBindData<T::BindData>>(bind_data) }.unwrap();
 
-    let file_path = check_api_call!(ffi::duckdb_v2_copy_to_init_get_file_path, info, RET)
-        .map(|x| DuckDBStr::from_raw(x).as_str().unwrap_or_default())?;
+    let file_path = check_api_call!(ffi::duckdb_v2_copy_to_init_get_file_path, info, RET, RET_2).map(str_from_tuple)?;
 
     let init_data = T::init(user_data, context, &bind_data.data, file_path)?;
 
@@ -231,7 +230,8 @@ impl<T> CopyFunctionBuilder<T> {
         check_api_call!(
             ffi::duckdb_v2_copy_function_set_name,
             handle.raw(),
-            &mut (&self.name).into()
+            self.name.as_ptr().cast(),
+            self.name.len() as u64
         )?;
 
         check_api_call!(
@@ -244,7 +244,8 @@ impl<T> CopyFunctionBuilder<T> {
             check_api_call!(
                 ffi::duckdb_v2_copy_function_set_file_extension,
                 handle.raw(),
-                &extension.into()
+                extension.as_ptr().cast(),
+                extension.len() as u64
             )
         } else {
             Ok(())
@@ -456,25 +457,22 @@ impl CopyToBindInfo {
     ///
     /// An out-of-range index returns an error.
     pub fn get_column(&self, index: usize) -> Result<(&str, LogicalType)> {
-        let mut name = ffi::duckdb_v2_str::default();
-
-        check_api_call!(
+        let name = check_api_call!(
             ffi::duckdb_v2_copy_to_bind_get_column_name,
             self.handle,
             index as u64,
-            &mut name
-        )?;
+            RET,
+            RET_2
+        )
+        .map(str_from_tuple)?;
 
-        let owned_type = check_api_call!(
+        check_api_call!(
             ffi::duckdb_v2_copy_to_bind_get_column_type,
             self.handle,
             index as u64,
             RET
-        )?;
-
-        let logical_type = LogicalType { handle: owned_type };
-
-        Ok((DuckDBStr::from_raw(name).as_str().unwrap_or_default(), logical_type))
+        )
+        .map(|handle| (name, LogicalType { handle }))
     }
 
     /// Return the output path as written in the `COPY TO` statement.
@@ -482,8 +480,7 @@ impl CopyToBindInfo {
     /// The initialization callback receives the actual file path, which may
     /// differ for temporary files or partitioned output.
     pub fn file_path(&self) -> Result<String> {
-        check_api_call!(ffi::duckdb_v2_copy_to_bind_get_file_path, self.handle, RET)
-            .map(|x| DuckDBStr::from_raw(x).as_str().unwrap_or_default().to_owned())
+        check_api_call!(ffi::duckdb_v2_copy_to_bind_get_file_path, self.handle, RET, RET_2).map(string_from_tuple)
     }
 
     /// Return the number of format-specific options, ordered case-insensitively by name.
@@ -497,15 +494,17 @@ impl CopyToBindInfo {
             ffi::duckdb_v2_copy_to_bind_get_option_name,
             self.handle,
             index as u64,
-            RET
-        )?;
-        let handle = check_api_call!(
+            RET,
+            RET_2
+        )
+        .map(str_from_tuple)?;
+        check_api_call!(
             ffi::duckdb_v2_copy_to_bind_get_option_value,
             self.handle,
             index as u64,
             RET
-        )?;
-        Ok((DuckDBStr::from_raw(name).as_str().unwrap_or_default(), Value { handle }))
+        )
+        .map(|handle| (name, Value { handle }))
     }
 
     /// Return format-specific options in an unordered map with case-preserving keys.
@@ -528,17 +527,12 @@ fn bind_from_callback<T: CopyFromFunctionCallbacks>(
 ) -> Result<()> {
     let user_data = get_user_data!(ffi::duckdb_v2_copy_from_bind_get_user_data, info);
 
-    let mut file_path = ffi::duckdb_v2_str::default();
-    check_api_call!(ffi::duckdb_v2_copy_from_bind_get_file_path, info, &mut file_path)?;
+    let file_path =
+        check_api_call!(ffi::duckdb_v2_copy_from_bind_get_file_path, info, RET, RET_2).map(str_from_tuple)?;
 
     let bind_info = CopyFromBindInfo { handle: info };
 
-    let bind_data = T::bind(
-        user_data,
-        context,
-        DuckDBStr::from_raw(file_path).as_str().unwrap_or_default(),
-        &bind_info,
-    )?;
+    let bind_data = T::bind(user_data, context, file_path, &bind_info)?;
     let cardinality = T::cardinality(user_data, context, &bind_data)?;
 
     check_api_call!(
@@ -671,8 +665,7 @@ pub struct CopyFromBindInfo {
 impl CopyFromBindInfo {
     /// Return the input path as written in the `COPY FROM` statement.
     pub fn file_path(&self) -> Result<String> {
-        check_api_call!(ffi::duckdb_v2_copy_from_bind_get_file_path, self.handle, RET)
-            .map(|path| DuckDBStr::from_raw(path).as_str().unwrap_or_default().to_owned())
+        check_api_call!(ffi::duckdb_v2_copy_from_bind_get_file_path, self.handle, RET, RET_2).map(string_from_tuple)
     }
 
     /// Return the number of columns the target table expects.
@@ -684,14 +677,14 @@ impl CopyFromBindInfo {
     ///
     /// An out-of-range index returns an error.
     pub fn get_column(&self, index: usize) -> Result<(&str, LogicalType)> {
-        let mut name = ffi::duckdb_v2_str::default();
-
-        check_api_call!(
+        let name = check_api_call!(
             ffi::duckdb_v2_copy_from_bind_get_column_name,
             self.handle,
             index as u64,
-            &mut name
-        )?;
+            RET,
+            RET_2
+        )
+        .map(str_from_tuple)?;
 
         check_api_call!(
             ffi::duckdb_v2_copy_from_bind_get_column_type,
@@ -699,12 +692,7 @@ impl CopyFromBindInfo {
             index as u64,
             RET
         )
-        .map(|owned_type| {
-            (
-                DuckDBStr::from_raw(name).as_str().unwrap_or_default(),
-                LogicalType { handle: owned_type },
-            )
-        })
+        .map(|owned_type| (name, LogicalType { handle: owned_type }))
     }
 
     /// Return the number of options, ordered case-insensitively by name, excluding `FORMAT`.
@@ -715,14 +703,14 @@ impl CopyFromBindInfo {
     /// Return an option's case-preserving name and owned value.
     /// An out-of-range index returns an error.
     pub fn get_option(&self, index: usize) -> Result<(&str, Value)> {
-        let mut name = ffi::duckdb_v2_str::default();
-
-        check_api_call!(
+        let name = check_api_call!(
             ffi::duckdb_v2_copy_from_bind_get_option_name,
             self.handle,
             index as u64,
-            &mut name
-        )?;
+            RET,
+            RET_2
+        )
+        .map(str_from_tuple)?;
 
         check_api_call!(
             ffi::duckdb_v2_copy_from_bind_get_option_value,
@@ -730,12 +718,7 @@ impl CopyFromBindInfo {
             index as u64,
             RET
         )
-        .map(|value| {
-            (
-                DuckDBStr::from_raw(name).as_str().unwrap_or_default(),
-                Value { handle: value },
-            )
-        })
+        .map(|value| (name, Value { handle: value }))
     }
 }
 

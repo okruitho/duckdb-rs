@@ -2,7 +2,7 @@
 
 use crate::ffi;
 
-use crate::ffi_str::DuckDBStr;
+use crate::string_from_tuple;
 use crate::{
     Result, builder_helpers::ffi_enum_redeclaration, cast::CastMode, check_api_call, logical_type::LogicalType,
     qualified_name::QualifiedName, value::Value,
@@ -122,8 +122,7 @@ impl<'a> Expression<'a> {
     /// return internal names; use [`Self::expression_type`] to distinguish them.
     /// Returns an error for nodes that do not represent function calls.
     pub fn function_name(&self) -> Result<String> {
-        check_api_call!(ffi::duckdb_v2_expression_function_get_name, self.handle, RET)
-            .map(|name| DuckDBStr::from_raw(name).as_str().unwrap_or_default().to_owned())
+        check_api_call!(ffi::duckdb_v2_expression_function_get_name, self.handle, RET, RET_2).map(string_from_tuple)
     }
 
     /// Return the function's owned name, qualified by catalog and schema where known.

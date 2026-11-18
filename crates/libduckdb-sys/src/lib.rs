@@ -98,9 +98,6 @@ pub mod v2 {
     pub use bindings::*;
 
     pub use crate::arrow_c_data::{ArrowArray, ArrowArrayStream, ArrowSchema};
-
-    // Trait impls only; nothing to re-export.
-    mod string;
 }
 
 #[cfg(all(test, feature = "capi-v1"))]

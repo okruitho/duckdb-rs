@@ -145,8 +145,7 @@ impl FromValue for BigNumValue {
             )));
         }
 
-        let raw = check_api_call!(ffi::duckdb_v2_value_get_blob, value.raw(), RET)?;
-        let encoded = owned_bytes(raw)?;
+        let encoded = check_api_call!(ffi::duckdb_v2_value_get_blob, value.raw(), RET, RET_2).and_then(owned_bytes)?;
         let (is_negative, magnitude) = Value::decode_bignum(&encoded)?;
         Ok(Self { is_negative, magnitude })
     }

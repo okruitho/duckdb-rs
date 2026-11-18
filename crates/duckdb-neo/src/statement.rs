@@ -8,26 +8,11 @@ use crate::{
     AsRaw, DropHandle, FromRaw, Parameters, Result, check_api_call,
     connection::Connection,
     ffi,
-    parameter::ParameterValue,
+    ffi_str::DecomposedArrays,
     query_result::{ArrowQueryResult, QueryResult, StatementType},
     raw::RawExt,
     schema::Schema,
 };
-
-/// Parameter buffers passed to an execute call.
-///
-/// Owns the converted values, so their handles stay valid for the call.
-struct ParameterBuffers<'a> {
-    _values: Vec<ParameterValue<'a>>,
-    pub(crate) value_handles: Vec<ffi::duckdb_v2_value_handle>,
-    pub(crate) names: Option<Vec<&'a str>>,
-}
-
-impl ParameterBuffers<'_> {
-    fn len(&self) -> u64 {
-        self.value_handles.len() as u64
-    }
-}
 
 /// Schemas resolved while binding a statement.
 #[derive(Debug)]
@@ -151,37 +136,21 @@ impl<'a> Statement<'a> {
     /// Columns use their explicit names from [`ColumnParameter::Named`](crate::column_data_collection::ColumnParameter::Named),
     /// or `col1` through `colN` for positional columns; empty column names are rejected.
     pub fn add_collection(mut self, collection: ColumnDataCollection<'a>, name: &str) -> Result<Self> {
+        let column_names = DecomposedArrays::new(collection.column_names().into_iter().flatten());
+
         check_api_call!(
             ffi::duckdb_v2_statement_add_collection,
             self.raw(),
             name.as_ptr().cast(),
             name.len() as u64,
             collection.raw(),
-            collection
-                .column_names()
-                .map(|x| x.iter().map(|x| x.as_ptr().cast::<i8>()).collect::<Vec<_>>())
-                .map_or(std::ptr::null_mut::<*const i8>(), |x| x.as_ptr() as *mut *const i8),
-            collection
-                .column_names()
-                .map(|x| x.iter().map(|x| x.len() as u64).collect::<Vec<_>>())
-                .map_or(std::ptr::null::<u64>().cast(), |x| x.as_ptr()),
-            collection.column_names().map_or(0, |x| x.len() as u64)
+            column_names.ptrs().cast_mut(),
+            column_names.child_lengths(),
+            column_names.len()
         )?;
 
         self.collections.0.push(Arc::new(collection));
         Ok(self)
-    }
-
-    fn prepare_params<'p>(conn: &Connection, params: Parameters<'p>) -> Result<ParameterBuffers<'p>> {
-        let (names, values) = params.into_values(conn)?;
-        let handles = values.iter().map(|value| value.as_value().handle).collect();
-        let names = names.map(|names| names.iter().map(|name| (*name).into()).collect());
-
-        Ok(ParameterBuffers {
-            _values: values,
-            value_handles: handles,
-            names,
-        })
     }
 
     /// Start the statement and return its lazy, streaming result.
@@ -193,21 +162,17 @@ impl<'a> Statement<'a> {
         'a: 'conn,
     {
         let (names, values) = params.into_values(conn)?;
+        let names = DecomposedArrays::new(names.iter().flatten());
+        let values = DecomposedArrays::new(&values);
 
         check_api_call!(
             ffi::duckdb_v2_statement_execute,
             conn.raw(),
             self.handle,
-            names
-                .as_ref()
-                .map_or(std::ptr::null::<*const i8>(), |x| x.as_ptr().cast()),
-            names.as_ref().map_or(std::ptr::null(), |x| x
-                .iter()
-                .map(|x| x.len() as u64)
-                .collect::<Vec<_>>()
-                .as_ptr()),
-            values.iter().map(|x| x.as_value().handle).collect::<Vec<_>>().as_ptr(),
-            values.len() as u64,
+            names.ptrs(),
+            names.child_lengths(),
+            values.ptrs(),
+            values.len(),
             RET
         )
         .map(|handle| QueryResult::new(handle, self.collections.clone()))
@@ -228,21 +193,17 @@ impl<'a> Statement<'a> {
         'a: 'conn,
     {
         let (names, values) = params.into_values(conn)?;
+        let names = DecomposedArrays::new(names.iter().flatten());
+        let values = DecomposedArrays::new(&values);
 
         check_api_call!(
             ffi::duckdb_v2_statement_execute_arrow,
             conn.raw(),
             self.handle,
-            names
-                .as_ref()
-                .map_or(std::ptr::null::<*const i8>(), |x| x.as_ptr().cast()),
-            names.as_ref().map_or(std::ptr::null(), |x| x
-                .iter()
-                .map(|x| x.len() as u64)
-                .collect::<Vec<_>>()
-                .as_ptr()),
-            values.iter().map(|x| x.as_value().handle).collect::<Vec<_>>().as_ptr(),
-            values.len() as u64,
+            names.ptrs(),
+            names.child_lengths(),
+            values.ptrs(),
+            values.len(),
             batch_size.unwrap_or_default() as u64,
             RET
         )
@@ -331,20 +292,16 @@ impl<'a> PreparedStatement<'a> {
     /// Execute with optional positional or named parameters.
     pub fn execute(&self, parameters: Parameters<'_>) -> Result<QueryResult<'a>> {
         let (names, values) = parameters.into_values(self.connection)?;
+        let names = DecomposedArrays::new(names.iter().flatten());
+        let values = DecomposedArrays::new(&values);
 
         check_api_call!(
             ffi::duckdb_v2_prepared_statement_execute,
             self.handle,
-            names
-                .as_ref()
-                .map_or(std::ptr::null::<*const i8>(), |x| x.as_ptr().cast()),
-            names.as_ref().map_or(std::ptr::null(), |x| x
-                .iter()
-                .map(|x| x.len() as u64)
-                .collect::<Vec<_>>()
-                .as_ptr()),
-            values.iter().map(|x| x.as_value().handle).collect::<Vec<_>>().as_ptr(),
-            values.len() as u64,
+            names.ptrs(),
+            names.child_lengths(),
+            values.ptrs(),
+            values.len(),
             RET
         )
         .map(|handle| QueryResult::new(handle, self.collections.clone()))
@@ -356,20 +313,16 @@ impl<'a> PreparedStatement<'a> {
     /// DuckDB's default of 131,072.
     pub fn execute_arrow(&self, parameters: Parameters<'_>, batch_size: Option<usize>) -> Result<ArrowQueryResult<'a>> {
         let (names, values) = parameters.into_values(self.connection)?;
+        let names = DecomposedArrays::new(names.iter().flatten());
+        let values = DecomposedArrays::new(&values);
 
         check_api_call!(
             ffi::duckdb_v2_prepared_statement_execute_arrow,
             self.handle,
-            names
-                .as_ref()
-                .map_or(std::ptr::null::<*const i8>(), |x| x.as_ptr().cast()),
-            names.as_ref().map_or(std::ptr::null(), |x| x
-                .iter()
-                .map(|x| x.len() as u64)
-                .collect::<Vec<_>>()
-                .as_ptr()),
-            values.iter().map(|x| x.as_value().handle).collect::<Vec<_>>().as_ptr(),
-            values.len() as u64,
+            names.ptrs(),
+            names.child_lengths(),
+            values.ptrs(),
+            values.len(),
             batch_size.unwrap_or_default() as u64,
             RET
         )

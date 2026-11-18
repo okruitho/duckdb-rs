@@ -14,6 +14,7 @@ use crate::{
     connection::{Connection, Context},
     data_chunk::{DataChunk, DataChunkRef},
     ffi,
+    ffi_str::DecomposedArrays,
     logical_type::LogicalType,
     raw::RawExt,
     schema::Schema,
@@ -159,19 +160,16 @@ impl<'ctx> ArrowExporter<'ctx> {
     ///
     /// `None` or `Some(0)` imposes no batch-size limit.
     pub fn new(context: &'ctx Context, columns: &[(&str, LogicalType)], batch_size: Option<usize>) -> Result<Self> {
-        let converted = columns
-            .iter()
-            .map(|(name, lt)| ((*name).into(), lt.handle))
-            .collect::<Vec<(ffi::duckdb_v2_str, ffi::duckdb_v2_logical_type_handle)>>();
-        let name_ptrs = converted.iter().map(|x| x.0).collect::<Vec<_>>();
-        let logical_type_handles = converted.iter().map(|x| x.1).collect::<Vec<_>>();
+        let names = DecomposedArrays::new(columns.iter().map(|(name, _)| *name));
+        let logical_types = DecomposedArrays::new(columns.iter().map(|(_, lt)| lt));
 
         check_api_call!(
             ffi::duckdb_v2_arrow_exporter_create,
             context.raw(),
-            logical_type_handles.as_ptr(),
-            name_ptrs.as_ptr(),
-            logical_type_handles.len() as u64,
+            logical_types.ptrs(),
+            names.ptrs().cast_mut(),
+            names.child_lengths(),
+            names.len(),
             batch_size.unwrap_or(0) as u64,
             RET
         )

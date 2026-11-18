@@ -2,9 +2,7 @@ use std::marker::PhantomData;
 
 use duckdb_loadable_macros::AsRaw;
 
-use crate::Error;
 use crate::builder_helpers::{OpaqueHandle, register_callback};
-use crate::ffi_str::DuckDBStr;
 use crate::log::{LogLevel, LogScope};
 use crate::raw::RawExt;
 use crate::{
@@ -12,6 +10,7 @@ use crate::{
     error::check_api_call,
     ffi,
     handles::{LogSinkBuilderHandle, LogSinkBuilderLink},
+    str_from_tuple,
 };
 
 /// The ids attached to one log record, valid only during [`LogSinkCallbacks::write`].
@@ -82,29 +81,22 @@ fn flush_callback<T: LogSinkCallbacks>(
     T::flush(user_data)
 }
 
-unsafe fn entry_str<'a>(text: *const ffi::duckdb_v2_str, what: &str) -> Result<&'a str> {
-    if text.is_null() {
-        return Ok("");
-    }
-    DuckDBStr::from_raw(unsafe { *text })
-        .as_str()
-        .ok_or_else(|| Error::api_error(format!("{what} is not valid UTF-8")))
-}
-
 fn write_callback<T: LogSinkCallbacks>(
     info: ffi::duckdb_v2_log_sink_write_info_handle,
     user_data: *mut ::std::os::raw::c_void,
     timestamp: i64,
     level: ffi::DUCKDB_V2_LOG_LEVEL,
     scope: ffi::DUCKDB_V2_LOG_SCOPE,
-    type_: *const ffi::duckdb_v2_str,
-    message: *const ffi::duckdb_v2_str,
+    type_: *const ::std::os::raw::c_char,
+    type_length: ffi::idx_t,
+    message: *const ::std::os::raw::c_char,
+    message_length: ffi::idx_t,
 ) -> Result<()> {
     let user_data = unsafe { &*(user_data as *const T) };
 
-    // SAFETY: DuckDB keeps both strings alive for the duration of the callback.
-    let log_type = unsafe { entry_str(type_, "log type") }?;
-    let message = unsafe { entry_str(message, "log message") }?;
+    // DuckDB keeps both strings alive for the duration of the callback.
+    let log_type = str_from_tuple((type_, type_length));
+    let message = str_from_tuple((message, message_length));
 
     T::write(
         user_data,
@@ -140,7 +132,12 @@ impl<T: LogSinkCallbacks> LogSinkBuilder<T> {
     }
 
     fn build(&self, handle: &LogSinkBuilderHandle) -> Result<()> {
-        check_api_call!(ffi::duckdb_v2_log_sink_set_name, handle.raw(), &(&self.name).into())?;
+        check_api_call!(
+            ffi::duckdb_v2_log_sink_set_name,
+            handle.raw(),
+            self.name.as_ptr().cast(),
+            self.name.len() as u64
+        )?;
 
         check_api_call!(
             ffi::duckdb_v2_log_sink_set_user_data,
@@ -171,8 +168,10 @@ impl<T: LogSinkCallbacks> LogSinkBuilder<T> {
                 timestamp: i64,
                 level: ffi::DUCKDB_V2_LOG_LEVEL,
                 scope: ffi::DUCKDB_V2_LOG_SCOPE,
-                type_: *const ffi::duckdb_v2_str,
-                message: *const ffi::duckdb_v2_str,
+                type_: *const ::std::os::raw::c_char,
+                type_length: ffi::idx_t,
+                message: *const ::std::os::raw::c_char,
+                message_length: ffi::idx_t,
             ),
             exec = write_callback,
         }

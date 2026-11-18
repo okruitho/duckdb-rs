@@ -80,7 +80,7 @@ fn combined_iterator_accepts_empty_readers() -> Result<()> {
 }
 
 #[test]
-fn combined_iterator_rejects_mismatched_lengths() -> Result<()> {
+fn combined_iterator_rejects_mismatched_child_lengths() -> Result<()> {
     let env = Environment::new()?;
     let conn = env.open(StorageLocation::InMemory)?.connect()?;
     let ty = i32::logical_type(&conn)?;

@@ -1,24 +1,24 @@
 use crate::{
     Result,
     error::{DuckDBError, Error, check_api_call_no_err},
-    ffi,
-    ffi_str::DuckDBStr,
+    ffi, str_from_tuple,
 };
 
 pub(crate) unsafe extern "C" fn copy_render_box(
-    text: *const ffi::duckdb_v2_str,
+    text: *const std::os::raw::c_char,
+    text_length: ffi::idx_t,
     user_data: *mut std::os::raw::c_void,
     err: *mut ffi::duckdb_v2_error_info_handle,
 ) {
     handle_unwind(
         || {
-            if text.is_null() || user_data.is_null() {
+            if user_data.is_null() {
                 return Err(Error::api_error("NULL value in copy_render_box"));
             }
 
             let string = unsafe { &mut *(user_data as *mut String) };
 
-            string.push_str(DuckDBStr::from_raw(unsafe { *text }).as_str().unwrap_or_default());
+            string.push_str(str_from_tuple((text, text_length)));
 
             Ok(())
         },
@@ -109,7 +109,12 @@ pub(crate) fn set_error(err: *mut ffi::duckdb_v2_error_info_handle, error: &Erro
         code => code,
     };
     let _ = check_api_call_no_err!(ffi::duckdb_v2_error_info_set_code, *err, code.into());
-    let _ = check_api_call_no_err!(ffi::duckdb_v2_error_info_set_text, *err, &(&error.message).into());
+    let _ = check_api_call_no_err!(
+        ffi::duckdb_v2_error_info_set_text,
+        *err,
+        error.message.as_ptr().cast(),
+        error.message.len() as u64
+    );
 }
 
 pub(crate) unsafe extern "C" fn drop_opaque<T>(ptr: *mut c_void) {
@@ -357,7 +362,7 @@ mod tests {
     fn test_set_error_maps_none_to_api() -> crate::Result<()> {
         let mut handle = std::ptr::null_mut();
         // SAFETY: the byte argument and output slot are valid for this call.
-        unsafe { crate::ffi::duckdb_v2_validate_utf8(&crate::ffi_str::bytes_arg(b"\xff"), &mut handle) };
+        unsafe { crate::ffi::duckdb_v2_validate_utf8(b"\xff".as_ptr().cast(), 1, &mut handle) };
         assert!(!handle.is_null());
         let error = crate::Error {
             code: crate::error::DuckDBError::None,

@@ -4,8 +4,7 @@
 pub use crate::builder_helpers::ArgCount as ArgumentCounts;
 
 use crate::ffi;
-use crate::ffi_str::DuckDBStr;
-use crate::{Result, check_api_call, error::DuckDBError, logical_type::LogicalType, value::Value};
+use crate::{Result, check_api_call, error::DuckDBError, logical_type::LogicalType, string_from_tuple, value::Value};
 
 /// Arguments are ordered as positional fixed parameters, `*args`, named-only parameters, then `**kwargs`.
 /// [`Self::value`] folds constant arguments on demand and returns any evaluation errors.
@@ -83,15 +82,14 @@ impl<'a> BindArguments<'a> {
 
     /// Return the declared parameter name, the caller's name for `**kwargs`, or empty for `*args`.
     pub fn name(&self, index: usize) -> Result<String> {
-        let str = check_api_call!(
+        check_api_call!(
             ffi::duckdb_v2_function_bind_get_arg_name,
             *self.handle,
             index as u64,
-            RET
+            RET,
+            RET_2
         )
-        .map(DuckDBStr::from_raw)?;
-
-        Ok(str.as_str().unwrap_or_default().to_string())
+        .map(string_from_tuple)
     }
 
     /// Find an argument case-insensitively, skipping positional-only parameters.
@@ -102,7 +100,8 @@ impl<'a> BindArguments<'a> {
         check_api_call!(
             ffi::duckdb_v2_function_bind_get_arg_index,
             *self.handle,
-            &name.into(),
+            name.as_ptr().cast(),
+            name.len() as u64,
             &mut index,
             &mut found
         )?;

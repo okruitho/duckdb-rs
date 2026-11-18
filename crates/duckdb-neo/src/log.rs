@@ -44,8 +44,10 @@ impl Log {
             ffi::duckdb_v2_context_log,
             ctx.raw(),
             level.into(),
-            &log_type.into(),
-            &message.into()
+            log_type.as_ptr().cast(),
+            log_type.len() as u64,
+            message.as_ptr().cast(),
+            message.len() as u64
         )
     }
 
@@ -55,8 +57,10 @@ impl Log {
             ffi::duckdb_v2_connection_log,
             conn.raw(),
             level.into(),
-            &log_type.into(),
-            &message.into()
+            log_type.as_ptr().cast(),
+            log_type.len() as u64,
+            message.as_ptr().cast(),
+            message.len() as u64
         )
     }
 
@@ -66,8 +70,10 @@ impl Log {
             ffi::duckdb_v2_instance_log,
             instance.raw(),
             level.into(),
-            &log_type.into(),
-            &message.into()
+            log_type.as_ptr().cast(),
+            log_type.len() as u64,
+            message.as_ptr().cast(),
+            message.len() as u64
         )
     }
 }

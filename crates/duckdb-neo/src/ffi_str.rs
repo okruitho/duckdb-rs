@@ -1,84 +1,119 @@
-//! Reading strings and bytes that DuckDB hands back through the C API.
+//! Passing strings and bytes through the C API.
 
-use std::borrow::Cow;
 use std::marker::PhantomData;
+use std::os::raw::c_char;
 
-use crate::ffi;
+use crate::{AsRaw, ffi, raw::RawExt};
 
-/// A string returned by DuckDB, borrowed from whatever owns its bytes for `'a`.
+/// Return the `(pointer, length)` bytes DuckDB handed back; a null pointer reads as empty.
 ///
-/// Callers pick `'a` in [`Self::from_raw`]: tie it to the owning handle, or `'static` for static strings.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DuckDBStr<'a> {
-    raw: ffi::duckdb_v2_str,
-    _owner: PhantomData<&'a [u8]>,
+/// The caller picks `'a`: tie it to the owning handle, or `'static` for static strings.
+pub(crate) fn bytes_from_tuple<'a>((ptr, len): (*const c_char, ffi::idx_t)) -> &'a [u8] {
+    if ptr.is_null() || len == 0 {
+        return &[];
+    }
+    // SAFETY: the C API returns `len` bytes that stay valid while their owner is borrowed.
+    unsafe { std::slice::from_raw_parts(ptr.cast(), len as usize) }
 }
 
-impl<'a> DuckDBStr<'a> {
-    /// `raw` must be null or point to `len` UTF-8 bytes that stay valid and unchanged for `'a`.
-    pub(crate) fn from_raw(raw: ffi::duckdb_v2_str) -> Self {
-        Self {
-            raw,
-            _owner: PhantomData,
+/// An item the C API takes in a pointer array: a handle, or a string with a parallel length.
+pub(crate) trait HasPtr {
+    type Ptr: Copy;
+
+    fn ptr(&self) -> Self::Ptr;
+
+    /// The byte length for the parallel lengths array; `None` for items without one, such as handles.
+    fn length(&self) -> Option<ffi::idx_t> {
+        None
+    }
+}
+
+impl HasPtr for str {
+    type Ptr = *const c_char;
+
+    fn ptr(&self) -> Self::Ptr {
+        self.as_ptr().cast()
+    }
+
+    fn length(&self) -> Option<ffi::idx_t> {
+        Some(self.len() as ffi::idx_t)
+    }
+}
+
+impl HasPtr for &str {
+    type Ptr = *const c_char;
+
+    fn ptr(&self) -> Self::Ptr {
+        (**self).ptr()
+    }
+
+    fn length(&self) -> Option<ffi::idx_t> {
+        (**self).length()
+    }
+}
+
+impl HasPtr for String {
+    type Ptr = *const c_char;
+
+    fn ptr(&self) -> Self::Ptr {
+        self.as_str().ptr()
+    }
+
+    fn length(&self) -> Option<ffi::idx_t> {
+        self.as_str().length()
+    }
+}
+
+impl<T: AsRaw> HasPtr for T {
+    type Ptr = T::Raw;
+
+    fn ptr(&self) -> Self::Ptr {
+        self.raw()
+    }
+}
+
+/// Borrow items as the C API's parallel pointer and length arrays; both are null when empty.
+///
+/// Handles fill only the pointer array, so [`Self::lengths`] stays null for them.
+pub(crate) struct DecomposedArrays<'a, T: HasPtr + ?Sized> {
+    ptrs: Vec<T::Ptr>,
+    child_lengths: Vec<ffi::idx_t>,
+    _items: PhantomData<&'a T>,
+}
+
+impl<'a, T: HasPtr + ?Sized + 'a> DecomposedArrays<'a, T> {
+    pub(crate) fn new(items: impl IntoIterator<Item = &'a T>) -> Self {
+        let mut ptrs = Vec::new();
+        let mut child_lengths = Vec::new();
+        for item in items {
+            ptrs.push(item.ptr());
+            child_lengths.extend(item.length());
+        }
+        DecomposedArrays {
+            ptrs,
+            child_lengths,
+            _items: PhantomData,
         }
     }
 
-    /// Return the string, or `None` for a null pointer with nonzero length.
-    ///
-    /// Only for text DuckDB produces; use [`Self::to_string_lossy`] for paths from the OS.
-    pub(crate) fn as_str(&self) -> Option<&'a str> {
-        let bytes = self.as_bytes()?;
-        // SAFETY: the C API returns UTF-8 text.
-        Some(unsafe { std::str::from_utf8_unchecked(bytes) })
-    }
-
-    /// Replace invalid UTF-8, or return `None` for a null pointer with nonzero length.
-    pub(crate) fn to_string_lossy(self) -> Option<Cow<'a, str>> {
-        self.as_bytes().map(String::from_utf8_lossy)
-    }
-
-    /// Return the bytes, or `None` for a null pointer with nonzero length.
-    pub(crate) fn as_bytes(&self) -> Option<&'a [u8]> {
-        if self.raw.len == 0 {
-            return Some(&[]);
+    pub(crate) fn ptrs(&self) -> *const T::Ptr {
+        if self.ptrs.is_empty() {
+            std::ptr::null()
+        } else {
+            self.ptrs.as_ptr()
         }
-        if self.raw.ptr.is_null() {
-            return None;
+    }
+
+    pub(crate) fn child_lengths(&self) -> *const ffi::idx_t {
+        if self.child_lengths.is_empty() {
+            std::ptr::null()
+        } else {
+            self.child_lengths.as_ptr()
         }
-        // SAFETY: `from_raw` requires `len` bytes valid for `'a`.
-        Some(unsafe { std::slice::from_raw_parts(self.raw.ptr.cast(), self.raw.len as usize) })
     }
-}
 
-impl From<DuckDBStr<'_>> for Option<String> {
-    fn from(value: DuckDBStr<'_>) -> Self {
-        value.as_str().map(str::to_owned)
-    }
-}
-
-impl<'a> From<&'a str> for DuckDBStr<'a> {
-    fn from(value: &str) -> Self {
-        DuckDBStr::from_raw(ffi::duckdb_v2_str {
-            ptr: value.as_ptr().cast(),
-            len: value.len() as ffi::idx_t,
-        })
-    }
-}
-
-impl<'a> From<&'a String> for DuckDBStr<'a> {
-    fn from(value: &String) -> Self {
-        DuckDBStr::from_raw(ffi::duckdb_v2_str {
-            ptr: value.as_ptr().cast(),
-            len: value.len() as ffi::idx_t,
-        })
-    }
-}
-
-/// Build a C string argument from bytes that need not be UTF-8, e.g. BLOB data.
-pub(crate) fn bytes_arg(bytes: &[u8]) -> ffi::duckdb_v2_str {
-    ffi::duckdb_v2_str {
-        ptr: bytes.as_ptr().cast(),
-        len: bytes.len() as ffi::idx_t,
+    pub(crate) fn len(&self) -> ffi::idx_t {
+        self.ptrs.len() as ffi::idx_t
     }
 }
 
@@ -100,17 +135,51 @@ pub(crate) fn bytes_view(value: &ffi::duckdb_v2_bytes) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
-    use super::DuckDBStr;
-    use crate::ffi;
+    use super::{DecomposedArrays, bytes_from_tuple};
+    use crate::{
+        AsRaw, ToValue,
+        environment::{Environment, StorageLocation},
+    };
 
     #[test]
-    fn canonical_empty_view_is_empty() {
-        let text = DuckDBStr::from_raw(ffi::duckdb_v2_str {
-            ptr: std::ptr::null(),
-            len: 0,
-        });
-        assert_eq!(text.as_bytes(), Some(b"".as_slice()));
-        assert_eq!(text.as_str(), Some(""));
-        assert_eq!(text.to_string_lossy().as_deref(), Some(""));
+    fn null_tuple_is_empty() {
+        assert_eq!(bytes_from_tuple((std::ptr::null(), 0)), b"");
+        assert_eq!(bytes_from_tuple((std::ptr::null(), 5)), b"");
+        assert_eq!(crate::str_from_tuple((std::ptr::null(), 0)), "");
+    }
+
+    #[test]
+    fn decomposed_arrays_split_strings() {
+        let strings = ["ab", "", "cde"];
+        let arrays = DecomposedArrays::new(&strings);
+        assert_eq!(arrays.len(), 3);
+        // SAFETY: both arrays hold `len` entries borrowed from `strings`.
+        let (ptrs, lengths) = unsafe {
+            (
+                std::slice::from_raw_parts(arrays.ptrs(), 3),
+                std::slice::from_raw_parts(arrays.child_lengths(), 3),
+            )
+        };
+        assert_eq!(lengths, [2, 0, 3]);
+        assert_eq!(ptrs[2], strings[2].as_ptr().cast());
+
+        let empty = DecomposedArrays::new(&[] as &[&str]);
+        assert!(empty.ptrs().is_null());
+        assert!(empty.child_lengths().is_null());
+        assert_eq!(empty.len(), 0);
+    }
+
+    #[test]
+    fn decomposed_arrays_take_handles() -> crate::Result<()> {
+        let conn = Environment::new()?.open(StorageLocation::InMemory)?.connect()?;
+        let values = [1_i32.value(&conn)?, 2_i32.value(&conn)?];
+        let arrays = DecomposedArrays::new(&values);
+        assert_eq!(arrays.len(), 2);
+        assert!(arrays.child_lengths().is_null());
+        // SAFETY: the pointer array holds `len` handles borrowed from `values`.
+        let ptrs = unsafe { std::slice::from_raw_parts(arrays.ptrs(), 2) };
+        // SAFETY: the handles are only compared.
+        assert_eq!(ptrs, unsafe { [values[0].get_raw(), values[1].get_raw()] });
+        Ok(())
     }
 }

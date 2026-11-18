@@ -10,34 +10,27 @@ use crate::{
     check_api_call,
     error::Error,
     ffi,
-    ffi_str::DuckDBStr,
     links::{FileSystemLink, InstanceKeepAlive, KeepAlive},
     raw::RawExt,
+    string_from_tuple,
     value::Value,
 };
 
 unsafe extern "C" fn copy_glob_callback(
-    text: *const ffi::duckdb_v2_str,
+    text: *const std::os::raw::c_char,
+    text_length: ffi::idx_t,
     user_data: *mut std::os::raw::c_void,
     err: *mut ffi::duckdb_v2_error_info_handle,
 ) {
     handle_unwind(
         || {
-            if text.is_null() || user_data.is_null() {
+            if user_data.is_null() {
                 return Err(Error::api_error("NULL value in copy_glob_callback"));
             }
 
             // SAFETY: glob passes its live, exclusively borrowed output Vec as user_data.
             let items = unsafe { &mut *(user_data as *mut Vec<String>) };
-            // SAFETY: DuckDB passes a live string descriptor for the duration of the callback.
-            let text = unsafe { *text };
-
-            items.push(
-                DuckDBStr::from_raw(text)
-                    .to_string_lossy()
-                    .unwrap_or_default()
-                    .into_owned(),
-            );
+            items.push(string_from_tuple((text, text_length)));
 
             Ok(())
         },
@@ -46,22 +39,19 @@ unsafe extern "C" fn copy_glob_callback(
 }
 
 unsafe extern "C" fn copy_path_callback(
-    text: *const ffi::duckdb_v2_str,
+    text: *const std::os::raw::c_char,
+    text_length: ffi::idx_t,
     user_data: *mut std::os::raw::c_void,
     err: *mut ffi::duckdb_v2_error_info_handle,
 ) {
     handle_unwind(
         || {
-            if text.is_null() || user_data.is_null() {
+            if user_data.is_null() {
                 return Err(Error::api_error("NULL value in copy_path_callback"));
             }
 
             let string = unsafe { &mut *(user_data as *mut String) };
-            string.push_str(
-                &DuckDBStr::from_raw(unsafe { *text })
-                    .to_string_lossy()
-                    .unwrap_or_default(),
-            );
+            string.push_str(&string_from_tuple((text, text_length)));
 
             Ok(())
         },
@@ -93,12 +83,24 @@ impl<'link> FileSystem<'link> {
 
     /// Whether a file exists at `path`; directories return false.
     pub fn exists(&self, path: &str) -> Result<bool> {
-        check_api_call!(ffi::duckdb_v2_file_system_path_exists, self.raw(), &path.into(), RET)
+        check_api_call!(
+            ffi::duckdb_v2_file_system_path_exists,
+            self.raw(),
+            path.as_ptr().cast(),
+            path.len() as u64,
+            RET
+        )
     }
 
     /// Whether `path` names a remote file, determined without opening it or loading extensions.
     pub fn is_remote(&self, path: &str) -> Result<bool> {
-        check_api_call!(ffi::duckdb_v2_file_system_path_is_remote, self.raw(), &path.into(), RET)
+        check_api_call!(
+            ffi::duckdb_v2_file_system_path_is_remote,
+            self.raw(),
+            path.as_ptr().cast(),
+            path.len() as u64,
+            RET
+        )
     }
 
     /// Move a file within one file system; replacement and atomicity depend on that file system.
@@ -106,14 +108,22 @@ impl<'link> FileSystem<'link> {
         check_api_call!(
             ffi::duckdb_v2_file_system_path_move,
             self.raw(),
-            &from.into(),
-            &to.into(),
+            from.as_ptr().cast(),
+            from.len() as u64,
+            to.as_ptr().cast(),
+            to.len() as u64,
         )
     }
 
     /// Remove a file, returning false if it does not exist.
     pub fn remove(&self, path: &str) -> Result<bool> {
-        check_api_call!(ffi::duckdb_v2_file_system_path_remove, self.raw(), &path.into(), RET)
+        check_api_call!(
+            ffi::duckdb_v2_file_system_path_remove,
+            self.raw(),
+            path.as_ptr().cast(),
+            path.len() as u64,
+            RET
+        )
     }
 
     /// Expand a path, replacing a leading `~` with the configured home directory.
@@ -123,7 +133,8 @@ impl<'link> FileSystem<'link> {
         check_api_call!(
             ffi::duckdb_v2_file_system_path_expand,
             self.raw(),
-            &path.into(),
+            path.as_ptr().cast(),
+            path.len() as u64,
             Some(copy_path_callback),
             &mut string as *mut String as *mut std::os::raw::c_void
         )?;
@@ -138,7 +149,8 @@ impl<'link> FileSystem<'link> {
         check_api_call!(
             ffi::duckdb_v2_file_system_path_glob,
             self.raw(),
-            &path.into(),
+            path.as_ptr().cast(),
+            path.len() as u64,
             Some(copy_glob_callback),
             &mut items as *mut Vec<String> as *mut std::os::raw::c_void
         )?;
@@ -233,7 +245,8 @@ impl<'link> FileBuilder<'link> {
         check_api_call!(
             ffi::duckdb_v2_file_open_options_set_value,
             self.handle,
-            &name.into(),
+            name.as_ptr().cast(),
+            name.len() as u64,
             value.raw()
         )?;
         Ok(self)
@@ -303,7 +316,15 @@ impl File {
         path: &str,
         options: ffi::duckdb_v2_file_open_options_handle,
     ) -> crate::Result<Self> {
-        check_api_call!(ffi::duckdb_v2_file_system_open, fs.handle, &path.into(), options, RET).map(|handle| File {
+        check_api_call!(
+            ffi::duckdb_v2_file_system_open,
+            fs.handle,
+            path.as_ptr().cast(),
+            path.len() as u64,
+            options,
+            RET
+        )
+        .map(|handle| File {
             handle,
             _instance: fs.instance.clone(),
         })
@@ -713,8 +734,8 @@ mod tests {
         };
         assert_ne!(code, ffi::DUCKDB_V2_ERROR::DUCKDB_V2_ERROR_NONE);
         assert!(!error.is_null());
-        // SAFETY: the callback rejects null inputs before dereferencing them; error is live.
-        unsafe { super::copy_glob_callback(std::ptr::null(), std::ptr::null_mut(), &mut error) };
+        // SAFETY: the callback rejects null user data before dereferencing it; error is live.
+        unsafe { super::copy_glob_callback(std::ptr::null(), 0, std::ptr::null_mut(), &mut error) };
         let mut code = ffi::DUCKDB_V2_ERROR::DUCKDB_V2_ERROR_NONE;
         check_api_call_no_err!(ffi::duckdb_v2_error_info_get_code, error, &mut code)?;
         assert_eq!(code, ffi::DUCKDB_V2_ERROR::DUCKDB_V2_ERROR_API);

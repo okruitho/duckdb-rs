@@ -1,8 +1,10 @@
 //! Qualified names for catalog objects.
 
 use crate::ffi;
-use crate::ffi_str::DuckDBStr;
-use crate::{AsRaw, DropHandle, FromRaw, Result, check_api_call, check_api_call_string, error::Error};
+use crate::ffi_str::DecomposedArrays;
+use crate::{
+    AsRaw, DropHandle, FromRaw, Result, check_api_call, check_api_call_string, error::Error, string_from_tuple,
+};
 
 /// Owned identifier parts extracted positionally from a [`QualifiedName`].
 #[derive(Debug)]
@@ -53,16 +55,23 @@ impl QualifiedName {
     /// Parse dot-separated parts; double-quoted parts support dots and doubled quotes, unlike unquoted parts.
     /// Spaces/keywords need no quotes; malformed quoting, zero/empty parts, or over three parts return errors.
     pub fn from_sql(sql: &str) -> Result<Self> {
-        check_api_call!(ffi::duckdb_v2_qname_parse, &sql.into(), RET).map(|handle| QualifiedName { handle })
+        check_api_call!(ffi::duckdb_v2_qname_parse, sql.as_ptr().cast(), sql.len() as u64, RET)
+            .map(|handle| QualifiedName { handle })
     }
 
     /// Create a name from identifier parts, outermost first, with the object name last.
     /// Returns an error for zero parts, more than three parts, or any empty part.
     pub fn from_parts(parts: &[&str]) -> Result<Self> {
-        let parts: Vec<ffi::duckdb_v2_str> = parts.iter().map(|s| (*s).into()).collect();
+        let parts = DecomposedArrays::new(parts);
 
-        check_api_call!(ffi::duckdb_v2_qname_create, parts.as_ptr(), parts.len() as u64, RET)
-            .map(|handle| QualifiedName { handle })
+        check_api_call!(
+            ffi::duckdb_v2_qname_create,
+            parts.ptrs().cast_mut(),
+            parts.child_lengths(),
+            parts.len(),
+            RET
+        )
+        .map(|handle| QualifiedName { handle })
     }
 
     /// Return a hash suitable for in-process lookup.
@@ -107,8 +116,7 @@ impl QualifiedName {
     /// Parts are ordered outermost first. An out-of-range index returns an
     /// error.
     pub fn part(&self, index: usize) -> Result<String> {
-        check_api_call!(ffi::duckdb_v2_qname_get_part, self.handle, index as u64, RET)
-            .map(|data| DuckDBStr::from_raw(data).as_str().unwrap_or_default().to_owned())
+        check_api_call!(ffi::duckdb_v2_qname_get_part, self.handle, index as u64, RET, RET_2).map(string_from_tuple)
     }
 
     /// Return all identifier parts, ordered outermost first.

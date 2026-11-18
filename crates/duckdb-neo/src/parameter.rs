@@ -1,4 +1,4 @@
-use crate::{Result, ToValue, connection::FFILink, value::Value};
+use crate::{Result, ToValue, connection::FFILink, ffi, ffi_str::HasPtr, value::Value};
 
 /// A value that can be bound as a positional or named query parameter.
 ///
@@ -34,6 +34,14 @@ impl ParameterValue<'_> {
             ParameterValue::Borrowed(value) => value,
             ParameterValue::Owned(value) => value,
         }
+    }
+}
+
+impl HasPtr for ParameterValue<'_> {
+    type Ptr = ffi::duckdb_v2_value_handle;
+
+    fn ptr(&self) -> Self::Ptr {
+        self.as_value().ptr()
     }
 }
 

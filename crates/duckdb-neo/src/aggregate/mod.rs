@@ -449,7 +449,8 @@ impl<T: AggregateCallbacks> AggregateFunctionBuilder<T> {
         check_api_call!(
             ffi::duckdb_v2_aggregate_function_set_name,
             handle.raw(),
-            &mut (&self.name).into()
+            self.name.as_ptr().cast(),
+            self.name.len() as u64
         )?;
 
         let signature = check_api_call!(ffi::duckdb_v2_aggregate_function_get_signature, handle.raw(), RET)?;
