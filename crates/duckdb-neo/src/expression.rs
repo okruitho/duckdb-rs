@@ -1,7 +1,12 @@
 //! Read-only introspection of bound expression trees.
 
-use crate::ffi;
+use duckdb_loadable_macros::AsRaw;
 
+use crate::connection::Context;
+use crate::{FromRaw, ffi};
+
+use crate::raw::RawExt;
+use crate::stats::Stats;
 use crate::string_from_tuple;
 use crate::{
     Result, builder_helpers::ffi_enum_redeclaration, cast::CastMode, check_api_call, logical_type::LogicalType,
@@ -63,11 +68,26 @@ ffi_enum_redeclaration! {
     }
 }
 
+ffi_enum_redeclaration! {
+    pub enum FilterPropagateResult <- ffi::DUCKDB_V2_FILTER_PROPAGATE_RESULT {
+    /// Statistics cannot prune any rows.
+    NoPruningPossible = DUCKDB_V2_FILTER_PROPAGATE_RESULT_NO_PRUNING_POSSIBLE,
+    /// Every row passes the predicate.
+    AlwaysTrue = DUCKDB_V2_FILTER_PROPAGATE_RESULT_ALWAYS_TRUE,
+    /// No row passes the predicate.
+    AlwaysFalse = DUCKDB_V2_FILTER_PROPAGATE_RESULT_ALWAYS_FALSE,
+    /// Every row passes the predicate or evaluates it to `NULL`.
+    TrueOrNull = DUCKDB_V2_FILTER_PROPAGATE_RESULT_TRUE_OR_NULL,
+    /// No row passes the predicate: each evaluates to false or to `NULL`.
+    FalseOrNull = DUCKDB_V2_FILTER_PROPAGATE_RESULT_FALSE_OR_NULL,
+    }
+}
+
 /// A borrowed node in DuckDB's bound expression tree.
 ///
 /// The lifetime ties the node and its children to the callback data that
 /// exposes them.
-#[derive(Debug)]
+#[derive(Debug, AsRaw)]
 pub struct Expression<'a> {
     /// The borrowed DuckDB expression handle.
     pub(crate) handle: ffi::duckdb_v2_expression_handle,
@@ -82,6 +102,17 @@ impl<'a> Expression<'a> {
             handle,
             _marker: std::marker::PhantomData,
         })
+    }
+
+    pub fn stats(&self, context: &Context, stats: Stats<'_>) -> Result<FilterPropagateResult> {
+        check_api_call!(
+            ffi::duckdb_v2_expression_check_statistics,
+            context.raw(),
+            self.raw(),
+            stats.raw(),
+            RET
+        )?
+        .try_into()
     }
 
     /// Return the number of child expressions.

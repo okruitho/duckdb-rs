@@ -2,7 +2,7 @@ use std::{
     num::NonZeroUsize,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -15,11 +15,13 @@ use crate::{
     error::Error,
     expression::ExpressionType,
     logical_type::LogicalTypeID,
+    metrics::QueryMetricsNode,
     signature::{FunctionParameter, SignatureBuilder},
     table_function::{
-        BindFunctionHandle, ExecColumnInfo, InitColumnData, OrderPreservation, PartitionData, PartitioningData,
-        PushdownData, TableClaimBatchCallbacks, TableFilterPushdownCallbacks, TableFunctionBuilder,
-        TableFunctionCallbacks, TablePartitionInfo, TablePartitioningCallbacks, TableStatsCallbacks,
+        BindFunctionHandle, ExecColumnInfo, InitColumnData, MetricsData, OrderPreservation, PartitionData,
+        PartitioningData, PushdownData, ScanMetric, TableClaimBatchCallbacks, TableFilterPushdownCallbacks,
+        TableFunctionBuilder, TableFunctionCallbacks, TableMetricsCallbacks, TablePartitionInfo,
+        TablePartitioningCallbacks, TableStatsCallbacks,
     },
     types::HugeInt,
 };
@@ -1054,5 +1056,168 @@ fn test_table_function_stats_callback() -> Result<()> {
     seen_columns.sort_unstable();
     seen_columns.dedup();
     assert_eq!(seen_columns, [0, 1]);
+    Ok(())
+}
+
+#[test]
+fn test_table_function_metrics_callback() -> Result<()> {
+    const ROWS: usize = 10_000;
+    const ROW_GROUP_SIZE: usize = 1_000;
+
+    #[derive(Default)]
+    struct ScanCounters {
+        next_row: AtomicUsize,
+        rows: AtomicU64,
+        row_groups: AtomicU64,
+        bytes: AtomicU64,
+    }
+
+    struct MetricScan {
+        reports: Arc<AtomicUsize>,
+    }
+
+    impl TableFunctionCallbacks for MetricScan {
+        type BindData = usize;
+        type GlobalState = ScanCounters;
+        type LocalState = ();
+
+        fn bind(
+            &self,
+            context: &Context,
+            arguments: Vec<BindArgument>,
+            bind_handle: BindFunctionHandle<'_>,
+        ) -> Result<usize> {
+            bind_handle.add_result_column("i", &i64::logical_type(context)?)?;
+            Ok(arguments[0].value.as_ref().unwrap().get::<i32>()?.unwrap() as usize)
+        }
+
+        fn init_global_state(&self, _: &Context, _: &usize, _: InitColumnData<'_>) -> Result<Option<ScanCounters>> {
+            Ok(Some(ScanCounters::default()))
+        }
+
+        fn max_threads(
+            &self,
+            _: &Context,
+            _: &usize,
+            _: Option<&ScanCounters>,
+            _: InitColumnData<'_>,
+        ) -> Result<Option<NonZeroUsize>> {
+            Ok(NonZeroUsize::new(4))
+        }
+
+        fn exec(
+            &self,
+            _: &Context,
+            rows: &usize,
+            _: Option<&mut ()>,
+            global_state: Option<&ScanCounters>,
+            mut output: DataChunkRef<'_>,
+            _: ExecColumnInfo<'_>,
+        ) -> Result<()> {
+            let counters = global_state.unwrap();
+            let start = counters.next_row.fetch_add(ROW_GROUP_SIZE, Ordering::SeqCst);
+            let count = rows.saturating_sub(start).min(ROW_GROUP_SIZE);
+            let mut vector = output.get_vector_at_mut::<i64>(0)?;
+            vector.set_size(count)?;
+            for row in 0..count {
+                vector.writer()?.set(row, &((start + row) as i64))?;
+            }
+            if count > 0 {
+                counters.rows.fetch_add(count as u64, Ordering::SeqCst);
+                counters.row_groups.fetch_add(1, Ordering::SeqCst);
+                counters
+                    .bytes
+                    .fetch_add((count * size_of::<i64>()) as u64, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
+    impl TableMetricsCallbacks for MetricScan {
+        fn metrics(
+            &self,
+            _: &Context,
+            rows: &usize,
+            global_state: Option<&ScanCounters>,
+            metrics: MetricsData<'_>,
+        ) -> Result<()> {
+            self.reports.fetch_add(1, Ordering::SeqCst);
+            let Some(counters) = global_state else {
+                return Ok(());
+            };
+            metrics.set(ScanMetric::RowsScanned, counters.rows.swap(0, Ordering::SeqCst))?;
+            metrics.set(
+                ScanMetric::RowGroupsScanned,
+                counters.row_groups.swap(0, Ordering::SeqCst),
+            )?;
+            metrics.set(ScanMetric::TotalRowGroupsToScan, rows.div_ceil(ROW_GROUP_SIZE) as u64)?;
+            metrics.set(ScanMetric::BytesScanned, counters.bytes.swap(0, Ordering::SeqCst))
+        }
+    }
+
+    fn find_operator<'a>(node: QueryMetricsNode<'a>, name: &str) -> Result<Option<QueryMetricsNode<'a>>> {
+        for index in 0..node.child_count()? {
+            let child = node.child(index)?;
+            if child.name()? == name {
+                return Ok(Some(child));
+            }
+            if let Some(found) = find_operator(child, name)? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    let env = Environment::new()?;
+    let conn = env.open(StorageLocation::InMemory)?.connect()?;
+    conn.config()?.set_text("threads", "4", SettingScope::Default)?;
+    let reports = Arc::new(AtomicUsize::new(0));
+    TableFunctionBuilder::new(
+        "metric_scan",
+        SignatureBuilder::new().param(FunctionParameter::new::<i32>("rows")),
+        MetricScan {
+            reports: reports.clone(),
+        },
+    )
+    .with_metrics()
+    .register(&conn)?;
+
+    let metrics = [
+        ScanMetric::RowsScanned,
+        ScanMetric::RowGroupsScanned,
+        ScanMetric::TotalRowGroupsToScan,
+        ScanMetric::BytesScanned,
+    ];
+    let tracked = metrics.map(|metric| format!("'{}'", metric.name())).join(", ");
+    conn.execute(format!("SET tracked_metrics = [{tracked}]"), Parameters::None)?;
+    conn.config()?
+        .set_text("enable_profiling", "no_output", SettingScope::Session)?;
+    conn.set_profiling(true)?;
+
+    let mut result = conn.query(format!("SELECT count(*) FROM metric_scan({ROWS})"), Parameters::None)?;
+    let chunk = result.next_chunk()?.unwrap();
+    assert_eq!(
+        chunk.get_vector_at::<i64>(0)?.reader()?.get(0)?.copied(),
+        Some(ROWS as i64)
+    );
+    drop(chunk);
+    drop(result);
+    assert!(reports.load(Ordering::SeqCst) > 0);
+
+    let query_metrics = conn.query_metrics()?;
+    let scan = find_operator(query_metrics.root()?, "TABLE_SCAN")?.expect("TABLE_SCAN node");
+    let reported = metrics.map(|metric| {
+        scan.get_by_name(metric.name())
+            .unwrap()
+            .unwrap_or_else(|| panic!("{} missing", metric.name()))
+            .get::<u64>()
+            .unwrap()
+            .unwrap()
+    });
+    let row_groups = ROWS.div_ceil(ROW_GROUP_SIZE) as u64;
+    assert_eq!(
+        reported,
+        [ROWS as u64, row_groups, row_groups, (ROWS * size_of::<i64>()) as u64]
+    );
     Ok(())
 }

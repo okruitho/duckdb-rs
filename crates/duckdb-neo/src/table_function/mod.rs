@@ -7,7 +7,9 @@
 //! help DuckDB optimize query plans and track execution. Functions that can
 //! apply the query's filters themselves implement
 //! [`TableFilterPushdownCallbacks`] on top, and functions that can describe the
-//! batches they produce implement [`TablePartitioningCallbacks`]. Readers wrapped
+//! batches they produce implement [`TablePartitioningCallbacks`]. Scans that
+//! track what they read can report it to the profiler through
+//! [`TableMetricsCallbacks`]. Readers wrapped
 //! by a [`MultiFileFunctionBuilder`](crate::multi_file::MultiFileFunctionBuilder)
 //! can also implement [`TableGetBindInfoCallbacks`] and [`TableClaimBatchCallbacks`].
 
@@ -400,6 +402,76 @@ fn stats_callback<T: TableStatsCallbacks>(
     T::stats(user_data, context, bind_data, &stats, column_index)
 }
 
+/// An operator metric a scan can report through [`MetricsData::set`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScanMetric {
+    /// `operator.rows_scanned`: the rows the scan read.
+    RowsScanned,
+    /// `operator.row_groups_scanned`: the row groups the scan read.
+    ///
+    /// A row group is the unit a format lets the scan skip, e.g. a Parquet row
+    /// group or an ORC stripe.
+    RowGroupsScanned,
+    /// `operator.total_row_groups_to_scan`: the row groups the scan read or skipped.
+    ///
+    /// Unlike the other metrics, this is the total found so far, not the amount
+    /// since the last report.
+    TotalRowGroupsToScan,
+    /// `operator.bytes_scanned`: the bytes the scan read.
+    BytesScanned,
+}
+
+impl ScanMetric {
+    /// Return the name DuckDB's profiler uses for the metric, as accepted by `tracked_metrics`.
+    pub fn name(self) -> &'static str {
+        match self {
+            ScanMetric::RowsScanned => "operator.rows_scanned",
+            ScanMetric::RowGroupsScanned => "operator.row_groups_scanned",
+            ScanMetric::TotalRowGroupsToScan => "operator.total_row_groups_to_scan",
+            ScanMetric::BytesScanned => "operator.bytes_scanned",
+        }
+    }
+}
+
+/// Callback-scoped sink for the operator metrics of a scan.
+#[derive(Debug)]
+pub struct MetricsData<'a> {
+    handle: &'a ffi::duckdb_v2_table_function_metrics_info_handle,
+}
+
+impl<'a> MetricsData<'a> {
+    /// Report `value` for `metric`. DuckDB adds up what each collection reports,
+    /// so pass the amount since the last report, except for [`ScanMetric::TotalRowGroupsToScan`].
+    pub fn set(&self, metric: ScanMetric, value: u64) -> Result<()> {
+        let name = metric.name();
+        check_api_call!(
+            ffi::duckdb_v2_table_function_metrics_set,
+            *self.handle,
+            name.as_ptr().cast(),
+            name.len() as u64,
+            value
+        )
+    }
+}
+
+fn metrics_callback<T: TableMetricsCallbacks>(
+    context: &Context,
+    info: ffi::duckdb_v2_table_function_metrics_info_handle,
+) -> Result<()> {
+    let user_data = get_user_data!(ffi::duckdb_v2_table_function_metrics_get_user_data, info);
+    let bind_data = get_bind_data!(ffi::duckdb_v2_table_function_metrics_get_bind_data, info)
+        .ok_or_else(|| Error::api_error("Table function bind data not set"))?;
+    let global_state = get_global_state!(ffi::duckdb_v2_table_function_metrics_get_global_state, info);
+
+    T::metrics(
+        user_data,
+        context,
+        bind_data,
+        global_state,
+        MetricsData { handle: &info },
+    )
+}
+
 ffi_enum_redeclaration! {
     /// Whether, and how, a scan's partitions line up with a set of columns.
     ///
@@ -572,6 +644,7 @@ pub struct TableFunctionBuilder<T: TableFunctionCallbacks> {
     partition_data_callback: ffi::duckdb_v2_table_function_partition_data_callback_fn,
     partitioning_callback: ffi::duckdb_v2_table_function_partitioning_callback_fn,
     stats_callback: ffi::duckdb_v2_table_function_stats_callback_fn,
+    metrics_callback: ffi::duckdb_v2_table_function_metrics_callback_fn,
     claim_batch_callback: ffi::duckdb_v2_table_function_claim_batch_callback_fn,
     get_bind_info_callback: ffi::duckdb_v2_table_function_get_bind_info_callback_fn,
 }
@@ -646,6 +719,18 @@ impl<T: TableStatsCallbacks> TableFunctionBuilder<T> {
     }
 }
 
+impl<T: TableMetricsCallbacks> TableFunctionBuilder<T> {
+    /// Report scan metrics to the profiler through [`TableMetricsCallbacks::metrics`].
+    pub fn with_metrics(mut self) -> Self {
+        self.metrics_callback = callback_trampoline! {
+            T = TableMetricsCallbacks,
+            args = (info: ffi::duckdb_v2_table_function_metrics_info_handle),
+            exec = metrics_callback,
+        };
+        self
+    }
+}
+
 impl<T: TableFunctionCallbacks> TableFunctionBuilder<T> {
     /// Create a builder from a name, signature, and callback implementation.
     pub fn new(name: &str, signature: SignatureBuilder, implementation: T) -> Self {
@@ -660,6 +745,7 @@ impl<T: TableFunctionCallbacks> TableFunctionBuilder<T> {
             partitioning_callback: None,
             claim_batch_callback: None,
             stats_callback: None,
+            metrics_callback: None,
             get_bind_info_callback: None,
         }
     }
@@ -785,6 +871,14 @@ impl<T: TableFunctionCallbacks> TableFunctionBuilder<T> {
                 ffi::duckdb_v2_table_function_set_stats_callback,
                 handle.raw(),
                 self.stats_callback
+            )?;
+        }
+
+        if self.metrics_callback.is_some() {
+            check_api_call!(
+                ffi::duckdb_v2_table_function_set_metrics_callback,
+                handle.raw(),
+                self.metrics_callback
             )?;
         }
 
@@ -1056,6 +1150,26 @@ pub trait TableStatsCallbacks: TableFunctionCallbacks {
         bind_data: &Self::BindData,
         stats: &Stats<'_>,
         column_index: usize,
+    ) -> Result<()>;
+}
+
+/// Reports what a table function's scan did to DuckDB's profiler.
+///
+/// Enable the callback with [`TableFunctionBuilder::with_metrics`]; it is
+/// ignored, and never registered, without it. DuckDB calls it when it collects
+/// the scan's metrics, e.g. with profiling enabled: once from every thread that
+/// scanned, as that thread finishes. It can therefore run while other threads
+/// still scan or report, so keep the counters in the global state in atomics
+/// and read them with an exchange, so that each amount is reported once.
+pub trait TableMetricsCallbacks: TableFunctionCallbacks {
+    /// **Metrics:** report the scan's metrics through `metrics`.
+    /// `global_state` is `None` when the scan was never initialized or set no state.
+    fn metrics(
+        &self,
+        context: &Context,
+        bind_data: &Self::BindData,
+        global_state: Option<&Self::GlobalState>,
+        metrics: MetricsData<'_>,
     ) -> Result<()>;
 }
 
