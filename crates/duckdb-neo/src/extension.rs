@@ -40,7 +40,7 @@ impl FFILink for Extension {}
 #[doc(hidden)]
 pub unsafe fn run_extension_entrypoint(
     input: *const ffi::duckdb_v2_extension_input,
-    version: &str,
+    version: &'static std::ffi::CStr,
     body: impl FnOnce(&Extension) -> std::result::Result<(), Box<dyn std::error::Error>>,
 ) {
     use crate::{FromRaw, error::Error};
@@ -51,6 +51,7 @@ pub unsafe fn run_extension_entrypoint(
     };
 
     // Without the vtable nothing can be called, not even the error setters; DuckDB reports the refusal itself.
+    // Nothing may allocate before this either, since a global allocator backed by DuckDB needs the vtable.
     // SAFETY: `input` comes straight from DuckDB.
     if !unsafe { init_extension_api(input, version) } {
         return;
@@ -72,7 +73,7 @@ pub unsafe fn run_extension_entrypoint(
 }
 
 #[cfg(feature = "build-extension")]
-unsafe fn init_extension_api(input: &ffi::duckdb_v2_extension_input, version: &str) -> bool {
+unsafe fn init_extension_api(input: &ffi::duckdb_v2_extension_input, version: &std::ffi::CStr) -> bool {
     // SAFETY: the caller passes DuckDB's entrypoint input.
     matches!(
         unsafe { ffi::duckdb_rs_extension_api_v2_init(input, version) },
@@ -81,7 +82,7 @@ unsafe fn init_extension_api(input: &ffi::duckdb_v2_extension_input, version: &s
 }
 
 #[cfg(feature = "build-extension-static")]
-unsafe fn init_extension_api(input: &ffi::duckdb_v2_extension_input, _version: &str) -> bool {
+unsafe fn init_extension_api(input: &ffi::duckdb_v2_extension_input, _version: &std::ffi::CStr) -> bool {
     // Calls bind to DuckDB at link time, so a vtable from a dynamic load is of no use: DuckDB then refuses the load
     // because get_api was never called.
     input.get_api.is_none()

@@ -8,7 +8,7 @@ type Result<T> = std::result::Result<T, darling::Error>;
 #[derive(Debug, FromMeta)]
 struct EntrypointArgs {
     extension_name: SpannedValue<String>,
-    api_version: String,
+    api_version: SpannedValue<String>,
 }
 
 fn is_valid_extension_name(name: &str) -> bool {
@@ -44,7 +44,10 @@ pub fn parse(meta: TokenStream, ast: Item) -> Result<TokenStream> {
         &format!("duckdb_extension_{extension_name}_describe"),
         Span::call_site(),
     );
-    let version = args.api_version;
+    let version = args.api_version.as_str();
+    if version.contains('\0') {
+        return Err(darling::Error::custom("api_version must not contain NUL").with_span(&args.api_version.span()));
+    }
 
     Ok(quote_spanned! {func.span() =>
         /// # Safety
@@ -52,8 +55,13 @@ pub fn parse(meta: TokenStream, ast: Item) -> Result<TokenStream> {
         #[unsafe(no_mangle)]
         #[allow(clippy::useless_conversion)]
         pub unsafe extern "C" fn #c_entrypoint(input: *mut ::duckdb_neo::ffi::duckdb_v2_extension_input) {
+            const API_VERSION: &::core::ffi::CStr =
+                match ::core::ffi::CStr::from_bytes_with_nul(concat!(#version, "\0").as_bytes()) {
+                    ::core::result::Result::Ok(version) => version,
+                    ::core::result::Result::Err(_) => panic!("api_version must not contain NUL"),
+                };
             unsafe {
-                ::duckdb_neo::extension::run_extension_entrypoint(input, #version, |extension| {
+                ::duckdb_neo::extension::run_extension_entrypoint(input, API_VERSION, |extension| {
                     #func_ident(extension).map_err(::std::convert::Into::into)
                 })
             }
@@ -134,5 +142,18 @@ mod tests {
             ),
         );
         assert!(message.contains("api_version"), "{message}");
+    }
+
+    #[test]
+    fn test_rejects_nul_in_api_version() {
+        let message = error_message(
+            quote!(extension_name = "my_ext", api_version = "v2.0.0\0"),
+            quote!(
+                fn entrypoint(extension: &Extension) -> Result<()> {
+                    Ok(())
+                }
+            ),
+        );
+        assert!(message.contains("api_version must not contain NUL"), "{message}");
     }
 }

@@ -86,13 +86,12 @@ fn generate_functions_v2(mut output: String) -> String {
 
     // (2) generate rust code similar to DUCKDB_EXTENSION_API_INIT macro
     let tokens = quote::quote! {
-        /// Like DUCKDB_EXTENSION_API_INIT macro
-        pub unsafe fn duckdb_rs_extension_api_v2_init(input: &duckdb_v2_extension_input, version: &str) -> ::std::result::Result<bool, &'static str> {
-            let version_c_string = std::ffi::CString::new(version).unwrap();
+        /// Like DUCKDB_EXTENSION_API_INIT macro, without allocating so that a Rust global allocator can call DuckDB.
+        pub unsafe fn duckdb_rs_extension_api_v2_init(input: &duckdb_v2_extension_input, version: &::std::ffi::CStr) -> ::std::result::Result<bool, &'static str> {
             let Some(get_api) = input.get_api else {
                 return Err("get_api is NULL: loadable extensions cannot be statically linked");
             };
-            let #p_api = get_api(input.extension, version_c_string.as_ptr()) as *const duckdb_ext_api_v2;
+            let #p_api = get_api(input.extension, version.as_ptr(), version.count_bytes() as idx_t) as *const duckdb_ext_api_v2;
             if #p_api.is_null() {
                 // get_api returns NULL on a version mismatch; DuckDB has already recorded why
                 return Ok(false);
