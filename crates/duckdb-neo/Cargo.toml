@@ -30,6 +30,7 @@ chrono = ["dep:chrono"]
 r2d2 = ["dep:r2d2"]
 uuid = ["dep:uuid"]
 rust_decimal = ["dep:rust_decimal"]
+global_allocator = []
 
 # Buildtime features
 # Where to find a prebuilt libduckdb. Not needed with `bundled`; opt out with `default-features = false`.

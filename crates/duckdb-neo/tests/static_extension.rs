@@ -3,10 +3,10 @@
 //! The registration is process-wide, so every instance opened by this binary loads the extension.
 #![cfg(feature = "build-extension-static")]
 
-use duckdb_loadable_macros::duckdb_entrypoint_c_api_v2;
 use duckdb_neo::{
     Parameters,
     connection::Connection,
+    duckdb_entrypoint_c_api_v2,
     environment::{Environment, StorageLocation},
     extension::{Extension, register_static_extension},
     scalar::MicroScalar,
