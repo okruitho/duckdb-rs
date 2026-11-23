@@ -56,6 +56,8 @@ pub unsafe fn run_extension_entrypoint(
     if !unsafe { init_extension_api(input, version) } {
         return;
     }
+    #[cfg(feature = "global_allocator")]
+    crate::allocator::global_allocator::register_extension(input.extension);
     let extension = Extension {
         handle: input.extension,
         // SAFETY: the context is borrowed for the duration of the entrypoint, which outlives `extension`.
