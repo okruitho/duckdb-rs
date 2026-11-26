@@ -1,7 +1,7 @@
 # Findings: `scalar_str`
 
-Measured with `run --quick` on the shared machine (smoke-test quality; ratios are Rust / C++). Profiles from
-`perf scalar_str/<case> --rows 100000`, which include the fixture and setup.
+Evidence comes from flat profiles (`perf scalar_str/<case> --rows 100000`, fixture and setup included) taken on a
+busy shared machine; the smoke-test timings only pointed at where to look and are not conclusions.
 
 ## 1. Every `String` / `&str` read validates UTF-8
 
@@ -9,19 +9,14 @@ Measured with `run --quick` on the shared machine (smoke-test quality; ratios ar
 the cost grows with the string length. The C++ API reads `varchar_t` bytes without validating them, and DuckDB
 already guarantees that VARCHAR holds valid UTF-8.
 
-| Case | Rust | C++ | Ratio |
-| --- | --- | --- | --- |
-| `len/long/100000` (200 to 2,000 bytes) | 17.6 ms | 573 µs | 30.7 |
-| `len/in_where/100000` (mixed) | 1.93 ms | 707 µs | 2.73 |
-| `wrap/column_affixes/100000` (three VARCHAR reads per row) | 8.39 ms | 3.85 ms | 2.18 |
-| `len/short/1000000` | 11.4 ms | 7.72 ms | 1.48 |
-| `has_prefix_any/nulls_10/1000000` | 17.5 ms | 12.8 ms | 1.37 |
-| `count_char/column/1000000` | 21.3 ms | 16.4 ms | 1.30 |
-| `first_word/mixed_nulls_10/100000` | 3.38 ms | 2.61 ms | 1.29 |
-
-Profile of `len/long/100000` (Rust): `72.30% core::str::converts::from_utf8`, then `6.47%` for the function's own
-closure. In `wrap/column_affixes/100000` it is `18.43% from_utf8` beside `30.47%` for the closure. The C++
-profile of `len/long` shows no per-byte work at all (`LenExec` at 2.16%).
+- `len/long/100000` (200 to 2,000 bytes per row), Rust: `72.30% core::str::converts::from_utf8`, then `6.47%`
+  for the function's own closure. The C++ profile of the same case has no per-byte work (`LenExec` at 2.16%;
+  the scan dominates).
+- `wrap/column_affixes/100000` (three VARCHAR reads per row), Rust: `18.43% from_utf8` beside `30.47%` for the
+  closure and `4.92% <String as ReadableNativeElement>::get`.
+- The smoke runs showed the same direction wherever VARCHAR is read: long reads most, then the multi-argument
+  functions (`vs_wrap`, `vs_count_char`) and the short-string read-only cases (`vs_len`, `vs_has_prefix_any`,
+  `vs_first_word`).
 
 - Wanted: read a VARCHAR row as `&str` or `&[u8]` without per-read validation, e.g. `vs_len` as
   `value.len()` over the stored bytes.
@@ -55,3 +50,15 @@ but only the C++ API can drop the copy without leaving its safe surface.
 - On the positive side, `VectorWriter::<String>::set_parts` writes `prefix || s || suffix` into one inline slot
   or arena allocation; the C++ API has no multi-part helper, so its `vs_wrap` hand-rolls the same thing with
   `Arena::Allocate`.
+
+## 4. Notes on the C++ side
+
+- `Value::Get<varchar_t>().view()` on a temporary dangles for strings of at most 12 bytes, which live inside the
+  `varchar_t` itself: the first `vs_has_prefix_any` bind split freed memory for short prefix lists and the `check`
+  caught it. duckdb-neo's `resolved_value::<String>()` returns an owned `String`, so it has no such trap.
+- `ScalarExecutor`'s documentation says string functions drive the vectors directly, but `varchar_t` works as an
+  argument and result type when the callable copies results into `result.GetHeap()`; every function here uses
+  the executor that way.
+- The first C++ `vs_upper_ascii` used `if (byte >= 'a' && byte <= 'z') byte -= 32;`, which profiled as a
+  mispredicting scalar loop (47% self time in the lambda on hex input) while Rust's `make_ascii_uppercase` is
+  branch-free. The C++ loop now uses the same branch-free form, which clang vectorizes.
