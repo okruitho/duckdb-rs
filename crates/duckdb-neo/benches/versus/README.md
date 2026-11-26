@@ -158,7 +158,8 @@ python3 scripts/neo_versus.py perf <family/case> --rows N [--lang rust|cpp|both]
 - `check` runs each case at its two smallest row counts in both languages, as a bench run with no warm-up
   and one sample, so the query's errors and `result_rows` surface too.
 - `run` executes each job as `rust, cpp, cpp, rust` per repetition, pinned to one CPU (`--cpu`, default 2)
-  under an exclusive lock on `/tmp/neo-versus.lock`, so concurrent agents do not measure at the same time.
+  under an exclusive lock per CPU (`/tmp/neo-versus.cpu<N>.lock`), so concurrent measurements never share a
+  core. CPUs 2 to 11 are reserved for measurements.
   It reports the median per language, the ratio `rust / cpp`, and a status: `slower` or `faster` when the
   ratio leaves `1 ± --threshold` (default 0.10) and every Rust sample median is on the same side of every
   C++ one, `inconclusive` when they overlap, else `same`. `--rows` replaces each case's row counts,
@@ -167,7 +168,7 @@ python3 scripts/neo_versus.py perf <family/case> --rows N [--lang rust|cpp|both]
 - `perf` records a flat profile (`perf record -F`, no call graph) of `--mode loop` per language for
   `--max-seconds` (default 3), keeps it in `target/neo-versus/perf/`, and prints the top 40 symbols by self
   time with their DSO. The profile includes the fixture and setup, which are small next to 3 seconds.
-- Builds run under `taskset -c 4-31` so a measurement on CPU 2 keeps its core.
+- Builds run under `taskset` on the CPUs above 11, so measurements keep their cores.
 
 ## Findings
 

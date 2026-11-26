@@ -28,7 +28,7 @@ VERSUS_DIR = WORKSPACE_DIR / "crates/duckdb-neo/benches/versus"
 CASES_DIR = VERSUS_DIR / "cases"
 CPP_SOURCE_DIR = VERSUS_DIR / "cpp"
 OUT_DIR = WORKSPACE_DIR / "target/neo-versus"
-LOCK_PATH = Path("/tmp/neo-versus.lock")
+MEASUREMENT_CPUS = range(2, 12)
 CPP_API_FILES = ["duckdb_cpp.hpp", "duckdb_cpp.cpp", "duckdb_cpp_extension.hpp"]
 LANGS = ["rust", "cpp"]
 CASE_KEYS = {
@@ -203,7 +203,7 @@ def runner_args(job: Job, mode: str, tmp: str, options: argparse.Namespace | Non
 
 
 def build_cpus() -> list[str]:
-    cpus = [cpu for cpu in range(4, 32) if cpu in os.sched_getaffinity(0)]
+    cpus = [cpu for cpu in sorted(os.sched_getaffinity(0)) if cpu > MEASUREMENT_CPUS[-1]]
     if not cpus or shutil.which("taskset") is None:
         return []
     return ["taskset", "-c", ",".join(map(str, cpus))]
@@ -390,12 +390,13 @@ def get_runners(args: argparse.Namespace) -> Runners:
 
 
 @contextlib.contextmanager
-def measurement_lock():
-    with open(LOCK_PATH, "a+") as lock:
+def measurement_lock(cpu: int):
+    path = Path(f"/tmp/neo-versus.cpu{cpu}.lock")
+    with open(path, "a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            log(f"waiting for {LOCK_PATH}, another measurement is running")
+            log(f"waiting for {path}, another measurement is running on CPU {cpu}")
             fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             yield
@@ -471,7 +472,7 @@ class Result:
 def bench_job(runners: Runners, job: Job, args: argparse.Namespace) -> Result:
     prefix = ["taskset", "-c", str(args.cpu)]
     outputs: dict[str, list[dict[str, object]]] = {lang: [] for lang in LANGS}
-    with measurement_lock():
+    with measurement_lock(args.cpu):
         for _ in range(args.repetitions):
             for lang in ["rust", "cpp", "cpp", "rust"]:
                 outputs[lang].append(run_runner(runners, lang, job, "bench", args, prefix))
@@ -657,7 +658,7 @@ def command_perf(args: argparse.Namespace) -> int:
             str(args.cpu),
         ]
         log(f"{job.name}: recording {lang} for {args.max_seconds} s")
-        with measurement_lock():
+        with measurement_lock(args.cpu):
             outputs[lang] = [run_runner(runners, lang, job, "loop", args, prefix)]
         report = subprocess.run(
             [
@@ -718,6 +719,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--filter", action="append", default=[], help="substring of family/case (repeatable)"
     )
 
+    default_cpu = int(os.environ.get("NEO_VERSUS_CPU", "2"))
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("build", parents=[build_options], help="build both runners")
@@ -732,7 +734,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run.add_argument("--samples", type=int, help="samples per runner (runner default 30, 10 with --quick)")
     run.add_argument("--max-seconds", type=float, help="sampling time limit per runner (runner default 3)")
     run.add_argument("--threshold", type=float, default=0.10, help="ratio change that counts (default 0.10)")
-    run.add_argument("--cpu", type=int, default=2, help="CPU to pin the runners to (default 2)")
+    run.add_argument("--cpu", type=int, default=default_cpu, help="CPU to pin the runners to (default $NEO_VERSUS_CPU or 2)")
     run.add_argument("--quick", action="store_true", help="10 samples and one repetition")
     run.add_argument("--json", help="write the results as JSON to this file")
     run.add_argument("--markdown", help="append a markdown report to this file")
@@ -742,7 +744,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     perf.add_argument("--rows", help="row count to profile")
     perf.add_argument("--lang", choices=["rust", "cpp", "both"], default="both")
     perf.add_argument("--max-seconds", type=float, default=3.0, help="seconds of --mode loop (default 3)")
-    perf.add_argument("--cpu", type=int, default=2, help="CPU to pin the runner to (default 2)")
+    perf.add_argument("--cpu", type=int, default=default_cpu, help="CPU to pin the runner to (default $NEO_VERSUS_CPU or 2)")
     perf.add_argument("--top", type=int, default=40, help="symbols to print (default 40)")
     perf.add_argument("--no-build", action="store_true", help="use the runners of the last build")
 
