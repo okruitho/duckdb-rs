@@ -545,7 +545,7 @@ def command_check(args: argparse.Namespace) -> int:
     failures = []
     count = 0
     for case in cases:
-        for rows in case.rows[:2]:
+        for rows in case.rows if args.all_rows else case.rows[:2]:
             job = Job(case, rows)
             count += 1
             try:
@@ -721,9 +721,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("build", parents=[build_options], help="build both runners")
-    commands.add_parser(
+    check = commands.add_parser(
         "check", parents=[build_options, runner_options], help="check every case at its two smallest row counts"
     )
+    check.add_argument("--all-rows", action="store_true", help="check every row count of each case")
 
     run = commands.add_parser("run", parents=[build_options, runner_options], help="benchmark the cases")
     run.add_argument("--rows", help="comma-separated row counts, replacing each case's own")
