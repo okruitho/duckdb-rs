@@ -1,0 +1,546 @@
+# vs_* functions over LIST, STRUCT, ARRAY and MAP; see ../rust/scalar_nested.rs for their semantics.
+# Each check counts the rows where a function differs from builtin SQL, plus edge inputs.
+# Short lists hold 0 to 16 elements (about 8), long ones about 1,000.
+
+[[case]]
+name = "list_sum/project"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT CASE WHEN i % 10 = 9 THEN NULL
+       ELSE list_transform(range(i % 17), lambda x: CASE WHEN (x + i) % 7 = 3 THEN NULL ELSE x * 1000003 + i END) END AS l
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_list_sum(l) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_list_sum(l) IS DISTINCT FROM
+                          CASE WHEN l IS NOT NULL THEN coalesce(list_sum(l), 0)::BIGINT END)
+        + (vs_list_sum([9223372036854775807, 1]) IS DISTINCT FROM (-9223372036854775808)::BIGINT)::BIGINT
+        + (vs_list_sum([]::BIGINT[]) IS DISTINCT FROM 0)::BIGINT
+        + (vs_list_sum([NULL, NULL]::BIGINT[]) IS DISTINCT FROM 0)::BIGINT
+        + (vs_list_sum(NULL::BIGINT[]) IS NOT NULL)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "list_sum/no_nulls"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT list_transform(range(i % 17), lambda x: x * 1000003 + i) AS l FROM range({rows}) r(i)"]
+query = "SELECT vs_list_sum(l) FROM t"
+check = "SELECT count(*)::VARCHAR FROM t WHERE vs_list_sum(l) IS DISTINCT FROM coalesce(list_sum(l), 0)::BIGINT"
+expect = "0"
+
+[[case]]
+name = "list_sum/nulls_50"
+rows = [1, 5000, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT CASE WHEN i % 2 = 1 THEN NULL
+       ELSE list_transform(range(i % 17), lambda x: CASE WHEN (x + i) % 2 = 1 THEN NULL ELSE x * 1000003 + i END) END AS l
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_list_sum(l) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_list_sum(l) IS DISTINCT FROM
+                          CASE WHEN l IS NOT NULL THEN coalesce(list_sum(l), 0)::BIGINT END)
+        + (count(*) FILTER (WHERE l IS NULL) <> {rows} // 2)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "list_sum/all_null"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT NULL::BIGINT[] AS l FROM range({rows}) r(i)"]
+query = "SELECT vs_list_sum(l) FROM t"
+check = "SELECT count(*)::VARCHAR FROM t WHERE vs_list_sum(l) IS NOT NULL"
+expect = "0"
+
+[[case]]
+name = "list_sum/long_lists"
+rows = [1, 64, 2048, 10_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT list_transform(range(990 + i % 21), lambda x: CASE WHEN (x + i) % 97 = 5 THEN NULL ELSE x * 1000003 + i END) AS l
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_list_sum(l) FROM t"
+check = "SELECT count(*)::VARCHAR FROM t WHERE vs_list_sum(l) IS DISTINCT FROM coalesce(list_sum(l), 0)::BIGINT"
+expect = "0"
+
+# The filter slices its output, so the function receives a selection of the scanned vector.
+[[case]]
+name = "list_sum/filtered"
+rows = [1, 5000, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, CASE WHEN i % 10 = 9 THEN NULL
+          ELSE list_transform(range(i % 17), lambda x: CASE WHEN (x + i) % 7 = 3 THEN NULL ELSE x * 1000003 + i END) END AS l
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_list_sum(l) FROM t WHERE i % 3 <> 1"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT l, vs_list_sum(l) AS s FROM t WHERE i % 3 <> 1)
+WHERE s IS DISTINCT FROM CASE WHEN l IS NOT NULL THEN coalesce(list_sum(l), 0)::BIGINT END
+"""
+expect = "0"
+
+[[case]]
+name = "list_sum/in_where"
+rows = [1, 5000, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, CASE WHEN i % 10 = 9 THEN NULL
+          ELSE list_transform(range(i % 17), lambda x: CASE WHEN (x + i) % 7 = 3 THEN NULL ELSE x * 1000003 + i END) END AS l
+FROM range({rows}) r(i)
+"""]
+query = "SELECT i FROM t WHERE vs_list_sum(l) > 40000000"
+check = """
+SELECT ((SELECT count(*) FROM t WHERE vs_list_sum(l) > 40000000)
+        - (SELECT count(*) FROM t WHERE l IS NOT NULL AND coalesce(list_sum(l), 0) > 40000000))::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "list_scale/project"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT CASE WHEN i % 10 = 9 THEN NULL
+       ELSE list_transform(range(i % 17), lambda x: CASE WHEN (x + i) % 7 = 3 THEN NULL ELSE x * 1000003 + i END) END AS l,
+       CASE WHEN i % 13 = 5 THEN NULL ELSE i % 5 - 2 END AS k
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_list_scale(l, k) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_list_scale(l, k) IS DISTINCT FROM
+                          CASE WHEN k IS NOT NULL THEN list_transform(l, lambda x: x * k) END)
+        + count(*) FILTER (WHERE vs_list_scale([1, NULL, 3], k) IS DISTINCT FROM
+                            CASE WHEN k IS NOT NULL THEN [k, NULL, 3 * k] END)
+        + (vs_list_scale([4611686018427387904, NULL, -3], 2) IS DISTINCT FROM
+           [(-9223372036854775808)::BIGINT, NULL, -6])::BIGINT
+        + (vs_list_scale([]::BIGINT[], 2) IS DISTINCT FROM []::BIGINT[])::BIGINT
+        + (vs_list_scale([1], NULL) IS NOT NULL)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# A constant `k` reaches the function as a CONSTANT vector.
+[[case]]
+name = "list_scale/constant_k"
+rows = [1, 5000, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT CASE WHEN i % 10 = 9 THEN NULL
+       ELSE list_transform(range(i % 17), lambda x: CASE WHEN (x + i) % 7 = 3 THEN NULL ELSE x * 1000003 + i END) END AS l
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_list_scale(l, 3) FROM t"
+check = "SELECT count(*)::VARCHAR FROM t WHERE vs_list_scale(l, 3) IS DISTINCT FROM list_transform(l, lambda x: x * 3)"
+expect = "0"
+
+[[case]]
+name = "list_scale/long_lists"
+rows = [1, 64, 2048, 10_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT list_transform(range(990 + i % 21), lambda x: CASE WHEN (x + i) % 97 = 5 THEN NULL ELSE x * 1000003 + i END) AS l
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_list_scale(l, 3) FROM t"
+check = "SELECT count(*)::VARCHAR FROM t WHERE vs_list_scale(l, 3) IS DISTINCT FROM list_transform(l, lambda x: x * 3)"
+expect = "0"
+
+[[case]]
+name = "range_list/project"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT CASE WHEN i % 10 = 9 THEN NULL ELSE (i % 18 - 1)::INTEGER END AS n FROM range({rows}) r(i)"]
+query = "SELECT vs_range_list(n) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_range_list(n) IS DISTINCT FROM range(n)::INTEGER[])
+        + (vs_range_list(-5) IS DISTINCT FROM []::INTEGER[])::BIGINT
+        + (vs_range_list(0) IS DISTINCT FROM []::INTEGER[])::BIGINT
+        + (vs_range_list(1) IS DISTINCT FROM [0])::BIGINT
+        + (vs_range_list(NULL) IS NOT NULL)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "range_list/long"
+rows = [1, 64, 2048, 10_000]
+setup = ["CREATE TABLE t AS SELECT (990 + i % 21)::INTEGER AS n FROM range({rows}) r(i)"]
+query = "SELECT vs_range_list(n) FROM t"
+check = "SELECT count(*)::VARCHAR FROM t WHERE vs_range_list(n) IS DISTINCT FROM range(n)::INTEGER[]"
+expect = "0"
+
+[[case]]
+name = "range_list/unnest"
+rows = [1, 5000, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT CASE WHEN i % 10 = 9 THEN NULL ELSE (i % 18 - 1)::INTEGER END AS n FROM range({rows}) r(i)"]
+query = "SELECT unnest(vs_range_list(n)) FROM t"
+check = """
+SELECT ((SELECT count(*) FROM (SELECT unnest(vs_range_list(n)) FROM t
+                               EXCEPT ALL SELECT unnest(range(n))::INTEGER FROM t))
+        + (SELECT count(*) FROM (SELECT unnest(range(n))::INTEGER FROM t
+                                 EXCEPT ALL SELECT unnest(vs_range_list(n)) FROM t)))::VARCHAR
+"""
+expect = "0"
+
+# Builds a list from scalars, scales it and sums it: three list functions back to back.
+[[case]]
+name = "nested/scale_range_sum"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT CASE WHEN i % 10 = 9 THEN NULL ELSE (i % 18 - 1)::INTEGER END AS n FROM range({rows}) r(i)"]
+query = "SELECT vs_list_sum(vs_list_scale(vs_range_list(n)::BIGINT[], 3)) FROM t"
+check = """
+SELECT count(*)::VARCHAR FROM t
+WHERE vs_list_sum(vs_list_scale(vs_range_list(n)::BIGINT[], 3))
+      IS DISTINCT FROM CASE WHEN n IS NOT NULL THEN 3 * (greatest(n, 0)::BIGINT * greatest(n - 1, 0) // 2) END
+"""
+expect = "0"
+
+[[case]]
+name = "split/project"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT CASE WHEN i % 10 = 9 THEN NULL
+       ELSE array_to_string(list_transform(range(i % 9),
+                                           lambda x: CASE WHEN x % 3 = 0 THEN 'long_segment_' || (x * i) ELSE 'p' || x END),
+                            ',') END AS s
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_split(s, ',') FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_split(s, ',') IS DISTINCT FROM string_split(s, ','))
+        + (vs_split('', ',') IS DISTINCT FROM [''])::BIGINT
+        + (vs_split(',a,,b,', ',') IS DISTINCT FROM ['', 'a', '', 'b', ''])::BIGINT
+        + (vs_split('a string longer than twelve bytes', ' ') IS DISTINCT FROM
+           ['a', 'string', 'longer', 'than', 'twelve', 'bytes'])::BIGINT
+        + (vs_split('héllo-wörld', '-') IS DISTINCT FROM ['héllo', 'wörld'])::BIGINT
+        + (vs_split(NULL, ',') IS NOT NULL)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# The separator varies per row and is sometimes NULL.
+[[case]]
+name = "split/sep_column"
+rows = [1, 5000, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT array_to_string(list_transform(range(i % 9), lambda x: 'p' || x || CASE WHEN x % 2 = 0 THEN ';q' ELSE '' END), ',') AS s,
+       CASE WHEN i % 13 = 5 THEN NULL WHEN i % 4 = 0 THEN ';' ELSE ',' END AS sep
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_split(s, sep) FROM t"
+check = "SELECT count(*)::VARCHAR FROM t WHERE vs_split(s, sep) IS DISTINCT FROM CASE WHEN sep IS NOT NULL THEN string_split(s, sep) END"
+expect = "0"
+
+[[case]]
+name = "split/long_strings"
+rows = [1, 64, 2048, 10_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT array_to_string(list_transform(range(990 + i % 21),
+                                      lambda x: CASE WHEN x % 5 = 0 THEN 'long_segment_' || (x * i) ELSE 'p' || x END),
+                       ',') AS s
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_split(s, ',') FROM t"
+check = "SELECT count(*)::VARCHAR FROM t WHERE vs_split(s, ',') IS DISTINCT FROM string_split(s, ',')"
+expect = "0"
+
+[[case]]
+name = "list_join/project"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT CASE WHEN i % 10 = 9 THEN NULL
+       ELSE list_transform(range(i % 17), lambda x: CASE WHEN (x + i) % 7 = 3 THEN NULL
+                                                    WHEN x % 3 = 0 THEN 'long_element_' || (x * i)
+                                                    ELSE 'e' || x END) END AS l
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_list_join(l, '-') FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_list_join(l, '-') IS DISTINCT FROM
+                          CASE WHEN l IS NOT NULL THEN coalesce(array_to_string(l, '-'), '') END)
+        + (vs_list_join([]::VARCHAR[], '-') IS DISTINCT FROM '')::BIGINT
+        + (vs_list_join([NULL]::VARCHAR[], '-') IS DISTINCT FROM '')::BIGINT
+        + (vs_list_join([NULL, 'a', NULL, 'b']::VARCHAR[], ', ') IS DISTINCT FROM 'a, b')::BIGINT
+        + (vs_list_join(['a', 'b'], NULL) IS NOT NULL)::BIGINT
+        + (vs_list_join(NULL::VARCHAR[], '-') IS NOT NULL)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "list_join/long_lists"
+rows = [1, 64, 2048, 10_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT list_transform(range(990 + i % 21), lambda x: CASE WHEN (x + i) % 97 = 5 THEN NULL
+                                                     WHEN x % 5 = 0 THEN 'long_element_' || (x * i)
+                                                     ELSE 'e' || x END) AS l
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_list_join(l, '-') FROM t"
+check = "SELECT count(*)::VARCHAR FROM t WHERE vs_list_join(l, '-') IS DISTINCT FROM array_to_string(l, '-')"
+expect = "0"
+
+[[case]]
+name = "nested/split_join"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT CASE WHEN i % 10 = 9 THEN NULL
+       ELSE array_to_string(list_transform(range(i % 9),
+                                           lambda x: CASE WHEN x % 3 = 0 THEN 'long_segment_' || (x * i) ELSE 'p' || x END),
+                            ',') END AS s
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_list_join(vs_split(s, ','), ';') FROM t"
+check = "SELECT count(*)::VARCHAR FROM t WHERE vs_list_join(vs_split(s, ','), ';') IS DISTINCT FROM replace(s, ',', ';')"
+expect = "0"
+
+[[case]]
+name = "point_norm/project"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT CASE WHEN i % 10 = 9 THEN NULL
+       ELSE {'x': CASE WHEN i % 7 = 3 THEN NULL ELSE i * 0.37 END, 'y': (i % 101) - 50.5}::STRUCT(x DOUBLE, y DOUBLE) END AS p
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_point_norm(p) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_point_norm(p) IS DISTINCT FROM sqrt(p.x * p.x + p.y * p.y))
+        + (vs_point_norm({'x': 3.0, 'y': -4.0}) IS DISTINCT FROM 5.0)::BIGINT
+        + (vs_point_norm({'x': 1.0, 'y': NULL}::STRUCT(x DOUBLE, y DOUBLE)) IS NOT NULL)::BIGINT
+        + (vs_point_norm(NULL) IS NOT NULL)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "point_norm/nulls_50"
+rows = [1, 5000, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT CASE WHEN i % 4 = 1 THEN NULL
+       ELSE {'x': CASE WHEN i % 4 = 2 THEN NULL ELSE i * 0.37 END, 'y': (i % 101) - 50.5}::STRUCT(x DOUBLE, y DOUBLE) END AS p
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_point_norm(p) FROM t"
+check = "SELECT count(*)::VARCHAR FROM t WHERE vs_point_norm(p) IS DISTINCT FROM sqrt(p.x * p.x + p.y * p.y)"
+expect = "0"
+
+[[case]]
+name = "point_norm/filtered"
+rows = [1, 5000, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, {'x': i * 0.37, 'y': (i % 101) - 50.5}::STRUCT(x DOUBLE, y DOUBLE) AS p
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_point_norm(p) FROM t WHERE i % 3 <> 1"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT p, vs_point_norm(p) AS norm FROM t WHERE i % 3 <> 1)
+WHERE norm IS DISTINCT FROM sqrt(p.x * p.x + p.y * p.y)
+"""
+expect = "0"
+
+[[case]]
+name = "make_point/project"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT CASE WHEN i % 10 = 9 THEN NULL ELSE i * 0.37 END::DOUBLE AS x,
+       CASE WHEN i % 13 = 5 THEN NULL ELSE (i % 101) - 50.5 END::DOUBLE AS y
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_make_point(x, y) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_make_point(x, y) IS DISTINCT FROM
+                          CASE WHEN x IS NOT NULL AND y IS NOT NULL
+                               THEN {'x': x, 'y': y}::STRUCT(x DOUBLE, y DOUBLE) END)
+        + (vs_make_point(1.5, NULL) IS NOT NULL)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "nested/norm_of_make_point"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT CASE WHEN i % 10 = 9 THEN NULL ELSE i * 0.37 END::DOUBLE AS x, ((i % 101) - 50.5)::DOUBLE AS y
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_point_norm(vs_make_point(x, y)) FROM t"
+check = "SELECT count(*)::VARCHAR FROM t WHERE vs_point_norm(vs_make_point(x, y)) IS DISTINCT FROM sqrt(x * x + y * y)"
+expect = "0"
+
+[[case]]
+name = "dot3/project"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT CASE WHEN i % 10 = 9 THEN NULL
+       ELSE [i % 1000, CASE WHEN i % 7 = 3 THEN NULL ELSE i % 13 - 6 END, 1.5]::DOUBLE[3] END AS a,
+       [i % 17, -2.0, (i % 5) * 0.25]::DOUBLE[3] AS b
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_dot3(a, b) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_dot3(a, b) IS DISTINCT FROM a[1] * b[1] + a[2] * b[2] + a[3] * b[3])
+        + (vs_dot3([1, 2, 3]::DOUBLE[3], [4, 5, 6]::DOUBLE[3]) IS DISTINCT FROM 32.0)::BIGINT
+        + (vs_dot3([1, 2, NULL]::DOUBLE[3], [4, 5, 6]::DOUBLE[3]) IS NOT NULL)::BIGINT
+        + (vs_dot3(NULL, [4, 5, 6]::DOUBLE[3]) IS NOT NULL)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "dot3/filtered"
+rows = [1, 5000, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, [i % 1000, i % 13 - 6, 1.5]::DOUBLE[3] AS a, [i % 17, -2.0, (i % 5) * 0.25]::DOUBLE[3] AS b
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_dot3(a, b) FROM t WHERE i % 3 <> 1"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT a, b, vs_dot3(a, b) AS d FROM t WHERE i % 3 <> 1)
+WHERE d IS DISTINCT FROM a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
+"""
+expect = "0"
+
+[[case]]
+name = "map_sum/project"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT CASE WHEN i % 10 = 9 THEN NULL
+       ELSE map(list_transform(range(i % 9), lambda x: CASE WHEN x % 2 = 0 THEN 'k' || x ELSE 'a_longer_key_' || x END),
+                list_transform(range(i % 9), lambda x: CASE WHEN (x + i) % 5 = 2 THEN NULL ELSE (x * 1000 + i % 1000)::INTEGER END))
+       END AS m
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_map_sum(m) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_map_sum(m) IS DISTINCT FROM
+                          CASE WHEN m IS NOT NULL THEN coalesce(list_sum(map_values(m)), 0)::BIGINT END)
+        + (vs_map_sum(MAP {}::MAP(VARCHAR, INTEGER)) IS DISTINCT FROM 0)::BIGINT
+        + (vs_map_sum(MAP {'a': 2147483647, 'b': 2147483647, 'c': NULL}) IS DISTINCT FROM 4294967294)::BIGINT
+        + (vs_map_sum(NULL) IS NOT NULL)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "map_sum/long"
+rows = [1, 64, 2048, 10_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT map(list_transform(range(990 + i % 21), lambda x: 'key_' || x),
+           list_transform(range(990 + i % 21), lambda x: CASE WHEN (x + i) % 97 = 5 THEN NULL ELSE (x * 1000 + i % 1000)::INTEGER END)) AS m
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_map_sum(m) FROM t"
+check = "SELECT count(*)::VARCHAR FROM t WHERE vs_map_sum(m) IS DISTINCT FROM coalesce(list_sum(map_values(m)), 0)::BIGINT"
+expect = "0"
+
+[[case]]
+name = "map_sum/filtered"
+rows = [1, 5000, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, map(list_transform(range(i % 9), lambda x: 'k' || x),
+              list_transform(range(i % 9), lambda x: CASE WHEN (x + i) % 5 = 2 THEN NULL ELSE (x * 1000 + i % 1000)::INTEGER END)) AS m
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_map_sum(m) FROM t WHERE i % 3 <> 1"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT m, vs_map_sum(m) AS s FROM t WHERE i % 3 <> 1)
+WHERE s IS DISTINCT FROM coalesce(list_sum(map_values(m)), 0)::BIGINT
+"""
+expect = "0"
+
+[[case]]
+name = "list_of_points/project"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT CASE WHEN i % 10 = 9 THEN NULL ELSE (i % 18 - 1)::INTEGER END AS n FROM range({rows}) r(i)"]
+query = "SELECT vs_list_of_points(n) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_list_of_points(n) IS DISTINCT FROM
+                          list_transform(range(n), lambda i: {'x': i::DOUBLE, 'y': (i * i)::DOUBLE}))
+        + (vs_list_of_points(0) IS DISTINCT FROM []::STRUCT(x DOUBLE, y DOUBLE)[])::BIGINT
+        + (vs_list_of_points(NULL) IS NOT NULL)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "list_of_points/long"
+rows = [1, 64, 2048, 10_000]
+setup = ["CREATE TABLE t AS SELECT (990 + i % 21)::INTEGER AS n FROM range({rows}) r(i)"]
+query = "SELECT vs_list_of_points(n) FROM t"
+check = """
+SELECT count(*)::VARCHAR FROM t
+WHERE vs_list_of_points(n) IS DISTINCT FROM list_transform(range(n), lambda i: {'x': i::DOUBLE, 'y': (i * i)::DOUBLE})
+"""
+expect = "0"
+
+# Several nested functions over the same rows in one projection.
+[[case]]
+name = "many_calls"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT CASE WHEN i % 10 = 9 THEN NULL
+       ELSE list_transform(range(i % 17), lambda x: CASE WHEN (x + i) % 7 = 3 THEN NULL ELSE x * 1000003 + i END) END AS l,
+       (i % 18 - 1)::INTEGER AS n,
+       (i * 0.37)::DOUBLE AS x
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_list_sum(l), vs_list_scale(l, 2), vs_range_list(n), vs_make_point(x, x), vs_list_of_points(n) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_list_sum(l) IS DISTINCT FROM CASE WHEN l IS NOT NULL THEN coalesce(list_sum(l), 0)::BIGINT END
+                            OR vs_list_scale(l, 2) IS DISTINCT FROM list_transform(l, lambda v: v * 2)
+                            OR vs_range_list(n) IS DISTINCT FROM range(n)::INTEGER[]
+                            OR vs_make_point(x, x) IS DISTINCT FROM {'x': x, 'y': x}::STRUCT(x DOUBLE, y DOUBLE)
+                            OR vs_list_of_points(n) IS DISTINCT FROM
+                               list_transform(range(n), lambda i: {'x': i::DOUBLE, 'y': (i * i)::DOUBLE})))::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# DuckDB's test vectors in every layout (CONSTANT, DICTIONARY, FLAT) and with extreme values, read straight
+# from the table function; the row count is fixed.
+[[case]]
+name = "layouts"
+rows = [1]
+query = """
+SELECT vs_list_sum(l), vs_list_scale(l, 1), vs_list_join(s, ','), vs_point_norm(p), vs_map_sum(m)
+FROM test_vector_types(NULL::BIGINT[], NULL::VARCHAR[], NULL::STRUCT(x DOUBLE, y DOUBLE), NULL::MAP(VARCHAR, INTEGER),
+                       all_flat := false) t(l, s, p, m)
+"""
+check = """
+SELECT count(*)::VARCHAR
+FROM test_vector_types(NULL::BIGINT[], NULL::VARCHAR[], NULL::STRUCT(x DOUBLE, y DOUBLE), NULL::MAP(VARCHAR, INTEGER),
+                       all_flat := false) t(l, s, p, m)
+WHERE vs_list_sum(l) IS DISTINCT FROM CASE WHEN l IS NOT NULL THEN coalesce(list_sum(l), 0)::BIGINT END
+   OR vs_list_scale(l, 1) IS DISTINCT FROM l
+   OR vs_list_join(s, ',') IS DISTINCT FROM CASE WHEN s IS NOT NULL THEN coalesce(array_to_string(s, ','), '') END
+   OR vs_point_norm(p) IS DISTINCT FROM sqrt(p.x * p.x + p.y * p.y)
+   OR vs_map_sum(m) IS DISTINCT FROM CASE WHEN m IS NOT NULL THEN coalesce(list_sum(map_values(m)), 0)::BIGINT END
+"""
+expect = "0"
