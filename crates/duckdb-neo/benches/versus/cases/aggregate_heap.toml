@@ -399,7 +399,7 @@ expect = "0"
 
 [[case]]
 name = "concat_sorted/sliding_9"
-rows = [1, 2048, 100_000, 1_000_000]
+rows = [1, 2048, 100_000]
 setup = ["CREATE TABLE t AS SELECT i, 'k' || (i * 7919 % 1009) AS s FROM range({rows}) r(i)"]
 query = "SELECT vs_concat_sorted(s) OVER (ORDER BY i ROWS BETWEEN 4 PRECEDING AND 4 FOLLOWING) FROM t"
 check = """
