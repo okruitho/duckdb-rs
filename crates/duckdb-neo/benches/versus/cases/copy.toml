@@ -1,0 +1,569 @@
+# vs_lines: COPY TO/FROM a tab-separated text format (see rust/copy.rs for the full format).
+#   One row per line, NULL as \N, VARCHAR escaping \ as \\, newline as \n and the separator as \<sep>.
+#   Option sep: the field separator, one ASCII punctuation or whitespace character (default tab).
+# vs_fixed: COPY TO/FROM a binary BIGINT/DOUBLE format: header, then a validity byte and 8 LE bytes per value.
+#
+# COPY TO cases run the timed statement once in setup, so the check sees the file it writes. Where every column
+# is BIGINT, BOOLEAN or VARCHAR the check rebuilds the expected file text in builtin SQL; where DOUBLE or vs_fixed
+# is involved it reads the file back with COPY FROM and, when the round trip holds, returns the file's md5, which
+# also makes the driver require byte-identical files from both languages.
+# COPY FROM cases write their input in setup and load it once there for the check; `reset` empties the target.
+
+# ---------------------------------------------------------------------------------------------------------------------
+# vs_lines, COPY TO
+# ---------------------------------------------------------------------------------------------------------------------
+
+[[case]]
+name = "lines_to/bigint"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = [
+    '''CREATE TABLE src AS SELECT CASE i WHEN 0 THEN -9223372036854775808 WHEN 1 THEN 9223372036854775807
+       ELSE i * 7919 - {rows}::BIGINT * 4000 END::BIGINT AS v FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)''',
+]
+query = '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+check = '''
+SELECT ((SELECT content FROM read_text('{tmp}/out.tsv'))
+        IS DISTINCT FROM (SELECT coalesce(string_agg(v::VARCHAR || chr(10), '' ORDER BY rowid), '') FROM src))::INT::VARCHAR
+'''
+expect = "0"
+
+[[case]]
+name = "lines_to/bigint_nulls_10"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = [
+    '''CREATE TABLE src AS SELECT CASE WHEN hash(i) % 100 < 10 THEN NULL ELSE i * 7919 - {rows}::BIGINT * 4000 END::BIGINT AS v
+       FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)''',
+]
+query = '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+check = '''
+SELECT ((SELECT content FROM read_text('{tmp}/out.tsv'))
+        IS DISTINCT FROM (SELECT coalesce(string_agg(coalesce(v::VARCHAR, '\N') || chr(10), '' ORDER BY rowid), '')
+                          FROM src))::INT::VARCHAR
+'''
+expect = "0"
+
+[[case]]
+name = "lines_to/bigint_nulls_50"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = [
+    '''CREATE TABLE src AS SELECT CASE WHEN hash(i) % 100 < 50 THEN NULL ELSE i * 7919 - {rows}::BIGINT * 4000 END::BIGINT AS v
+       FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)''',
+]
+query = '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+check = '''
+SELECT ((SELECT content FROM read_text('{tmp}/out.tsv'))
+        IS DISTINCT FROM (SELECT coalesce(string_agg(coalesce(v::VARCHAR, '\N') || chr(10), '' ORDER BY rowid), '')
+                          FROM src))::INT::VARCHAR
+'''
+expect = "0"
+
+[[case]]
+name = "lines_to/varchar_short"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = [
+    '''CREATE TABLE src AS SELECT CASE WHEN hash(i) % 100 < 10 THEN NULL WHEN i % 17 = 3 THEN '' ELSE 'v' || i END AS s
+       FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)''',
+]
+query = '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+check = '''
+SELECT ((SELECT content FROM read_text('{tmp}/out.tsv'))
+        IS DISTINCT FROM (SELECT coalesce(string_agg(coalesce(s, '\N') || chr(10), '' ORDER BY rowid), '')
+                          FROM src))::INT::VARCHAR
+'''
+expect = "0"
+
+[[case]]
+name = "lines_to/varchar_long"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = [
+    '''CREATE TABLE src AS SELECT repeat(chr(97 + (i % 26)::INTEGER), 80 + (i % 40)::INTEGER) || i AS s FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)''',
+]
+query = '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+check = '''
+SELECT ((SELECT content FROM read_text('{tmp}/out.tsv'))
+        IS DISTINCT FROM (SELECT coalesce(string_agg(s || chr(10), '' ORDER BY rowid), '') FROM src))::INT::VARCHAR
+'''
+expect = "0"
+
+# Every escape: tab (the separator), newline, backslash, a literal \N, the empty string, NULL and non-ASCII text.
+# The check rebuilds the text in SQL and also reads the file back.
+[[case]]
+name = "lines_to/varchar_escapes"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = [
+    '''CREATE TABLE src AS SELECT i::BIGINT AS id, CASE i % 8
+         WHEN 0 THEN 'plain ' || i WHEN 1 THEN 'tab' || chr(9) || i WHEN 2 THEN 'line' || chr(10) || 'break' || i
+         WHEN 3 THEN 'back\slash\\' || i WHEN 4 THEN '\N' WHEN 5 THEN '' WHEN 6 THEN NULL
+         ELSE 'ünïcødé 🦆 ' || i END AS s
+       FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)''',
+    "CREATE TABLE dst AS FROM src LIMIT 0",
+    '''COPY dst FROM '{tmp}/out.tsv' (FORMAT vs_lines)''',
+]
+query = '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+check = '''
+SELECT (((SELECT content FROM read_text('{tmp}/out.tsv'))
+         IS DISTINCT FROM (SELECT coalesce(string_agg(id::VARCHAR || chr(9) || coalesce(
+                                   replace(replace(replace(s, '\', '\\'), chr(10), '\n'), chr(9), '\' || chr(9)), '\N')
+                                   || chr(10), '' ORDER BY rowid), '') FROM src))::INT
+        + (SELECT count(*) FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src))))::VARCHAR
+'''
+expect = "0"
+
+# A query with a filter and a projection rather than a table.
+[[case]]
+name = "lines_to/filtered"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = [
+    '''CREATE TABLE src AS SELECT i::BIGINT AS id, 'name_' || i AS s, i % 3 = 0 AS f, i * 2.5 AS unused
+       FROM range({rows}) r(i)''',
+    '''COPY (SELECT f, id, s FROM src WHERE id % 4 <> 1) TO '{tmp}/out.tsv' (FORMAT vs_lines)''',
+]
+query = '''COPY (SELECT f, id, s FROM src WHERE id % 4 <> 1) TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+check = '''
+SELECT ((SELECT content FROM read_text('{tmp}/out.tsv'))
+        IS DISTINCT FROM (SELECT coalesce(string_agg(f::VARCHAR || chr(9) || id || chr(9) || s || chr(10), ''
+                                                     ORDER BY rowid), '')
+                          FROM src WHERE id % 4 <> 1))::INT::VARCHAR
+'''
+expect = "0"
+
+[[case]]
+name = "lines_to/limit"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = [
+    '''CREATE TABLE src AS SELECT i::BIGINT AS id, 'name_' || i AS s FROM range({rows}) r(i)''',
+    '''COPY (FROM src LIMIT 1000) TO '{tmp}/out.tsv' (FORMAT vs_lines)''',
+]
+query = '''COPY (FROM src LIMIT 1000) TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+check = '''
+SELECT ((SELECT content FROM read_text('{tmp}/out.tsv'))
+        IS DISTINCT FROM (SELECT coalesce(string_agg(id || chr(9) || s || chr(10), '' ORDER BY rowid), '')
+                          FROM (SELECT rowid, * FROM src ORDER BY rowid LIMIT 1000)))::INT::VARCHAR
+'''
+expect = "0"
+
+# The sep option, spelled in upper case: strings containing the separator are escaped.
+[[case]]
+name = "lines_to/sep"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = [
+    '''CREATE TABLE src AS SELECT i::BIGINT AS id, CASE WHEN i % 5 = 2 THEN 'a,b,' || i ELSE 'c' || i END AS s,
+       i % 2 = 0 AS f FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/out.csv' (FORMAT vs_lines, SEP ',')''',
+]
+query = '''COPY src TO '{tmp}/out.csv' (FORMAT vs_lines, SEP ',')'''
+check = '''
+SELECT ((SELECT content FROM read_text('{tmp}/out.csv'))
+        IS DISTINCT FROM (SELECT coalesce(string_agg(id || ',' || replace(s, ',', '\,') || ',' || f || chr(10), ''
+                                                     ORDER BY rowid), '') FROM src))::INT::VARCHAR
+'''
+expect = "0"
+
+# About ten columns of every supported type, without NULLs and with half of them NULL.
+[[case]]
+name = "lines_to/wide"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = [
+    '''CREATE TABLE src AS SELECT i::BIGINT AS id, (i * 7919 % 100003 - 50000)::BIGINT AS a, (hash(i) >> 1)::BIGINT AS b,
+         (i * 0.25)::DOUBLE AS x, (i / 7)::DOUBLE AS y, sqrt(i) * 1e10 AS z, i % 3 = 0 AS f, i % 5 = 0 AS g,
+         'name_' || i AS s, CASE i % 4 WHEN 0 THEN '' WHEN 1 THEN 'tab' || chr(9) || i WHEN 2 THEN repeat('long', 10)
+         ELSE 'back\slash' END AS t
+       FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)''',
+    "CREATE TABLE dst AS FROM src LIMIT 0",
+    '''COPY dst FROM '{tmp}/out.tsv' (FORMAT vs_lines)''',
+]
+query = '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+check = '''
+SELECT CASE WHEN (SELECT count(*) FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src))) = 0
+            THEN (SELECT md5(content) FROM read_text('{tmp}/out.tsv')) ELSE 'round trip differs' END
+'''
+
+[case.expect_at]
+1 = "392ef5287838207fbda7bd31907ad18c"
+2048 = "1a5713a003e2474c2ec837e0ef9a2edb"
+100000 = "d4aa2cdda00cacf47f062de56b2d118e"
+1000000 = "2ba4ae568f37f10812db9ba470d4f79d"
+
+[[case]]
+name = "lines_to/wide_nulls_50"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO maybe_null(v, i, k) AS CASE WHEN hash(i * 16 + k) % 100 < 50 THEN NULL ELSE v END",
+    '''CREATE TABLE src AS SELECT maybe_null(i::BIGINT, i, 0) AS id,
+         maybe_null((i * 7919 % 100003 - 50000)::BIGINT, i, 1) AS a, maybe_null((hash(i) >> 1)::BIGINT, i, 2) AS b,
+         maybe_null((i * 0.25)::DOUBLE, i, 3) AS x, maybe_null((i / 7)::DOUBLE, i, 4) AS y,
+         maybe_null(sqrt(i) * 1e10, i, 5) AS z, maybe_null(i % 3 = 0, i, 6) AS f, maybe_null(i % 5 = 0, i, 7) AS g,
+         maybe_null('name_' || i, i, 8) AS s, maybe_null(CASE i % 4 WHEN 0 THEN '' WHEN 1 THEN 'tab' || chr(9) || i
+         WHEN 2 THEN repeat('long', 10) ELSE 'back\slash' END, i, 9) AS t
+       FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)''',
+    "CREATE TABLE dst AS FROM src LIMIT 0",
+    '''COPY dst FROM '{tmp}/out.tsv' (FORMAT vs_lines)''',
+]
+query = '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+check = '''
+SELECT CASE WHEN (SELECT count(*) FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src))) = 0
+            THEN (SELECT md5(content) FROM read_text('{tmp}/out.tsv')) ELSE 'round trip differs' END
+'''
+
+[case.expect_at]
+1 = "0784dac530f919001399ffc6ea01a8c8"
+2048 = "8c3812ef27e33fe9022442a16e4008b2"
+100000 = "2b26005ce621b86eb5d91fb821d97034"
+1000000 = "24bd72400f5e3ad3caac5ae0f687878b"
+
+# DOUBLE edge values: NaN, infinities, -0.0, the smallest subnormal, the largest finite value, NULL.
+[[case]]
+name = "lines_to/double"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = [
+    '''CREATE TABLE src AS SELECT CASE i % 10 WHEN 1 THEN 'nan'::DOUBLE WHEN 2 THEN 'inf'::DOUBLE WHEN 3 THEN '-inf'::DOUBLE
+         WHEN 4 THEN '-0.0'::DOUBLE WHEN 5 THEN 5e-324 WHEN 6 THEN 1.7976931348623157e308 WHEN 7 THEN NULL
+         ELSE (i - {rows} // 2) / 7 END::DOUBLE AS v
+       FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)''',
+    "CREATE TABLE dst AS FROM src LIMIT 0",
+    '''COPY dst FROM '{tmp}/out.tsv' (FORMAT vs_lines)''',
+]
+query = '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+check = '''
+SELECT CASE WHEN (SELECT count(*) FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src))) = 0
+                 AND (SELECT count(*) FROM dst WHERE v = 0 AND signbit(v)) = (SELECT count(*) FROM src WHERE v = 0 AND signbit(v))
+            THEN (SELECT md5(content) FROM read_text('{tmp}/out.tsv')) ELSE 'round trip differs' END
+'''
+
+[case.expect_at]
+1 = "4b578ff832d2c3f00d2f260f1c5aeb05"
+2048 = "81ce8a2e20dcdc1182204dc47cfcda61"
+100000 = "148510495c616ff0d8d6ecd046f0b074"
+2000000 = "87f0fabb250e4afd6c274b38c0ec829b"
+
+# Zero rows: the fixed cost of bind, init, an empty file and finalize.
+[[case]]
+name = "lines_to/empty"
+rows = [1]
+setup = [
+    '''CREATE TABLE src AS SELECT i::BIGINT AS id, 'name_' || i AS s FROM range({rows}) r(i)''',
+    '''COPY (FROM src WHERE id < 0) TO '{tmp}/out.tsv' (FORMAT vs_lines)''',
+]
+query = '''COPY (FROM src WHERE id < 0) TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+check = '''SELECT size::VARCHAR FROM read_blob('{tmp}/out.tsv')'''
+expect = "0"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# vs_lines, COPY FROM
+# ---------------------------------------------------------------------------------------------------------------------
+
+[[case]]
+name = "lines_from/bigint"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = [
+    '''CREATE TABLE src AS SELECT CASE i WHEN 0 THEN -9223372036854775808 WHEN 1 THEN 9223372036854775807
+       ELSE i * 7919 - {rows}::BIGINT * 4000 END::BIGINT AS v FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/in.tsv' (FORMAT vs_lines)''',
+    "CREATE TABLE dst AS FROM src LIMIT 0",
+    '''COPY dst FROM '{tmp}/in.tsv' (FORMAT vs_lines)''',
+]
+query = '''COPY dst FROM '{tmp}/in.tsv' (FORMAT vs_lines)'''
+reset = "TRUNCATE dst"
+check = '''SELECT count(*)::VARCHAR FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src))'''
+expect = "0"
+
+[[case]]
+name = "lines_from/varchar_escapes"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = [
+    '''CREATE TABLE src AS SELECT CASE i % 8
+         WHEN 0 THEN 'plain ' || i WHEN 1 THEN 'tab' || chr(9) || i WHEN 2 THEN 'line' || chr(10) || 'break' || i
+         WHEN 3 THEN 'back\slash\\' || i WHEN 4 THEN '\N' WHEN 5 THEN '' WHEN 6 THEN NULL
+         ELSE 'ünïcødé 🦆 ' || i END AS s
+       FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/in.tsv' (FORMAT vs_lines)''',
+    "CREATE TABLE dst AS FROM src LIMIT 0",
+    '''COPY dst FROM '{tmp}/in.tsv' (FORMAT vs_lines)''',
+]
+query = '''COPY dst FROM '{tmp}/in.tsv' (FORMAT vs_lines)'''
+reset = "TRUNCATE dst"
+check = '''SELECT count(*)::VARCHAR FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src))'''
+expect = "0"
+
+[[case]]
+name = "lines_from/wide_nulls_10"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO maybe_null(v, i, k) AS CASE WHEN hash(i * 16 + k) % 100 < 10 THEN NULL ELSE v END",
+    '''CREATE TABLE src AS SELECT maybe_null(i::BIGINT, i, 0) AS id,
+         maybe_null((i * 7919 % 100003 - 50000)::BIGINT, i, 1) AS a, maybe_null((hash(i) >> 1)::BIGINT, i, 2) AS b,
+         maybe_null((i * 0.25)::DOUBLE, i, 3) AS x, maybe_null((i / 7)::DOUBLE, i, 4) AS y,
+         maybe_null(sqrt(i) * 1e10, i, 5) AS z, maybe_null(i % 3 = 0, i, 6) AS f, maybe_null(i % 5 = 0, i, 7) AS g,
+         maybe_null('name_' || i, i, 8) AS s, maybe_null(CASE i % 4 WHEN 0 THEN '' WHEN 1 THEN 'tab' || chr(9) || i
+         WHEN 2 THEN repeat('long', 10) ELSE 'back\slash' END, i, 9) AS t
+       FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/in.tsv' (FORMAT vs_lines)''',
+    "CREATE TABLE dst AS FROM src LIMIT 0",
+    '''COPY dst FROM '{tmp}/in.tsv' (FORMAT vs_lines)''',
+]
+query = '''COPY dst FROM '{tmp}/in.tsv' (FORMAT vs_lines)'''
+reset = "TRUNCATE dst"
+check = '''SELECT count(*)::VARCHAR FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src))'''
+expect = "0"
+
+# Lines of 500 to 1000 bytes: from 2,048 rows on the file outgrows the 1 MiB read buffer, so chunks end early
+# where the buffer does and the unparsed tail moves to its front.
+[[case]]
+name = "lines_from/varchar_long"
+rows = [1, 2048, 100_000]
+setup = [
+    '''CREATE TABLE src AS SELECT i::BIGINT AS id, repeat(chr(97 + (i % 26)::INTEGER), 500 + (i % 500)::INTEGER) || i AS s
+       FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/in.tsv' (FORMAT vs_lines)''',
+    "CREATE TABLE dst AS FROM src LIMIT 0",
+    '''COPY dst FROM '{tmp}/in.tsv' (FORMAT vs_lines)''',
+]
+query = '''COPY dst FROM '{tmp}/in.tsv' (FORMAT vs_lines)'''
+reset = "TRUNCATE dst"
+check = '''SELECT count(*)::VARCHAR FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src))'''
+expect = "0"
+
+# Every 1,024th line is longer than the read buffer, which then doubles.
+[[case]]
+name = "lines_from/huge_line"
+rows = [1, 2048]
+setup = [
+    '''CREATE TABLE src AS SELECT i::BIGINT AS id, CASE WHEN i % 1024 = 0 THEN repeat('x' || chr(9), 1_000_000) || i
+         ELSE 'short ' || i END AS s
+       FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/in.tsv' (FORMAT vs_lines)''',
+    "CREATE TABLE dst AS FROM src LIMIT 0",
+    '''COPY dst FROM '{tmp}/in.tsv' (FORMAT vs_lines)''',
+]
+query = '''COPY dst FROM '{tmp}/in.tsv' (FORMAT vs_lines)'''
+reset = "TRUNCATE dst"
+check = '''SELECT count(*)::VARCHAR FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src))'''
+expect = "0"
+
+# The input comes from DuckDB's own CSV writer, read with sep ','.
+[[case]]
+name = "lines_from/builtin_csv"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = [
+    '''CREATE TABLE src AS SELECT i::BIGINT AS id, CASE WHEN hash(i) % 100 < 10 THEN NULL ELSE (i - 1000) * 1.25e10 END AS x
+       FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/in.csv' (FORMAT csv, HEADER false, NULLSTR '\N')''',
+    "CREATE TABLE dst AS FROM src LIMIT 0",
+    '''COPY dst FROM '{tmp}/in.csv' (FORMAT vs_lines, sep ',')''',
+]
+query = '''COPY dst FROM '{tmp}/in.csv' (FORMAT vs_lines, sep ',')'''
+reset = "TRUNCATE dst"
+check = '''SELECT count(*)::VARCHAR FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src))'''
+expect = "0"
+
+[[case]]
+name = "lines_from/sep"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = [
+    '''CREATE TABLE src AS SELECT i::BIGINT AS id, CASE WHEN i % 5 = 2 THEN 'a|b|' || i ELSE 'c' || i END AS s,
+       i % 2 = 0 AS f FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/in.psv' (FORMAT vs_lines, sep '|')''',
+    "CREATE TABLE dst AS FROM src LIMIT 0",
+    '''COPY dst FROM '{tmp}/in.psv' (FORMAT vs_lines, sep '|')''',
+]
+query = '''COPY dst FROM '{tmp}/in.psv' (FORMAT vs_lines, sep '|')'''
+reset = "TRUNCATE dst"
+check = '''
+SELECT ((SELECT count(*) FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src)))
+        + ((SELECT content FROM read_text('{tmp}/in.psv'))
+           IS DISTINCT FROM (SELECT coalesce(string_agg(id || '|' || replace(s, '|', '\|') || '|' || f || chr(10), ''
+                                                        ORDER BY rowid), '') FROM src))::INT)::VARCHAR
+'''
+expect = "0"
+
+[[case]]
+name = "lines_from/empty"
+rows = [1]
+setup = [
+    '''CREATE TABLE src AS SELECT i::BIGINT AS id, 'name_' || i AS s FROM range({rows}) r(i)''',
+    '''COPY (FROM src WHERE id < 0) TO '{tmp}/in.tsv' (FORMAT vs_lines)''',
+    "CREATE TABLE dst AS FROM src LIMIT 0",
+    '''COPY dst FROM '{tmp}/in.tsv' (FORMAT vs_lines)''',
+]
+query = '''COPY dst FROM '{tmp}/in.tsv' (FORMAT vs_lines)'''
+reset = "TRUNCATE dst"
+check = "SELECT count(*)::VARCHAR FROM dst"
+expect = "0"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# vs_fixed, COPY TO
+# ---------------------------------------------------------------------------------------------------------------------
+
+[[case]]
+name = "fixed_to/bigint"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = [
+    '''CREATE TABLE src AS SELECT CASE i WHEN 0 THEN -9223372036854775808 WHEN 1 THEN 9223372036854775807
+       ELSE i * 7919 - {rows}::BIGINT * 4000 END::BIGINT AS v FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/out.bin' (FORMAT vs_fixed)''',
+    "CREATE TABLE dst AS FROM src LIMIT 0",
+    '''COPY dst FROM '{tmp}/out.bin' (FORMAT vs_fixed)''',
+]
+query = '''COPY src TO '{tmp}/out.bin' (FORMAT vs_fixed)'''
+check = '''
+SELECT CASE WHEN (SELECT count(*) FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src))) = 0
+            THEN (SELECT md5(content) || ' ' || size FROM read_blob('{tmp}/out.bin')) ELSE 'round trip differs' END
+'''
+
+[case.expect_at]
+1 = "d5d55c010241124e38c71fd3417a3e36 18"
+2048 = "9dc11a77a4f2f1556f04347c0238ec88 18441"
+100000 = "9b64770d322a01d5ab7dd59cbfe5980d 900009"
+2000000 = "84649896a6c62cf50282aa02dbe4640a 18000009"
+
+[[case]]
+name = "fixed_to/wide"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = [
+    '''CREATE TABLE src AS SELECT i::BIGINT AS id, (i * 7919 % 100003 - 50000)::BIGINT AS a, (hash(i) >> 1)::BIGINT AS b,
+         (-i)::BIGINT AS c, (i // 3)::BIGINT AS d, (i * 0.25)::DOUBLE AS x, (i / 7)::DOUBLE AS y, sqrt(i) * 1e10 AS z,
+         (-i * 1.5)::DOUBLE AS w, (i % 1000)::DOUBLE AS u
+       FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/out.bin' (FORMAT vs_fixed)''',
+    "CREATE TABLE dst AS FROM src LIMIT 0",
+    '''COPY dst FROM '{tmp}/out.bin' (FORMAT vs_fixed)''',
+]
+query = '''COPY src TO '{tmp}/out.bin' (FORMAT vs_fixed)'''
+check = '''
+SELECT CASE WHEN (SELECT count(*) FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src))) = 0
+            THEN (SELECT md5(content) || ' ' || size FROM read_blob('{tmp}/out.bin')) ELSE 'round trip differs' END
+'''
+
+[case.expect_at]
+1 = "cfd941f89bc758014161ffc84b3c5988 108"
+2048 = "791960cb48525cdb9e4af7b7932b8e61 184338"
+100000 = "4c4c6ee40a0c4ce38b98f000677be735 9000018"
+2000000 = "17569211988fbbc53c77d4d0cad72bd4 180000018"
+
+[[case]]
+name = "fixed_to/wide_nulls_50"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = [
+    "CREATE MACRO maybe_null(v, i, k) AS CASE WHEN hash(i * 16 + k) % 100 < 50 THEN NULL ELSE v END",
+    '''CREATE TABLE src AS SELECT maybe_null(i::BIGINT, i, 0) AS id,
+         maybe_null((i * 7919 % 100003 - 50000)::BIGINT, i, 1) AS a, maybe_null((hash(i) >> 1)::BIGINT, i, 2) AS b,
+         maybe_null((-i)::BIGINT, i, 3) AS c, maybe_null((i // 3)::BIGINT, i, 4) AS d,
+         maybe_null((i * 0.25)::DOUBLE, i, 5) AS x, maybe_null((i / 7)::DOUBLE, i, 6) AS y,
+         maybe_null(sqrt(i) * 1e10, i, 7) AS z, maybe_null((-i * 1.5)::DOUBLE, i, 8) AS w,
+         maybe_null((i % 1000)::DOUBLE, i, 9) AS u
+       FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/out.bin' (FORMAT vs_fixed)''',
+    "CREATE TABLE dst AS FROM src LIMIT 0",
+    '''COPY dst FROM '{tmp}/out.bin' (FORMAT vs_fixed)''',
+]
+query = '''COPY src TO '{tmp}/out.bin' (FORMAT vs_fixed)'''
+check = '''
+SELECT CASE WHEN (SELECT count(*) FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src))) = 0
+            THEN (SELECT md5(content) || ' ' || size FROM read_blob('{tmp}/out.bin')) ELSE 'round trip differs' END
+'''
+
+[case.expect_at]
+1 = "3ff269409ebb579c0cb43db874634e0c 108"
+2048 = "a67917330b53cd975e861b0aa87a7077 184338"
+100000 = "1d44e8d38a520b985f88ead964dfed36 9000018"
+2000000 = "5ad275fa5b6f6aee667915d68d33696d 180000018"
+
+# A filtered projection; with four threads the batches are prepared in parallel and flushed in order.
+[[case]]
+name = "fixed_to/filtered_threads_4"
+rows = [1, 2048, 100_000, 2_000_000]
+threads = 4
+setup = [
+    '''CREATE TABLE src AS SELECT i::BIGINT AS id, (i * 7919 % 100003 - 50000)::BIGINT AS a, (i / 7)::DOUBLE AS y,
+         'unused' AS s
+       FROM range({rows}) r(i)''',
+    '''COPY (SELECT y, id FROM src WHERE a % 4 <> 1) TO '{tmp}/out.bin' (FORMAT vs_fixed)''',
+    "CREATE TABLE dst (y DOUBLE, id BIGINT)",
+    '''COPY dst FROM '{tmp}/out.bin' (FORMAT vs_fixed)''',
+]
+query = '''COPY (SELECT y, id FROM src WHERE a % 4 <> 1) TO '{tmp}/out.bin' (FORMAT vs_fixed)'''
+check = '''
+SELECT CASE WHEN (SELECT count(*) FROM (((SELECT y, id FROM src WHERE a % 4 <> 1) EXCEPT ALL FROM dst)
+                                        UNION ALL (FROM dst EXCEPT ALL (SELECT y, id FROM src WHERE a % 4 <> 1)))) = 0
+            THEN (SELECT md5(content) || ' ' || size FROM read_blob('{tmp}/out.bin')) ELSE 'round trip differs' END
+'''
+
+[case.expect_at]
+1 = "708c7d55a8657412098f249abd0259e7 28"
+2048 = "7d9074b81d2b6bf26147e18f63cc53e2 32248"
+100000 = "4a8b10cba3cb1e40487299ebb4d2e65c 1575010"
+2000000 = "4ba4bc57e79193204ab0c2b7672b02f1 31499758"
+
+[[case]]
+name = "fixed_to/empty"
+rows = [1]
+setup = [
+    '''CREATE TABLE src AS SELECT i::BIGINT AS id, (i / 7)::DOUBLE AS y FROM range({rows}) r(i)''',
+    '''COPY (FROM src WHERE id < 0) TO '{tmp}/out.bin' (FORMAT vs_fixed)''',
+]
+query = '''COPY (FROM src WHERE id < 0) TO '{tmp}/out.bin' (FORMAT vs_fixed)'''
+check = '''SELECT hex(content) FROM read_blob('{tmp}/out.bin')'''
+expect = "56534658020000000001"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# vs_fixed, COPY FROM
+# ---------------------------------------------------------------------------------------------------------------------
+
+[[case]]
+name = "fixed_from/bigint"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = [
+    '''CREATE TABLE src AS SELECT CASE i WHEN 0 THEN -9223372036854775808 WHEN 1 THEN 9223372036854775807
+       ELSE i * 7919 - {rows}::BIGINT * 4000 END::BIGINT AS v FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/in.bin' (FORMAT vs_fixed)''',
+    "CREATE TABLE dst AS FROM src LIMIT 0",
+    '''COPY dst FROM '{tmp}/in.bin' (FORMAT vs_fixed)''',
+]
+query = '''COPY dst FROM '{tmp}/in.bin' (FORMAT vs_fixed)'''
+reset = "TRUNCATE dst"
+check = '''SELECT count(*)::VARCHAR FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src))'''
+expect = "0"
+
+[[case]]
+name = "fixed_from/wide_nulls_10"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = [
+    "CREATE MACRO maybe_null(v, i, k) AS CASE WHEN hash(i * 16 + k) % 100 < 10 THEN NULL ELSE v END",
+    '''CREATE TABLE src AS SELECT maybe_null(i::BIGINT, i, 0) AS id,
+         maybe_null((i * 7919 % 100003 - 50000)::BIGINT, i, 1) AS a, maybe_null((hash(i) >> 1)::BIGINT, i, 2) AS b,
+         maybe_null((-i)::BIGINT, i, 3) AS c, maybe_null((i // 3)::BIGINT, i, 4) AS d,
+         maybe_null((i * 0.25)::DOUBLE, i, 5) AS x, maybe_null((i / 7)::DOUBLE, i, 6) AS y,
+         maybe_null(sqrt(i) * 1e10, i, 7) AS z, maybe_null((-i * 1.5)::DOUBLE, i, 8) AS w,
+         maybe_null((i % 1000)::DOUBLE, i, 9) AS u
+       FROM range({rows}) r(i)''',
+    '''COPY src TO '{tmp}/in.bin' (FORMAT vs_fixed)''',
+    "CREATE TABLE dst AS FROM src LIMIT 0",
+    '''COPY dst FROM '{tmp}/in.bin' (FORMAT vs_fixed)''',
+]
+query = '''COPY dst FROM '{tmp}/in.bin' (FORMAT vs_fixed)'''
+reset = "TRUNCATE dst"
+check = '''SELECT count(*)::VARCHAR FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src))'''
+expect = "0"
+
+[[case]]
+name = "fixed_from/empty"
+rows = [1]
+setup = [
+    '''CREATE TABLE src AS SELECT i::BIGINT AS id, (i / 7)::DOUBLE AS y FROM range({rows}) r(i)''',
+    '''COPY (FROM src WHERE id < 0) TO '{tmp}/in.bin' (FORMAT vs_fixed)''',
+    "CREATE TABLE dst AS FROM src LIMIT 0",
+    '''COPY dst FROM '{tmp}/in.bin' (FORMAT vs_fixed)''',
+]
+query = '''COPY dst FROM '{tmp}/in.bin' (FORMAT vs_fixed)'''
+reset = "TRUNCATE dst"
+check = "SELECT count(*)::VARCHAR FROM dst"
+expect = "0"

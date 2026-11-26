@@ -1,0 +1,520 @@
+# Casts on the custom types `vs_cents` (BIGINT cents) and `vs_hex` (VARCHAR, uppercase hex like `to_hex`); see
+# rust/cast.rs for the semantics. Checks compare with builtin SQL: `round(d * 100)` for DOUBLE -> vs_cents,
+# `printf` for the cents text, `to_hex` for vs_hex. `vs_cents <-> BIGINT` and `VARCHAR <-> vs_hex` are DuckDB's own
+# alias casts, which the checks use to get at the representation. A strict failure is detected as
+# `try(CAST(...) IS NULL) IS NULL`: `try` turns the raised error into NULL, while a cast that quietly returned NULL
+# would make the inner `IS NULL` true.
+
+# DOUBLE -> vs_cents
+
+[[case]]
+name = "double_to_cents/project"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT (((i * 7919) % 2000001) - 1000000)::DOUBLE / 1000 AS d FROM range({rows}) r(i)"]
+query = "SELECT d::vs_cents FROM t"
+check = """
+SELECT ((SELECT count(*) FROM t WHERE d::vs_cents::BIGINT IS DISTINCT FROM round(d * 100)::BIGINT)
+      + (SELECT count(*)
+         FROM (VALUES ('NaN'::DOUBLE), ('inf'::DOUBLE), ('-inf'::DOUBLE), (1e17::DOUBLE), (-1e17::DOUBLE),
+                      (-92233720368547758.08::DOUBLE), (92233720368547758.07::DOUBLE), (0.125::DOUBLE),
+                      (-0.125::DOUBLE), (2.675::DOUBLE), (0.0::DOUBLE), (-0.0::DOUBLE), (1e-300::DOUBLE),
+                      (NULL::DOUBLE)) e(x)
+         WHERE TRY_CAST(x AS vs_cents)::BIGINT IS DISTINCT FROM TRY_CAST(round(x * 100) AS BIGINT)
+            OR (x IS NOT NULL AND TRY_CAST(x AS vs_cents) IS NULL AND try(CAST(x AS vs_cents) IS NULL) IS NOT NULL))
+      + (CAST((-0.125)::DOUBLE AS vs_cents)::BIGINT <> -13)::BIGINT)::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "double_to_cents/try_50"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT CASE WHEN i % 2 = 1 THEN ['NaN', 'inf', '-inf', '1e300'][i // 2 % 4 + 1]::DOUBLE
+            ELSE (((i * 7919) % 2000001) - 1000000)::DOUBLE / 1000 END AS d
+FROM range({rows}) r(i)
+"""]
+query = "SELECT TRY_CAST(d AS vs_cents) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE TRY_CAST(d AS vs_cents)::BIGINT IS DISTINCT FROM TRY_CAST(round(d * 100) AS BIGINT))
+      + (count(*) FILTER (WHERE TRY_CAST(d AS vs_cents) IS NULL) <> {rows} // 2)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# vs_cents -> DOUBLE, explicit and implicit
+
+[[case]]
+name = "cents_to_double/project"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT ((i * 7919) % 2000001 - 1000000)::BIGINT::vs_cents AS c FROM range({rows}) r(i)"]
+query = "SELECT c::DOUBLE FROM t"
+check = """
+SELECT ((SELECT count(*) FROM t WHERE c::DOUBLE IS DISTINCT FROM c::BIGINT::DOUBLE / 100)
+      + (SELECT count(*)
+         FROM (VALUES ((-9223372036854775808)::BIGINT), (9223372036854775807::BIGINT), (-1::BIGINT), (NULL::BIGINT)) e(v)
+         WHERE v::vs_cents::DOUBLE IS DISTINCT FROM v::DOUBLE / 100))::VARCHAR
+"""
+expect = "0"
+
+# DuckDB binds `vs_cents < DOUBLE` only through the implicit vs_cents -> DOUBLE cast.
+[[case]]
+name = "cents_to_double/implicit_compare"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, ((i * 7919) % 2000001 - 1000000)::BIGINT::vs_cents AS c,
+       (((i * 104729) % 2000001) - 1000000)::DOUBLE / 100 AS d
+FROM range({rows}) r(i)
+"""]
+query = "SELECT i FROM t WHERE c < d"
+check = """
+SELECT count(*) FILTER (WHERE (c < d) IS DISTINCT FROM (c::BIGINT::DOUBLE / 100 < d))::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# `abs` has no vs_cents overload, so the binder casts the argument to DOUBLE.
+[[case]]
+name = "cents_to_double/implicit_argument"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT ((i * 7919) % 2000001 - 1000000)::BIGINT::vs_cents AS c FROM range({rows}) r(i)"]
+query = "SELECT abs(c) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE abs(c) IS DISTINCT FROM abs(c::BIGINT::DOUBLE / 100))
+      + (max(typeof(abs(c))) <> 'DOUBLE')::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# VARCHAR -> vs_cents
+
+[[case]]
+name = "varchar_to_cents/project"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT v, printf('%s%d.%02d', CASE WHEN v < 0 THEN '-' ELSE '' END, abs(v) // 100, abs(v) % 100) AS s
+FROM (SELECT ((i * 7919) % 2000001 - 1000000)::BIGINT AS v FROM range({rows}) r(i))
+"""]
+query = "SELECT s::vs_cents FROM t"
+check = """
+SELECT ((SELECT count(*) FROM t WHERE s::vs_cents::BIGINT IS DISTINCT FROM v)
+      + (SELECT count(*)
+         FROM (VALUES ('92233720368547758.07', 9223372036854775807::BIGINT),
+                      ('-92233720368547758.08', (-9223372036854775808)::BIGINT),
+                      ('92233720368547758.08', NULL), ('-92233720368547758.09', NULL),
+                      ('1.5', 150), ('-0.05', -5), ('007', 700), ('-0', 0), ('0.00', 0),
+                      ('', NULL), ('-', NULL), ('.5', NULL), ('1.', NULL), ('1.234', NULL), ('1e5', NULL),
+                      (' 1', NULL), ('1 ', NULL), ('+1', NULL), ('--1', NULL), ('1.-5', NULL),
+                      ('99999999999999999999', NULL), ('ünïcode', NULL), (NULL, NULL)) e(text, expected)
+         WHERE TRY_CAST(text AS vs_cents)::BIGINT IS DISTINCT FROM expected
+            OR (text IS NOT NULL AND expected IS NULL AND try(CAST(text AS vs_cents) IS NULL) IS NOT NULL)))::VARCHAR
+"""
+expect = "0"
+
+# The filter slices its output, so the cast receives a selection of the scanned vector.
+[[case]]
+name = "varchar_to_cents/filtered"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT v, printf('%s%d.%02d', CASE WHEN v < 0 THEN '-' ELSE '' END, abs(v) // 100, abs(v) % 100) AS s
+FROM (SELECT ((i * 7919) % 2000001 - 1000000)::BIGINT AS v FROM range({rows}) r(i))
+"""]
+query = "SELECT s::vs_cents FROM t WHERE v % 3 <> 1"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT v, s::vs_cents AS c FROM t WHERE v % 3 <> 1)
+WHERE c::BIGINT IS DISTINCT FROM v
+"""
+expect = "0"
+
+[[case]]
+name = "varchar_to_cents/in_where"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT v, printf('%s%d.%02d', CASE WHEN v < 0 THEN '-' ELSE '' END, abs(v) // 100, abs(v) % 100) AS s
+FROM (SELECT ((i * 7919) % 2000001 - 1000000)::BIGINT AS v FROM range({rows}) r(i))
+"""]
+query = "SELECT v FROM t WHERE s::vs_cents::BIGINT % 7 = 0"
+check = "SELECT count(*)::VARCHAR FROM t WHERE (s::vs_cents::BIGINT % 7 = 0) IS DISTINCT FROM (v % 7 = 0)"
+expect = "0"
+
+[[case]]
+name = "varchar_to_cents/try_0"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT v, printf('%s%d.%02d', CASE WHEN v < 0 THEN '-' ELSE '' END, abs(v) // 100, abs(v) % 100) AS s
+FROM (SELECT ((i * 7919) % 2000001 - 1000000)::BIGINT AS v FROM range({rows}) r(i))
+"""]
+query = "SELECT TRY_CAST(s AS vs_cents) FROM t"
+check = "SELECT count(*)::VARCHAR FROM t WHERE TRY_CAST(s AS vs_cents)::BIGINT IS DISTINCT FROM v"
+expect = "0"
+
+# `v` is NULL on the rows whose text does not parse.
+[[case]]
+name = "varchar_to_cents/try_1"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT CASE WHEN i % 100 = 7 THEN NULL ELSE v END AS v,
+       CASE WHEN i % 100 = 7 THEN ['bad', '12.345', '', '-', '1.', '.5', '1x', '99999999999999999999'][i // 100 % 8 + 1]
+            ELSE printf('%s%d.%02d', CASE WHEN v < 0 THEN '-' ELSE '' END, abs(v) // 100, abs(v) % 100) END AS s
+FROM (SELECT i, ((i * 7919) % 2000001 - 1000000)::BIGINT AS v FROM range({rows}) r(i))
+"""]
+query = "SELECT TRY_CAST(s AS vs_cents) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE TRY_CAST(s AS vs_cents)::BIGINT IS DISTINCT FROM v)
+      + (count(*) FILTER (WHERE v IS NULL) <> ({rows} + 92) // 100)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "varchar_to_cents/try_50"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT CASE WHEN i % 2 = 1 THEN NULL ELSE v END AS v,
+       CASE WHEN i % 2 = 1 THEN ['bad', '12.345', '', '-', '1.', '.5', '1x', '99999999999999999999'][i // 2 % 8 + 1]
+            ELSE printf('%s%d.%02d', CASE WHEN v < 0 THEN '-' ELSE '' END, abs(v) // 100, abs(v) % 100) END AS s
+FROM (SELECT i, ((i * 7919) % 2000001 - 1000000)::BIGINT AS v FROM range({rows}) r(i))
+"""]
+query = "SELECT TRY_CAST(s AS vs_cents) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE TRY_CAST(s AS vs_cents)::BIGINT IS DISTINCT FROM v)
+      + (count(*) FILTER (WHERE v IS NULL) <> {rows} // 2)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# A validation filter: the try cast runs inside WHERE and drops the rows that do not parse.
+[[case]]
+name = "varchar_to_cents/try_in_where"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT CASE WHEN i % 100 = 7 THEN NULL ELSE v END AS v,
+       CASE WHEN i % 100 = 7 THEN ['bad', '12.345', '', '-', '1.', '.5', '1x', '99999999999999999999'][i // 100 % 8 + 1]
+            ELSE printf('%s%d.%02d', CASE WHEN v < 0 THEN '-' ELSE '' END, abs(v) // 100, abs(v) % 100) END AS s
+FROM (SELECT i, ((i * 7919) % 2000001 - 1000000)::BIGINT AS v FROM range({rows}) r(i))
+"""]
+query = "SELECT v FROM t WHERE TRY_CAST(s AS vs_cents) IS NOT NULL"
+check = """
+SELECT ((SELECT count(*) FROM t WHERE TRY_CAST(s AS vs_cents) IS NOT NULL)
+        <> (SELECT count(*) FROM t WHERE v IS NOT NULL))::BIGINT::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "varchar_to_cents/nulls_10"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT v, printf('%s%d.%02d', CASE WHEN v < 0 THEN '-' ELSE '' END, abs(v) // 100, abs(v) % 100) AS s
+FROM (SELECT CASE WHEN i % 10 = 9 THEN NULL ELSE ((i * 7919) % 2000001 - 1000000)::BIGINT END AS v
+      FROM range({rows}) r(i))
+"""]
+query = "SELECT s::vs_cents FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE s::vs_cents::BIGINT IS DISTINCT FROM v)
+      + (count(*) FILTER (WHERE s IS NULL) <> {rows} // 10)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "varchar_to_cents/nulls_50"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT v, printf('%s%d.%02d', CASE WHEN v < 0 THEN '-' ELSE '' END, abs(v) // 100, abs(v) % 100) AS s
+FROM (SELECT CASE WHEN i % 2 = 1 THEN NULL ELSE ((i * 7919) % 2000001 - 1000000)::BIGINT END AS v
+      FROM range({rows}) r(i))
+"""]
+query = "SELECT s::vs_cents FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE s::vs_cents::BIGINT IS DISTINCT FROM v)
+      + (count(*) FILTER (WHERE s IS NULL) <> {rows} // 2)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "varchar_to_cents/nulls_100"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT NULL::VARCHAR AS s FROM range({rows}) r(i)"]
+query = "SELECT s::vs_cents FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE s::vs_cents IS NOT NULL) + (count(*) <> {rows})::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# The single-row side of a cross product reaches the cast as a CONSTANT vector, converted as one row.
+[[case]]
+name = "varchar_to_cents/constant"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT i FROM range({rows}) r(i)"]
+query = "SELECT CAST(k.s AS vs_cents) FROM t CROSS JOIN (SELECT '12.34' AS s) k"
+check = """
+SELECT (count(*) FILTER (WHERE CAST(k.s AS vs_cents)::BIGINT IS DISTINCT FROM 1234)
+      + (count(*) <> {rows})::BIGINT)::VARCHAR
+FROM t CROSS JOIN (SELECT '12.34' AS s) k
+"""
+expect = "0"
+
+[[case]]
+name = "varchar_to_cents/unprepared"
+rows = [1, 2048, 100_000]
+unprepared = true
+setup = ["""
+CREATE TABLE t AS
+SELECT v, printf('%s%d.%02d', CASE WHEN v < 0 THEN '-' ELSE '' END, abs(v) // 100, abs(v) % 100) AS s
+FROM (SELECT ((i * 7919) % 2000001 - 1000000)::BIGINT AS v FROM range({rows}) r(i))
+"""]
+query = "SELECT s::vs_cents FROM t"
+check = "SELECT count(*)::VARCHAR FROM t WHERE s::vs_cents::BIGINT IS DISTINCT FROM v"
+expect = "0"
+
+# vs_cents -> VARCHAR
+
+# At most 10 characters, so every result is inlined.
+[[case]]
+name = "cents_to_varchar/short"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT v, v::vs_cents AS c FROM (SELECT ((i * 7919) % 2000001 - 1000000)::BIGINT AS v FROM range({rows}) r(i))
+"""]
+query = "SELECT c::VARCHAR FROM t"
+check = """
+SELECT ((SELECT count(*) FROM t
+         WHERE c::VARCHAR IS DISTINCT FROM
+               printf('%s%d.%02d', CASE WHEN v < 0 THEN '-' ELSE '' END, abs(v) // 100, abs(v) % 100))
+      + (SELECT count(*)
+         FROM (VALUES ((-9223372036854775808)::BIGINT, '-92233720368547758.08'),
+                      (9223372036854775807::BIGINT, '92233720368547758.07'), (0, '0.00'), (5, '0.05'),
+                      (-5, '-0.05'), (-100, '-1.00'), (123456, '1234.56'), (NULL, NULL)) e(v, expected)
+         WHERE v::vs_cents::VARCHAR IS DISTINCT FROM expected))::VARCHAR
+"""
+expect = "0"
+
+# 17 or 18 characters, so every result goes to the vector's string heap.
+[[case]]
+name = "cents_to_varchar/long"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT v, v::vs_cents AS c
+FROM (SELECT ((i * 7919) % 2000001 - 1000000 + CASE WHEN i % 2 = 0 THEN 2000000 ELSE -2000000 END)
+             * 1000000007 AS v
+      FROM range({rows}) r(i))
+"""]
+query = "SELECT c::VARCHAR FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE c::VARCHAR IS DISTINCT FROM
+              printf('%s%d.%02d', CASE WHEN v < 0 THEN '-' ELSE '' END, abs(v) // 100, abs(v) % 100))
+      + (min(length(c::VARCHAR)) <= 12)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "cents_to_varchar/nulls_50"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT v, v::vs_cents AS c
+FROM (SELECT CASE WHEN i % 2 = 1 THEN NULL ELSE ((i * 7919) % 2000001 - 1000000)::BIGINT END AS v
+      FROM range({rows}) r(i))
+"""]
+query = "SELECT c::VARCHAR FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE c::VARCHAR IS DISTINCT FROM
+              printf('%s%d.%02d', CASE WHEN v < 0 THEN '-' ELSE '' END, abs(v) // 100, abs(v) % 100))
+      + (count(*) FILTER (WHERE c IS NULL) <> {rows} // 2)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# DOUBLE -> vs_cents -> VARCHAR -> vs_cents: three custom casts in a row.
+[[case]]
+name = "chained"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT (((i * 7919) % 2000001) - 1000000)::DOUBLE / 1000 AS d FROM range({rows}) r(i)"]
+query = "SELECT d::vs_cents::VARCHAR::vs_cents FROM t"
+check = """
+SELECT count(*) FILTER (WHERE d::vs_cents::VARCHAR::vs_cents::BIGINT IS DISTINCT FROM round(d * 100)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# BIGINT <-> vs_hex
+
+# At most 4 digits, so every result is inlined.
+[[case]]
+name = "bigint_to_hex/short"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT (i * 7919 % 65536)::BIGINT AS v FROM range({rows}) r(i)"]
+query = "SELECT v::vs_hex FROM t"
+check = """
+SELECT ((SELECT count(*) FROM t WHERE v::vs_hex::VARCHAR IS DISTINCT FROM to_hex(v))
+      + (SELECT count(*)
+         FROM (VALUES (0::BIGINT), (-1::BIGINT), (15::BIGINT), (16::BIGINT), ((-9223372036854775808)::BIGINT),
+                      (9223372036854775807::BIGINT), (NULL::BIGINT)) e(v)
+         WHERE v::vs_hex::VARCHAR IS DISTINCT FROM to_hex(v)))::VARCHAR
+"""
+expect = "0"
+
+# 15 or 16 digits, so every result goes to the vector's string heap.
+[[case]]
+name = "bigint_to_hex/long"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT (hash(i) >> 1)::BIGINT | 1152921504606846976 * CASE WHEN i % 2 = 0 THEN 1 ELSE -1 END AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT v::vs_hex FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE v::vs_hex::VARCHAR IS DISTINCT FROM to_hex(v))
+      + (min(length(v::vs_hex::VARCHAR)) < 15)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# Even rows are lowercase.
+[[case]]
+name = "hex_to_bigint/project"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT v, (CASE WHEN i % 2 = 0 THEN lower(to_hex(v)) ELSE to_hex(v) END)::vs_hex AS h
+FROM (SELECT i, (hash(i) >> (i % 63 + 1))::BIGINT * CASE WHEN i % 3 = 0 THEN -1 ELSE 1 END AS v FROM range({rows}) r(i))
+"""]
+query = "SELECT h::BIGINT FROM t"
+check = """
+SELECT ((SELECT count(*) FROM t WHERE h::BIGINT IS DISTINCT FROM v)
+      + (SELECT count(*)
+         FROM (VALUES ('0', 0::BIGINT), ('ff', 255), ('Ff', 255), ('FFFFFFFFFFFFFFFF', -1),
+                      ('8000000000000000', (-9223372036854775808)::BIGINT), ('0000000000000001', 1),
+                      ('00000000000000001', NULL), ('', NULL), ('g', NULL), ('0x1', NULL), (' 1', NULL),
+                      ('-1', NULL), (NULL, NULL)) e(text, expected)
+         WHERE TRY_CAST(text::vs_hex AS BIGINT) IS DISTINCT FROM expected
+            OR (text IS NOT NULL AND expected IS NULL AND try(CAST(text::vs_hex AS BIGINT) IS NULL) IS NOT NULL)))::VARCHAR
+"""
+expect = "0"
+
+# `v` is NULL on the rows whose text is not hex.
+[[case]]
+name = "hex_to_bigint/try_1"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT CASE WHEN i % 100 = 7 THEN NULL ELSE v END AS v,
+       (CASE WHEN i % 100 = 7 THEN ['xyz', '', '12G4', '00000000000000001'][i // 100 % 4 + 1]
+             ELSE to_hex(v) END)::vs_hex AS h
+FROM (SELECT i, (hash(i) >> (i % 63 + 1))::BIGINT AS v FROM range({rows}) r(i))
+"""]
+query = "SELECT TRY_CAST(h AS BIGINT) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE TRY_CAST(h AS BIGINT) IS DISTINCT FROM v)
+      + (count(*) FILTER (WHERE v IS NULL) <> ({rows} + 92) // 100)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# vs_cents -> vs_hex: a cast between two custom types.
+[[case]]
+name = "cents_to_hex/project"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT ((i * 7919) % 2000001 - 1000000)::BIGINT::vs_cents AS c FROM range({rows}) r(i)"]
+query = "SELECT c::vs_hex FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE c::vs_hex::VARCHAR IS DISTINCT FROM to_hex(c::BIGINT))
+      + (max(typeof(c::vs_hex)) <> 'vs_hex')::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# INSERT converts each column to its declared type with the custom cast. The setup inserts once for the check.
+
+[[case]]
+name = "insert/double"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = [
+    "CREATE TABLE src AS SELECT i AS id, (((i * 7919) % 2000001) - 1000000)::DOUBLE / 1000 AS d FROM range({rows}) r(i)",
+    "CREATE TABLE target (id BIGINT, c vs_cents)",
+    "INSERT INTO target SELECT id, d FROM src",
+]
+query = "INSERT INTO target SELECT id, d FROM src"
+reset = "TRUNCATE target"
+check = """
+SELECT ((SELECT count(*) FROM src LEFT JOIN target USING (id)
+         WHERE target.c::BIGINT IS DISTINCT FROM round(src.d * 100)::BIGINT)
+      + ((SELECT count(*) FROM target) <> {rows})::BIGINT)::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "insert/varchar"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = [
+    """
+CREATE TABLE src AS
+SELECT id, v, printf('%s%d.%02d', CASE WHEN v < 0 THEN '-' ELSE '' END, abs(v) // 100, abs(v) % 100) AS s
+FROM (SELECT i AS id, ((i * 7919) % 2000001 - 1000000)::BIGINT AS v FROM range({rows}) r(i))
+""",
+    "CREATE TABLE target (id BIGINT, c vs_cents)",
+    "INSERT INTO target SELECT id, s FROM src",
+]
+query = "INSERT INTO target SELECT id, s FROM src"
+reset = "TRUNCATE target"
+check = """
+SELECT ((SELECT count(*) FROM src LEFT JOIN target USING (id) WHERE target.c::BIGINT IS DISTINCT FROM src.v)
+      + ((SELECT count(*) FROM target) <> {rows})::BIGINT)::VARCHAR
+"""
+expect = "0"
+
+# Several casts in one query
+
+[[case]]
+name = "many_casts"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT v, v::vs_cents AS c, v::DOUBLE / 100 + 0.001 AS d,
+       printf('%s%d.%02d', CASE WHEN v < 0 THEN '-' ELSE '' END, abs(v) // 100, abs(v) % 100) AS s
+FROM (SELECT ((i * 7919) % 2000001 - 1000000)::BIGINT AS v FROM range({rows}) r(i))
+"""]
+query = "SELECT s::vs_cents, c::VARCHAR, d::vs_cents, v::vs_hex, c::vs_hex FROM t"
+check = """
+SELECT count(*) FILTER (WHERE s::vs_cents::BIGINT IS DISTINCT FROM v
+                           OR c::VARCHAR IS DISTINCT FROM s
+                           OR d::vs_cents::BIGINT IS DISTINCT FROM v
+                           OR v::vs_hex::VARCHAR IS DISTINCT FROM to_hex(v)
+                           OR c::vs_hex::VARCHAR IS DISTINCT FROM to_hex(v))::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# Every cast on one row: the per-query and per-callback costs.
+[[case]]
+name = "one_row"
+rows = [1]
+setup = ["""
+CREATE TABLE t AS
+SELECT '-12.34' AS s, (-1234)::vs_cents AS c, 12.345::DOUBLE AS d, 255::BIGINT AS v, 'ff'::vs_hex AS h
+FROM range({rows}) r(i)
+"""]
+query = "SELECT s::vs_cents, c::DOUBLE, c::VARCHAR, d::vs_cents, v::vs_hex, h::BIGINT, c::vs_hex FROM t"
+check = """
+SELECT concat_ws(' ', s::vs_cents::BIGINT, c::DOUBLE, c::VARCHAR, d::vs_cents::BIGINT, v::vs_hex::VARCHAR, h::BIGINT,
+                 c::vs_hex::VARCHAR)
+FROM t
+"""
+expect = "-1234 -12.34 -12.34 1235 FF 255 FFFFFFFFFFFFFB2E"

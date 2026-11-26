@@ -1,0 +1,460 @@
+# String scalar functions, compared with builtin SQL; see `../rust/scalar_str.rs` for the semantics.
+#
+# Inputs are built from md5 hex digits with '0' replaced by a space, so they hold words and lowercase letters:
+# short is 1 to 12 bytes (inlined), medium 13 to 40, long 200 to 2,000; mixed adds empty strings to all three.
+# `upper` stands for the builtin ASCII-only uppercase,
+# translate(s, 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ').
+
+# vs_len -------------------------------------------------------------------------------------------------------------
+
+[[case]]
+name = "len/short"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT i, replace(left(md5(i::VARCHAR), 1 + i % 12), '0', ' ') AS s FROM range({rows}) r(i)"]
+query = "SELECT vs_len(s) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_len(s) IS DISTINCT FROM strlen(s))
+        + (vs_len('') <> 0)::BIGINT + (vs_len('héllo 🦆') <> 11)::BIGINT
+        + (vs_len(NULL) IS NOT NULL)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "len/long"
+rows = [1, 2048, 100_000]
+setup = ["CREATE TABLE t AS SELECT i, replace(left(repeat(md5(i::VARCHAR), 63), 200 + i % 1801), '0', ' ') AS s FROM range({rows}) r(i)"]
+query = "SELECT vs_len(s) FROM t"
+check = "SELECT count(*) FILTER (WHERE vs_len(s) IS DISTINCT FROM strlen(s))::VARCHAR FROM t"
+expect = "0"
+
+[[case]]
+name = "len/nulls_50"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, CASE WHEN i % 2 = 1 THEN NULL ELSE replace(left(md5(i::VARCHAR), 1 + i % 12), '0', ' ') END AS s
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_len(s) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_len(s) IS DISTINCT FROM strlen(s))
+        + (count(vs_len(s)) <> ({rows} + 1) // 2)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# The function filters rows itself.
+[[case]]
+name = "len/in_where"
+rows = [1, 2048, 100_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, CASE i % 8
+    WHEN 0 THEN ''
+    WHEN 1 THEN replace(left(repeat(md5(i::VARCHAR), 63), 200 + i % 1801), '0', ' ')
+    WHEN 2 THEN replace(left(md5(i::VARCHAR) || md5((i + 1)::VARCHAR), 13 + i % 28), '0', ' ')
+    WHEN 3 THEN replace(left(md5(i::VARCHAR) || md5((i + 1)::VARCHAR), 13 + i % 28), '0', ' ')
+    ELSE replace(left(md5(i::VARCHAR), 1 + i % 12), '0', ' ') END AS s
+FROM range({rows}) r(i)
+"""]
+query = "SELECT i FROM t WHERE vs_len(s) > 30"
+check = """
+SELECT (count(*) FILTER (WHERE (vs_len(s) > 30) IS DISTINCT FROM (strlen(s) > 30))
+        + ((SELECT count(*) FROM t WHERE vs_len(s) > 30) <> (SELECT count(*) FROM t WHERE strlen(s) > 30))::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# vs_upper_ascii -----------------------------------------------------------------------------------------------------
+
+[[case]]
+name = "upper_ascii/short"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT i, replace(left(md5(i::VARCHAR), 1 + i % 12), '0', ' ') AS s FROM range({rows}) r(i)"]
+query = "SELECT vs_upper_ascii(s) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_upper_ascii(s)
+                         IS DISTINCT FROM translate(s, 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'))
+        + (vs_upper_ascii('') <> '')::BIGINT + (vs_upper_ascii('aZ09_~ yz') <> 'AZ09_~ YZ')::BIGINT
+        + (vs_upper_ascii(NULL) IS NOT NULL)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "upper_ascii/medium"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT i, replace(left(md5(i::VARCHAR) || md5((i + 1)::VARCHAR), 13 + i % 28), '0', ' ') AS s FROM range({rows}) r(i)"]
+query = "SELECT vs_upper_ascii(s) FROM t"
+check = """
+SELECT count(*) FILTER (WHERE vs_upper_ascii(s)
+                        IS DISTINCT FROM translate(s, 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'))::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "upper_ascii/long"
+rows = [1, 2048, 100_000]
+setup = ["CREATE TABLE t AS SELECT i, replace(left(repeat(md5(i::VARCHAR), 63), 200 + i % 1801), '0', ' ') AS s FROM range({rows}) r(i)"]
+query = "SELECT vs_upper_ascii(s) FROM t"
+check = """
+SELECT count(*) FILTER (WHERE vs_upper_ascii(s)
+                        IS DISTINCT FROM translate(s, 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'))::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# Multi-byte characters pass through unchanged.
+[[case]]
+name = "upper_ascii/non_ascii"
+rows = [1, 2048, 100_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, CASE i % 3
+    WHEN 0 THEN 'Ärger über ' || md5(i::VARCHAR)
+    WHEN 1 THEN 'naïve café ' || (i % 1000)::VARCHAR
+    ELSE '🦆 日本語 ' || left(md5(i::VARCHAR), i % 7) END AS s
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_upper_ascii(s) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_upper_ascii(s)
+                         IS DISTINCT FROM translate(s, 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'))
+        + (vs_upper_ascii('ärger ß é') <> 'äRGER ß é')::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# A selective filter slices the scan, so the function receives a small selection of each vector.
+[[case]]
+name = "upper_ascii/filter_10pct"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT i, replace(left(md5(i::VARCHAR) || md5((i + 1)::VARCHAR), 1 + i % 40), '0', ' ') AS s FROM range({rows}) r(i)"]
+query = "SELECT vs_upper_ascii(s) FROM t WHERE i % 10 = 0"
+check = """
+SELECT count(*) FILTER (WHERE u IS DISTINCT FROM translate(s, 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'))::VARCHAR
+FROM (SELECT s, vs_upper_ascii(s) AS u FROM t WHERE i % 10 = 0)
+"""
+expect = "0"
+
+[[case]]
+name = "upper_ascii/filter_90pct"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT i, replace(left(md5(i::VARCHAR) || md5((i + 1)::VARCHAR), 1 + i % 40), '0', ' ') AS s FROM range({rows}) r(i)"]
+query = "SELECT vs_upper_ascii(s) FROM t WHERE i % 10 <> 1"
+check = """
+SELECT count(*) FILTER (WHERE u IS DISTINCT FROM translate(s, 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'))::VARCHAR
+FROM (SELECT s, vs_upper_ascii(s) AS u FROM t WHERE i % 10 <> 1)
+"""
+expect = "0"
+
+[[case]]
+name = "upper_ascii/all_null"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT i, NULL::VARCHAR AS s FROM range({rows}) r(i)"]
+query = "SELECT vs_upper_ascii(s) FROM t"
+check = "SELECT count(vs_upper_ascii(s))::VARCHAR FROM t"
+expect = "0"
+
+# vs_wrap ------------------------------------------------------------------------------------------------------------
+
+# Constant affixes; the results straddle the 12-byte inline limit.
+[[case]]
+name = "wrap/constant_affixes"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT i, replace(left(md5(i::VARCHAR), 1 + i % 12), '0', ' ') AS s FROM range({rows}) r(i)"]
+query = "SELECT vs_wrap(s, '<', '>') FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_wrap(s, '<', '>') IS DISTINCT FROM '<' || s || '>')
+        + (vs_wrap('', '', '') <> '')::BIGINT + (vs_wrap('abcdefghij', 'xy', 'z') <> 'xyabcdefghijz')::BIGINT
+        + (vs_wrap('a', NULL, 'b') IS NOT NULL)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# Column affixes of varying length; about 10% of the prefixes are NULL.
+[[case]]
+name = "wrap/column_affixes"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i,
+    replace(left(md5(i::VARCHAR) || md5((i + 1)::VARCHAR), 13 + i % 28), '0', ' ') AS s,
+    CASE WHEN i % 10 = 9 THEN NULL ELSE left('[[[[[[[[', i % 9) END AS p,
+    left(']]]]]]]]]]]]]]]]', i % 17) AS x
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_wrap(s, p, x) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_wrap(s, p, x) IS DISTINCT FROM p || s || x)
+        + (count(vs_wrap(s, p, x)) <> count(p))::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# The joined one-row table reaches the function as a constant vector next to a column.
+[[case]]
+name = "wrap/constant_input"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = [
+    "CREATE TABLE t AS SELECT i, replace(left(md5(i::VARCHAR), 1 + i % 12), '0', ' ') AS s FROM range({rows}) r(i)",
+    "CREATE TABLE k AS SELECT 'a constant value longer than inline' AS c",
+]
+query = "SELECT vs_wrap(k.c, t.s, '!') FROM t, k"
+check = "SELECT count(*) FILTER (WHERE vs_wrap(k.c, t.s, '!') IS DISTINCT FROM t.s || k.c || '!')::VARCHAR FROM t, k"
+expect = "0"
+
+# vs_repeat ----------------------------------------------------------------------------------------------------------
+
+# Counts from -1 (NULL) through 4 over short strings.
+[[case]]
+name = "repeat/short"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT i, replace(left(md5(i::VARCHAR), 1 + i % 12), '0', ' ') AS s, (i % 6)::INTEGER - 1 AS n FROM range({rows}) r(i)"]
+query = "SELECT vs_repeat(s, n) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_repeat(s, n) IS DISTINCT FROM CASE WHEN n < 0 THEN NULL ELSE repeat(s, n) END)
+        + (vs_repeat('ab', 0) <> '')::BIGINT + (vs_repeat('ab', -1) IS NOT NULL)::BIGINT
+        + (vs_repeat('', 5) <> '')::BIGINT + (vs_repeat('ab', 7) <> 'ababababababab')::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# Outputs of 130 to 2,360 bytes.
+[[case]]
+name = "repeat/long_output"
+rows = [1, 2048, 100_000]
+setup = ["CREATE TABLE t AS SELECT i, replace(left(md5(i::VARCHAR) || md5((i + 1)::VARCHAR), 13 + i % 28), '0', ' ') AS s, (10 + i % 50)::INTEGER AS n FROM range({rows}) r(i)"]
+query = "SELECT vs_repeat(s, n) FROM t"
+check = "SELECT count(*) FILTER (WHERE vs_repeat(s, n) IS DISTINCT FROM repeat(s, n))::VARCHAR FROM t"
+expect = "0"
+
+# vs_first_word ------------------------------------------------------------------------------------------------------
+
+# Mixed lengths with about 10% NULLs; most words are short.
+[[case]]
+name = "first_word/mixed_nulls_10"
+rows = [1, 2048, 100_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, CASE
+    WHEN i % 10 = 9 THEN NULL
+    WHEN i % 8 = 0 THEN ''
+    WHEN i % 8 = 1 THEN replace(left(repeat(md5(i::VARCHAR), 63), 200 + i % 1801), '0', ' ')
+    WHEN i % 8 IN (2, 3) THEN replace(left(md5(i::VARCHAR) || md5((i + 1)::VARCHAR), 13 + i % 28), '0', ' ')
+    ELSE replace(left(md5(i::VARCHAR), 1 + i % 12), '0', ' ') END AS s
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_first_word(s) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_first_word(s) IS DISTINCT FROM split_part(s, ' ', 1))
+        + (vs_first_word(' lead') <> '')::BIGINT + (vs_first_word('one') <> 'one')::BIGINT
+        + (vs_first_word('a longer first word here') <> 'a')::BIGINT
+        + (vs_first_word('unbroken_word_longer_than_inline rest') <> 'unbroken_word_longer_than_inline')::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# vs_count_char ------------------------------------------------------------------------------------------------------
+
+[[case]]
+name = "count_char/constant_long"
+rows = [1, 2048, 100_000]
+setup = ["CREATE TABLE t AS SELECT i, replace(left(repeat(md5(i::VARCHAR), 63), 200 + i % 1801), '0', ' ') AS s FROM range({rows}) r(i)"]
+query = "SELECT vs_count_char(s, ' ') FROM t"
+check = """
+SELECT count(*) FILTER (WHERE vs_count_char(s, ' ') IS DISTINCT FROM strlen(s) - strlen(replace(s, ' ', '')))::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# The character varies per row; the edge checks cover the errors for '' and multi-byte `c`.
+[[case]]
+name = "count_char/column"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, replace(left(md5(i::VARCHAR) || md5((i + 1)::VARCHAR), 13 + i % 28), '0', ' ') AS s,
+    substr('a b9c', 1 + i % 5, 1) AS c
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_count_char(s, c) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_count_char(s, c) IS DISTINCT FROM strlen(s) - strlen(replace(s, c, '')))
+        + (try(vs_count_char('abc', 'ab')) IS NOT NULL)::BIGINT + (try(vs_count_char('abc', '')) IS NOT NULL)::BIGINT
+        + (try(vs_count_char('é', 'é')) IS NOT NULL)::BIGINT + (vs_count_char('', 'a') <> 0)::BIGINT
+        + (vs_count_char(NULL, 'ab') IS NOT NULL)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# vs_has_prefix_any --------------------------------------------------------------------------------------------------
+
+# The function filters rows itself, at about 13% selectivity.
+[[case]]
+name = "has_prefix_any/in_where"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT i, replace(left(md5(i::VARCHAR), 1 + i % 12), '0', ' ') AS s FROM range({rows}) r(i)"]
+query = "SELECT i FROM t WHERE vs_has_prefix_any(s, 'a,b,c1')"
+check = """
+SELECT (count(*) FILTER (WHERE vs_has_prefix_any(s, 'a,b,c1')
+                         IS DISTINCT FROM (starts_with(s, 'a') OR starts_with(s, 'b') OR starts_with(s, 'c1')))
+        + ((SELECT count(*) FROM t WHERE vs_has_prefix_any(s, 'a,b,c1'))
+           <> (SELECT count(*) FROM t WHERE starts_with(s, 'a') OR starts_with(s, 'b') OR starts_with(s, 'c1')))::BIGINT
+        + (vs_has_prefix_any('abc', '') IS DISTINCT FROM true)::BIGINT
+        + (vs_has_prefix_any('abc', 'x,') IS DISTINCT FROM true)::BIGINT
+        + (vs_has_prefix_any('abc', 'x,abcd,bc') IS DISTINCT FROM false)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "has_prefix_any/nulls_10"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, CASE WHEN i % 10 = 9 THEN NULL
+    ELSE replace(left(md5(i::VARCHAR) || md5((i + 1)::VARCHAR), 13 + i % 28), '0', ' ') END AS s
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_has_prefix_any(s, 'ab,cd,e,f 1,9') FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_has_prefix_any(s, 'ab,cd,e,f 1,9')
+                         IS DISTINCT FROM (starts_with(s, 'ab') OR starts_with(s, 'cd') OR starts_with(s, 'e')
+                                           OR starts_with(s, 'f 1') OR starts_with(s, '9')))
+        + (count(vs_has_prefix_any(s, 'ab,cd,e,f 1,9')) <> count(s))::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# Each iteration parses and binds again, splitting the prefixes.
+[[case]]
+name = "has_prefix_any/unprepared"
+rows = [1, 2048]
+unprepared = true
+setup = ["CREATE TABLE t AS SELECT i, replace(left(md5(i::VARCHAR), 1 + i % 12), '0', ' ') AS s FROM range({rows}) r(i)"]
+query = "SELECT vs_has_prefix_any(s, 'a,b,c,d,e,f,1,2,3,4') FROM t"
+check = """
+SELECT count(*) FILTER (WHERE vs_has_prefix_any(s, 'a,b,c,d,e,f,1,2,3,4')
+                        IS DISTINCT FROM regexp_matches(s, '^[a-f1-4]'))::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# vs_null_if_empty ---------------------------------------------------------------------------------------------------
+
+# Special NULL handling: a third of the values are empty and about 10% are NULL.
+[[case]]
+name = "null_if_empty/mixed"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, CASE WHEN i % 10 = 9 THEN NULL WHEN i % 3 = 0 THEN ''
+    ELSE replace(left(md5(i::VARCHAR) || md5((i + 1)::VARCHAR), 1 + i % 40), '0', ' ') END AS s
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_null_if_empty(s) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_null_if_empty(s) IS DISTINCT FROM nullif(s, ''))
+        + (vs_null_if_empty('') IS NOT NULL)::BIGINT + (vs_null_if_empty(NULL) IS NOT NULL)::BIGINT
+        + (vs_null_if_empty(' ') IS DISTINCT FROM ' ')::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "null_if_empty/all_null"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT i, NULL::VARCHAR AS s FROM range({rows}) r(i)"]
+query = "SELECT vs_null_if_empty(s) FROM t"
+check = "SELECT count(vs_null_if_empty(s))::VARCHAR FROM t"
+expect = "0"
+
+# Combinations -------------------------------------------------------------------------------------------------------
+
+[[case]]
+name = "combined/nested"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT i, replace(left(md5(i::VARCHAR) || md5((i + 1)::VARCHAR), 1 + i % 40), '0', ' ') AS s FROM range({rows}) r(i)"]
+query = "SELECT vs_upper_ascii(vs_wrap(vs_first_word(s), '[', ']')) FROM t"
+check = """
+SELECT count(*) FILTER (WHERE vs_upper_ascii(vs_wrap(vs_first_word(s), '[', ']'))
+                        IS DISTINCT FROM '[' || upper(split_part(s, ' ', 1)) || ']')::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "combined/many_calls"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT i, replace(left(md5(i::VARCHAR) || md5((i + 1)::VARCHAR), 1 + i % 40), '0', ' ') AS s FROM range({rows}) r(i)"]
+query = "SELECT vs_len(s), vs_upper_ascii(s), vs_first_word(s), vs_null_if_empty(s), vs_count_char(s, 'a') FROM t"
+check = """
+SELECT count(*) FILTER (WHERE vs_len(s) IS DISTINCT FROM strlen(s)
+                           OR vs_upper_ascii(s) IS DISTINCT FROM upper(s)
+                           OR vs_first_word(s) IS DISTINCT FROM split_part(s, ' ', 1)
+                           OR vs_null_if_empty(s) IS DISTINCT FROM nullif(s, '')
+                           OR vs_count_char(s, 'a') IS DISTINCT FROM strlen(s) - strlen(replace(s, 'a', '')))::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# Function results feed aggregates rather than the result set.
+[[case]]
+name = "combined/aggregate_argument"
+rows = [1, 2048, 100_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, CASE i % 8
+    WHEN 0 THEN ''
+    WHEN 1 THEN replace(left(repeat(md5(i::VARCHAR), 63), 200 + i % 1801), '0', ' ')
+    WHEN 2 THEN replace(left(md5(i::VARCHAR) || md5((i + 1)::VARCHAR), 13 + i % 28), '0', ' ')
+    WHEN 3 THEN replace(left(md5(i::VARCHAR) || md5((i + 1)::VARCHAR), 13 + i % 28), '0', ' ')
+    ELSE replace(left(md5(i::VARCHAR), 1 + i % 12), '0', ' ') END AS s
+FROM range({rows}) r(i)
+"""]
+query = "SELECT sum(vs_len(vs_upper_ascii(s))), max(vs_first_word(s)) FROM t"
+check = """
+SELECT ((SELECT sum(vs_len(vs_upper_ascii(s))) IS DISTINCT FROM sum(strlen(s))
+             OR max(vs_first_word(s)) IS DISTINCT FROM max(split_part(s, ' ', 1)) FROM t))::INTEGER::VARCHAR
+"""
+expect = "0"
+
+# Low-cardinality values in a compressed database reach the function dictionary-encoded, and its result is the
+# grouping key.
+[[case]]
+name = "combined/group_by_dictionary"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = [
+    "ATTACH ':memory:' AS compressed (COMPRESS)",
+    "USE compressed",
+    """
+CREATE TABLE t AS
+SELECT i, (['alpha beta', 'gamma', 'a much longer first word value', '', ' leading space', 'Ünïcode wörds here',
+            'delta epsilon zeta'])[1 + i % 7] AS s
+FROM range({rows}) r(i)
+""",
+    "CHECKPOINT",
+]
+query = "SELECT vs_first_word(s) AS w, count(*) FROM t GROUP BY w"
+check = """
+WITH f AS (SELECT vs_first_word(s) AS w, count(*) AS n FROM t GROUP BY w),
+     b AS (SELECT split_part(s, ' ', 1) AS w, count(*) AS n FROM t GROUP BY w)
+SELECT ((SELECT count(*) FROM (FROM f EXCEPT ALL FROM b)) + (SELECT count(*) FROM (FROM b EXCEPT ALL FROM f)))::VARCHAR
+"""
+expect = "0"
+
+# Fixed per-query and per-call costs.
+[[case]]
+name = "combined/one_row"
+rows = [1]
+setup = ["CREATE TABLE t AS SELECT 'one row of text' AS s"]
+query = "SELECT vs_wrap(s, '<', '>'), vs_len(s), vs_has_prefix_any(s, 'one,two') FROM t"
+check = """
+SELECT (vs_wrap(s, '<', '>') IS DISTINCT FROM '<one row of text>'
+        OR vs_len(s) IS DISTINCT FROM 15 OR vs_has_prefix_any(s, 'one,two') IS DISTINCT FROM true)::INTEGER::VARCHAR
+FROM t
+"""
+expect = "0"

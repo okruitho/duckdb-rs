@@ -1,0 +1,832 @@
+# The existing duckdb-neo benchmark functions (`benches/support`, `benches/functions.rs`) and their C++ ports.
+# Inputs are the modules' `create_input` SQL, with `N(value, seed)` of `benches/instructions.md` spelled as the
+# `nullable(value, i, seed, percent)` macro below; the NULL percentage is 10 unless a case name says otherwise.
+# Checks reproduce each module's `verify` plus the golden values of `instructions.md` section 8.
+
+# merge_struct(i, s, m, u, d) -> STRUCT(i, s, m, u, d): the arguments as fields, NULL arguments as NULL fields.
+# The checks materialize the output, so that their filters are not merged into the query's own WHERE.
+
+[[case]]
+name = "merge_struct/project"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    """
+CREATE TABLE scalar_input AS
+SELECT nullable(i::INTEGER, i, 0, 10) AS i,
+       nullable('value_' || i, i, 1, 10) AS s,
+       nullable(MAP {'a': nullable(i::INTEGER, i, 5, 10), 'b': nullable((i * 2)::INTEGER, i, 6, 10),
+                     'key_' || (i % 7): nullable((i % 7)::INTEGER, i, 7, 10)}, i, 2, 10) AS m,
+       nullable(CASE WHEN i % 2 = 0 THEN union_value(num := nullable(i::INTEGER, i, 8, 10))::UNION(num INTEGER, str VARCHAR)
+                     ELSE union_value(str := nullable('union_string_' || i, i, 9, 10))::UNION(num INTEGER, str VARCHAR) END,
+                i, 3, 10) AS u,
+       nullable((i / 1000)::DECIMAL(18, 3), i, 4, 10) AS d
+FROM range({rows}) t(i)
+""",
+    "CREATE TABLE merge_edges (i INTEGER, s VARCHAR, m MAP(VARCHAR, INTEGER), u UNION(num INTEGER, str VARCHAR), d DECIMAL(18, 3))",
+    """
+INSERT INTO merge_edges VALUES
+    (NULL, NULL, NULL, NULL, NULL),
+    (-2147483648, '', MAP {}, union_value(num := NULL::INTEGER), -999999999999999.999),
+    (2147483647, 'a string too long to be inlined', MAP {'nullable': NULL, 'a map key too long to be inlined': 5},
+     union_value(str := NULL::VARCHAR), 999999999999999.999),
+    (0, 'é', MAP {'k': -1}, union_value(str := 'a union string too long to be inlined'), 0)
+""",
+]
+query = "SELECT merge_struct(i, s, m, u, d) FROM scalar_input"
+check = """
+WITH output AS MATERIALIZED (
+    SELECT merge_struct(i, s, m, u, d) AS r, * FROM (FROM scalar_input UNION ALL FROM merge_edges))
+SELECT ((SELECT count(*)
+         FROM output
+         WHERE r IS NULL OR r.i IS DISTINCT FROM i OR r.s IS DISTINCT FROM s OR r.u IS DISTINCT FROM u
+            OR union_tag(r.u) IS DISTINCT FROM union_tag(u) OR r.d IS DISTINCT FROM d
+            OR union_extract(r.u, 'num') IS DISTINCT FROM union_extract(u, 'num')
+            OR union_extract(r.u, 'str') IS DISTINCT FROM union_extract(u, 'str')
+            OR list_sort(map_entries(r.m)) IS DISTINCT FROM list_sort(map_entries(m)))
+      + ((SELECT typeof(merge_struct(i, s, m, u, d)) FROM scalar_input LIMIT 1)
+         <> 'STRUCT(i INTEGER, s VARCHAR, m MAP(VARCHAR, INTEGER), u UNION(num INTEGER, str VARCHAR), d DECIMAL(18,3))')::BIGINT
+      + (SELECT count(*)
+         FROM (SELECT merge_struct(i, s, m, u, d) AS r, expected
+               FROM (VALUES
+                   (0, NULL, MAP {'a': 0, 'b': 0, 'key_0': 0}, union_value(num := 0)::UNION(num INTEGER, str VARCHAR),
+                    NULL::DECIMAL(18, 3),
+                    '{''i'': 0, ''s'': NULL, ''m'': [{''key'': a, ''value'': 0}, {''key'': b, ''value'': 0}, {''key'': key_0, ''value'': 0}], ''u'': 0, ''d'': NULL}'),
+                   (1, 'value_1', MAP {'a': 1, 'b': 2, 'key_1': 1},
+                    union_value(str := 'union_string_1')::UNION(num INTEGER, str VARCHAR), 0.001::DECIMAL(18, 3),
+                    '{''i'': 1, ''s'': value_1, ''m'': [{''key'': a, ''value'': 1}, {''key'': b, ''value'': 2}, {''key'': key_1, ''value'': 1}], ''u'': union_string_1, ''d'': 0.001}')
+               ) v(i, s, m, u, d, expected))
+         WHERE {'i': r.i, 's': r.s, 'm': list_sort(map_entries(r.m)), 'u': r.u, 'd': r.d}::VARCHAR IS DISTINCT FROM expected)
+)::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "merge_struct/nulls_0"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    """
+CREATE TABLE scalar_input AS
+SELECT nullable(i::INTEGER, i, 0, 0) AS i,
+       nullable('value_' || i, i, 1, 0) AS s,
+       nullable(MAP {'a': nullable(i::INTEGER, i, 5, 0), 'b': nullable((i * 2)::INTEGER, i, 6, 0),
+                     'key_' || (i % 7): nullable((i % 7)::INTEGER, i, 7, 0)}, i, 2, 0) AS m,
+       nullable(CASE WHEN i % 2 = 0 THEN union_value(num := nullable(i::INTEGER, i, 8, 0))::UNION(num INTEGER, str VARCHAR)
+                     ELSE union_value(str := nullable('union_string_' || i, i, 9, 0))::UNION(num INTEGER, str VARCHAR) END,
+                i, 3, 0) AS u,
+       nullable((i / 1000)::DECIMAL(18, 3), i, 4, 0) AS d
+FROM range({rows}) t(i)
+""",
+]
+query = "SELECT merge_struct(i, s, m, u, d) FROM scalar_input"
+check = """
+WITH output AS MATERIALIZED (SELECT merge_struct(i, s, m, u, d) AS r, * FROM scalar_input)
+SELECT count(*)::VARCHAR
+FROM output
+WHERE r IS NULL OR r.i IS DISTINCT FROM i OR r.s IS DISTINCT FROM s OR r.u IS DISTINCT FROM u
+   OR union_tag(r.u) IS DISTINCT FROM union_tag(u) OR r.d IS DISTINCT FROM d
+   OR list_sort(map_entries(r.m)) IS DISTINCT FROM list_sort(map_entries(m))
+"""
+expect = "0"
+
+[[case]]
+name = "merge_struct/nulls_100"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    """
+CREATE TABLE scalar_input AS
+SELECT nullable(i::INTEGER, i, 0, 100) AS i,
+       nullable('value_' || i, i, 1, 100) AS s,
+       nullable(MAP {'a': nullable(i::INTEGER, i, 5, 100), 'b': nullable((i * 2)::INTEGER, i, 6, 100),
+                     'key_' || (i % 7): nullable((i % 7)::INTEGER, i, 7, 100)}, i, 2, 100) AS m,
+       nullable(CASE WHEN i % 2 = 0 THEN union_value(num := nullable(i::INTEGER, i, 8, 100))::UNION(num INTEGER, str VARCHAR)
+                     ELSE union_value(str := nullable('union_string_' || i, i, 9, 100))::UNION(num INTEGER, str VARCHAR) END,
+                i, 3, 100) AS u,
+       nullable((i / 1000)::DECIMAL(18, 3), i, 4, 100) AS d
+FROM range({rows}) t(i)
+""",
+]
+query = "SELECT merge_struct(i, s, m, u, d) FROM scalar_input"
+check = """
+WITH output AS MATERIALIZED (SELECT merge_struct(i, s, m, u, d) AS r, * FROM scalar_input)
+SELECT count(*)::VARCHAR
+FROM output
+WHERE r IS NULL OR r.i IS NOT NULL OR r.s IS NOT NULL OR r.m IS NOT NULL OR r.u IS NOT NULL OR r.d IS NOT NULL
+   OR i IS NOT NULL OR s IS NOT NULL OR m IS NOT NULL OR u IS NOT NULL OR d IS NOT NULL
+"""
+expect = "0"
+
+# The filter slices the scan, so the arguments arrive as selections of the scanned vectors.
+[[case]]
+name = "merge_struct/filtered"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    """
+CREATE TABLE scalar_input AS
+SELECT nullable(i::INTEGER, i, 0, 10) AS i,
+       nullable('value_' || i, i, 1, 10) AS s,
+       nullable(MAP {'a': nullable(i::INTEGER, i, 5, 10), 'b': nullable((i * 2)::INTEGER, i, 6, 10),
+                     'key_' || (i % 7): nullable((i % 7)::INTEGER, i, 7, 10)}, i, 2, 10) AS m,
+       nullable(CASE WHEN i % 2 = 0 THEN union_value(num := nullable(i::INTEGER, i, 8, 10))::UNION(num INTEGER, str VARCHAR)
+                     ELSE union_value(str := nullable('union_string_' || i, i, 9, 10))::UNION(num INTEGER, str VARCHAR) END,
+                i, 3, 10) AS u,
+       nullable((i / 1000)::DECIMAL(18, 3), i, 4, 10) AS d
+FROM range({rows}) t(i)
+""",
+]
+query = "SELECT merge_struct(i, s, m, u, d) FROM scalar_input WHERE rowid % 3 <> 1"
+check = """
+WITH output AS MATERIALIZED (SELECT merge_struct(i, s, m, u, d) AS r, * FROM scalar_input WHERE rowid % 3 <> 1)
+SELECT count(*)::VARCHAR
+FROM output
+WHERE r IS NULL OR r.i IS DISTINCT FROM i OR r.s IS DISTINCT FROM s OR r.u IS DISTINCT FROM u
+   OR union_tag(r.u) IS DISTINCT FROM union_tag(u) OR r.d IS DISTINCT FROM d
+   OR list_sort(map_entries(r.m)) IS DISTINCT FROM list_sort(map_entries(m))
+"""
+expect = "0"
+
+# `s` and `m` arrive as constant vectors.
+[[case]]
+name = "merge_struct/constant_args"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    """
+CREATE TABLE scalar_input AS
+SELECT nullable(i::INTEGER, i, 0, 10) AS i,
+       nullable('value_' || i, i, 1, 10) AS s,
+       nullable(MAP {'a': nullable(i::INTEGER, i, 5, 10), 'b': nullable((i * 2)::INTEGER, i, 6, 10),
+                     'key_' || (i % 7): nullable((i % 7)::INTEGER, i, 7, 10)}, i, 2, 10) AS m,
+       nullable(CASE WHEN i % 2 = 0 THEN union_value(num := nullable(i::INTEGER, i, 8, 10))::UNION(num INTEGER, str VARCHAR)
+                     ELSE union_value(str := nullable('union_string_' || i, i, 9, 10))::UNION(num INTEGER, str VARCHAR) END,
+                i, 3, 10) AS u,
+       nullable((i / 1000)::DECIMAL(18, 3), i, 4, 10) AS d
+FROM range({rows}) t(i)
+""",
+]
+query = """
+SELECT merge_struct(i, 'a constant string too long to be inlined',
+                    MAP {'a constant map key too long to be inlined': 42, 'nullable': NULL}, u, d)
+FROM scalar_input
+"""
+check = """
+WITH output AS MATERIALIZED (
+    SELECT merge_struct(i, 'a constant string too long to be inlined',
+                        MAP {'a constant map key too long to be inlined': 42, 'nullable': NULL}, u, d) AS r, *
+    FROM scalar_input)
+SELECT count(*)::VARCHAR
+FROM output
+WHERE r IS NULL OR r.i IS DISTINCT FROM i OR r.s IS DISTINCT FROM 'a constant string too long to be inlined'
+   OR r.u IS DISTINCT FROM u OR union_tag(r.u) IS DISTINCT FROM union_tag(u) OR r.d IS DISTINCT FROM d
+   OR list_sort(map_entries(r.m))
+      IS DISTINCT FROM list_sort(map_entries(MAP {'a constant map key too long to be inlined': 42, 'nullable': NULL}))
+"""
+expect = "0"
+
+# dash_split(input, n) -> TABLE(idx, part): `input` split on '-' into at most `n` parts, like `str::splitn`.
+# `split_input` holds `rows` parts, so `n = rows` splits it fully.
+
+[[case]]
+name = "dash_split/scan"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = """
+SET VARIABLE split_input = (
+    SELECT string_agg(CASE WHEN i % 3 = 0 THEN 'long_segment_' || i ELSE 'p' || i END, '-' ORDER BY i)
+    FROM range({rows}) t(i))
+"""
+query = "SELECT idx, part FROM dash_split(getvariable('split_input'), {rows})"
+check = """
+WITH expected AS (
+         SELECT unnest(range(len(parts)))::BIGINT AS idx, unnest(parts) AS part
+         FROM (SELECT string_split(getvariable('split_input'), '-') AS parts)),
+     actual AS (
+         SELECT idx, part, row_number() OVER () - 1 AS position
+         FROM dash_split(getvariable('split_input'), {rows}))
+SELECT ((SELECT count(*) FROM actual FULL JOIN expected USING (idx)
+         WHERE actual.part IS DISTINCT FROM expected.part OR idx IS DISTINCT FROM position)
+      + ((SELECT count(*) FROM dash_split(getvariable('split_input'), {rows})) <> {rows})::BIGINT
+      + ((SELECT string_agg(idx || ':' || part, ',' ORDER BY idx) FROM dash_split('a-b-c', 2)) IS DISTINCT FROM '0:a,1:b-c')::BIGINT
+      + ((SELECT string_agg(idx || ':' || part, ',' ORDER BY idx) FROM dash_split('a-b-c', 3)) IS DISTINCT FROM '0:a,1:b,2:c')::BIGINT
+      + ((SELECT string_agg(idx || ':' || part, ',' ORDER BY idx) FROM dash_split('a-b-c', 10)) IS DISTINCT FROM '0:a,1:b,2:c')::BIGINT
+      + ((SELECT string_agg(idx || ':' || part, ',' ORDER BY idx) FROM dash_split('-a--b-', 10)) IS DISTINCT FROM '0:,1:a,2:,3:b,4:')::BIGINT
+      + ((SELECT string_agg(idx || ':' || part, ',' ORDER BY idx) FROM dash_split('', 1)) IS DISTINCT FROM '0:')::BIGINT
+      + ((SELECT string_agg(idx || ':' || part, ',' ORDER BY idx) FROM dash_split('a-b', 1)) IS DISTINCT FROM '0:a-b')::BIGINT
+      + (SELECT count(*) FROM dash_split('abc', 0))
+      + ((SELECT string_agg(part, ',') FROM dash_split('a-b-c', 3)) IS DISTINCT FROM 'a,b,c')::BIGINT
+      + (SELECT count(*) FROM dash_split(NULL, 3))
+      + (SELECT count(*) FROM dash_split('a-b', NULL))
+)::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "dash_split/limit"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = """
+SET VARIABLE split_input = (
+    SELECT string_agg(CASE WHEN i % 3 = 0 THEN 'long_segment_' || i ELSE 'p' || i END, '-' ORDER BY i)
+    FROM range({rows}) t(i))
+"""
+query = "SELECT idx, part FROM dash_split(getvariable('split_input'), {rows}) LIMIT 2500"
+check = """
+WITH expected AS (
+         SELECT unnest(range(len(parts)))::BIGINT AS idx, unnest(parts) AS part
+         FROM (SELECT string_split(getvariable('split_input'), '-') AS parts)),
+     actual AS (
+         SELECT idx, part, row_number() OVER () - 1 AS position
+         FROM (SELECT idx, part FROM dash_split(getvariable('split_input'), {rows}) LIMIT 2500))
+SELECT ((SELECT count(*) FROM actual LEFT JOIN expected USING (idx)
+         WHERE actual.part IS DISTINCT FROM expected.part OR idx IS DISTINCT FROM position)
+      + ((SELECT count(*) FROM actual) <> least({rows}, 2500))::BIGINT)::VARCHAR
+"""
+expect = "0"
+
+# Projection pushdown: only `part` is written.
+[[case]]
+name = "dash_split/part_only"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = """
+SET VARIABLE split_input = (
+    SELECT string_agg(CASE WHEN i % 3 = 0 THEN 'long_segment_' || i ELSE 'p' || i END, '-' ORDER BY i)
+    FROM range({rows}) t(i))
+"""
+query = "SELECT part FROM dash_split(getvariable('split_input'), {rows})"
+check = """
+WITH expected AS (
+         SELECT unnest(range(len(parts)))::BIGINT AS idx, unnest(parts) AS part
+         FROM (SELECT string_split(getvariable('split_input'), '-') AS parts)),
+     actual AS (
+         SELECT part, row_number() OVER () - 1 AS idx
+         FROM dash_split(getvariable('split_input'), {rows}))
+SELECT count(*)::VARCHAR FROM actual FULL JOIN expected USING (idx) WHERE actual.part IS DISTINCT FROM expected.part
+"""
+expect = "0"
+
+# No column is projected: DuckDB asks for `idx` and only counts the rows.
+[[case]]
+name = "dash_split/count"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = """
+SET VARIABLE split_input = (
+    SELECT string_agg(CASE WHEN i % 3 = 0 THEN 'long_segment_' || i ELSE 'p' || i END, '-' ORDER BY i)
+    FROM range({rows}) t(i))
+"""
+query = "SELECT count(*) FROM dash_split(getvariable('split_input'), {rows})"
+check = """
+SELECT (((SELECT count(*) FROM dash_split(getvariable('split_input'), {rows})) <> {rows})::BIGINT
+      + ((SELECT count(*) FROM dash_split(getvariable('split_input'), 7)) <> least({rows}, 7))::BIGINT)::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "dash_split/filter_output"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = """
+SET VARIABLE split_input = (
+    SELECT string_agg(CASE WHEN i % 3 = 0 THEN 'long_segment_' || i ELSE 'p' || i END, '-' ORDER BY i)
+    FROM range({rows}) t(i))
+"""
+query = "SELECT idx, part FROM dash_split(getvariable('split_input'), {rows}) WHERE part LIKE 'long%'"
+check = """
+WITH expected AS (
+         SELECT * FROM (SELECT unnest(range(len(parts)))::BIGINT AS idx, unnest(parts) AS part
+                        FROM (SELECT string_split(getvariable('split_input'), '-') AS parts))
+         WHERE part LIKE 'long%'),
+     actual AS (SELECT idx, part FROM dash_split(getvariable('split_input'), {rows}) WHERE part LIKE 'long%')
+SELECT count(*)::VARCHAR FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual))
+"""
+expect = "0"
+
+# row_hash(s, d, b) -> UBIGINT: wrapping sum of per-row hashes. The ungrouped check pins the hash to the golden
+# values; the others compare each shape with the builtin sum (mod 2^64) of the per-row hashes.
+
+[[case]]
+name = "row_hash/ungrouped"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    "CREATE MACRO wrap64(x) AS (x % 18446744073709551616)::UBIGINT",
+    """
+CREATE TABLE agg_input AS
+SELECT (i % 1024)::INTEGER AS g, nullable('key_' || (i * 7919 % 100003), i, 10, 10) AS s,
+       nullable(i * 0.25, i, 11, 10)::DOUBLE AS d, nullable(i % 3 = 0, i, 12, 10) AS b
+FROM range({rows}) t(i)
+""",
+    """
+CREATE TABLE golden_agg_input AS
+SELECT CASE WHEN i % 89 = 0 THEN NULL ELSE 'key_' || (i * 7919 % 100003) END AS s,
+       CASE WHEN i % 97 = 0 THEN NULL ELSE i * 0.25 END::DOUBLE AS d,
+       CASE WHEN i % 101 = 0 THEN NULL ELSE i % 3 = 0 END AS b, i < 1000 AS first_1000
+FROM range(10000) t(i)
+""",
+]
+query = "SELECT row_hash(s, d, b) FROM agg_input"
+check = """
+WITH per_row AS (SELECT rowid AS r, row_hash(s, d, b) AS h FROM agg_input GROUP BY rowid)
+SELECT (((SELECT row_hash(s, d, b) FROM agg_input) IS DISTINCT FROM (SELECT wrap64(sum(h)) FROM per_row))::BIGINT
+      + ((SELECT row_hash(s, d, b) FROM agg_input WHERE false) IS NOT NULL)::BIGINT
+      + ((SELECT row_hash('duck', 1.5, true)) IS DISTINCT FROM 17517133033816018756)::BIGINT
+      + ((SELECT row_hash(s, d, b) FROM (SELECT NULL::VARCHAR AS s, NULL::DOUBLE AS d, NULL::BOOLEAN AS b))
+         IS DISTINCT FROM 16898831758259097429)::BIGINT
+      + ((SELECT row_hash('', 0.0, false)) IS DISTINCT FROM 15861653319075095682)::BIGINT
+      + ((SELECT row_hash(s, d, b) FROM golden_agg_input WHERE first_1000) IS DISTINCT FROM 13117526009623259447)::BIGINT
+      + ((SELECT row_hash(s, d, b) FROM golden_agg_input) IS DISTINCT FROM 15537843542995968811)::BIGINT
+)::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "row_hash/nulls_0"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    "CREATE MACRO wrap64(x) AS (x % 18446744073709551616)::UBIGINT",
+    """
+CREATE TABLE agg_input AS
+SELECT (i % 1024)::INTEGER AS g, nullable('key_' || (i * 7919 % 100003), i, 10, 0) AS s,
+       nullable(i * 0.25, i, 11, 0)::DOUBLE AS d, nullable(i % 3 = 0, i, 12, 0) AS b
+FROM range({rows}) t(i)
+""",
+]
+query = "SELECT row_hash(s, d, b) FROM agg_input"
+check = """
+WITH per_row AS (SELECT rowid AS r, row_hash(s, d, b) AS h FROM agg_input GROUP BY rowid)
+SELECT ((SELECT row_hash(s, d, b) FROM agg_input) IS DISTINCT FROM (SELECT wrap64(sum(h)) FROM per_row))::BIGINT::VARCHAR
+"""
+expect = "0"
+
+# 1,024 groups, as in `benches/functions.rs`.
+[[case]]
+name = "row_hash/grouped"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    "CREATE MACRO wrap64(x) AS (x % 18446744073709551616)::UBIGINT",
+    """
+CREATE TABLE agg_input AS
+SELECT (i % 1024)::INTEGER AS g, nullable('key_' || (i * 7919 % 100003), i, 10, 10) AS s,
+       nullable(i * 0.25, i, 11, 10)::DOUBLE AS d, nullable(i % 3 = 0, i, 12, 10) AS b
+FROM range({rows}) t(i)
+""",
+]
+query = "SELECT g, row_hash(s, d, b) FROM agg_input GROUP BY g"
+check = """
+WITH per_row AS (SELECT rowid AS r, g, row_hash(s, d, b) AS h FROM agg_input GROUP BY rowid, g),
+     expected AS (SELECT g, wrap64(sum(h)) AS e FROM per_row GROUP BY g),
+     actual AS (SELECT g, row_hash(s, d, b) AS a FROM agg_input GROUP BY g)
+SELECT count(*)::VARCHAR FROM actual FULL JOIN expected USING (g) WHERE a IS DISTINCT FROM e
+"""
+expect = "0"
+
+[[case]]
+name = "row_hash/groups_4"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    "CREATE MACRO wrap64(x) AS (x % 18446744073709551616)::UBIGINT",
+    """
+CREATE TABLE agg_input AS
+SELECT (i % 1024)::INTEGER AS g, nullable('key_' || (i * 7919 % 100003), i, 10, 10) AS s,
+       nullable(i * 0.25, i, 11, 10)::DOUBLE AS d, nullable(i % 3 = 0, i, 12, 10) AS b
+FROM range({rows}) t(i)
+""",
+]
+query = "SELECT g % 4 AS k, row_hash(s, d, b) FROM agg_input GROUP BY k"
+check = """
+WITH per_row AS (SELECT rowid AS r, g, row_hash(s, d, b) AS h FROM agg_input GROUP BY rowid, g),
+     expected AS (SELECT g % 4 AS k, wrap64(sum(h)) AS e FROM per_row GROUP BY k),
+     actual AS (SELECT g % 4 AS k, row_hash(s, d, b) AS a FROM agg_input GROUP BY k)
+SELECT count(*)::VARCHAR FROM actual FULL JOIN expected USING (k) WHERE a IS DISTINCT FROM e
+"""
+expect = "0"
+
+# About rows / 4 groups of 4 rows each.
+[[case]]
+name = "row_hash/groups_quarter"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    "CREATE MACRO wrap64(x) AS (x % 18446744073709551616)::UBIGINT",
+    """
+CREATE TABLE agg_input AS
+SELECT (i % 1024)::INTEGER AS g, nullable('key_' || (i * 7919 % 100003), i, 10, 10) AS s,
+       nullable(i * 0.25, i, 11, 10)::DOUBLE AS d, nullable(i % 3 = 0, i, 12, 10) AS b
+FROM range({rows}) t(i)
+""",
+]
+query = "SELECT rowid // 4 AS k, row_hash(s, d, b) FROM agg_input GROUP BY k"
+check = """
+WITH per_row AS (SELECT rowid AS r, row_hash(s, d, b) AS h FROM agg_input GROUP BY rowid),
+     expected AS (SELECT r // 4 AS k, wrap64(sum(h)) AS e FROM per_row GROUP BY k),
+     actual AS (SELECT rowid // 4 AS k, row_hash(s, d, b) AS a FROM agg_input GROUP BY k)
+SELECT count(*)::VARCHAR FROM actual FULL JOIN expected USING (k) WHERE a IS DISTINCT FROM e
+"""
+expect = "0"
+
+[[case]]
+name = "row_hash/filter"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    "CREATE MACRO wrap64(x) AS (x % 18446744073709551616)::UBIGINT",
+    """
+CREATE TABLE agg_input AS
+SELECT (i % 1024)::INTEGER AS g, nullable('key_' || (i * 7919 % 100003), i, 10, 10) AS s,
+       nullable(i * 0.25, i, 11, 10)::DOUBLE AS d, nullable(i % 3 = 0, i, 12, 10) AS b
+FROM range({rows}) t(i)
+""",
+]
+query = "SELECT row_hash(s, d, b) FILTER (WHERE g % 2 = 0) FROM agg_input"
+check = """
+WITH per_row AS (SELECT rowid AS r, g, row_hash(s, d, b) AS h FROM agg_input GROUP BY rowid, g)
+SELECT (((SELECT row_hash(s, d, b) FILTER (WHERE g % 2 = 0) FROM agg_input)
+         IS DISTINCT FROM (SELECT wrap64(sum(h) FILTER (WHERE g % 2 = 0)) FROM per_row))::BIGINT
+      + ((SELECT row_hash(s, d, b) FILTER (WHERE g < 0) FROM agg_input) IS NOT NULL)::BIGINT)::VARCHAR
+"""
+expect = "0"
+
+# A running window without ORDER BY: DuckDB's streaming window updates and finalizes once per row.
+[[case]]
+name = "row_hash/running"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    "CREATE MACRO wrap64(x) AS (x % 18446744073709551616)::UBIGINT",
+    """
+CREATE TABLE agg_input AS
+SELECT (i % 1024)::INTEGER AS g, nullable('key_' || (i * 7919 % 100003), i, 10, 10) AS s,
+       nullable(i * 0.25, i, 11, 10)::DOUBLE AS d, nullable(i % 3 = 0, i, 12, 10) AS b
+FROM range({rows}) t(i)
+""",
+]
+query = "SELECT row_hash(s, d, b) OVER (ROWS UNBOUNDED PRECEDING) FROM agg_input"
+check = """
+WITH per_row AS (SELECT rowid AS r, row_hash(s, d, b) AS h FROM agg_input GROUP BY rowid)
+SELECT count(*)::VARCHAR
+FROM (SELECT row_hash(s, d, b) OVER w AS a, wrap64(sum(h) OVER w) AS e
+      FROM agg_input JOIN per_row ON agg_input.rowid = per_row.r
+      WINDOW w AS (ORDER BY r ROWS UNBOUNDED PRECEDING))
+WHERE a IS DISTINCT FROM e
+"""
+expect = "0"
+
+# A sliding frame over partitions: DuckDB's segment tree updates, combines and finalizes a few rows at a time.
+[[case]]
+name = "row_hash/sliding"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    "CREATE MACRO wrap64(x) AS (x % 18446744073709551616)::UBIGINT",
+    """
+CREATE TABLE agg_input AS
+SELECT (i % 1024)::INTEGER AS g, nullable('key_' || (i * 7919 % 100003), i, 10, 10) AS s,
+       nullable(i * 0.25, i, 11, 10)::DOUBLE AS d, nullable(i % 3 = 0, i, 12, 10) AS b
+FROM range({rows}) t(i)
+""",
+]
+query = "SELECT row_hash(s, d, b) OVER (PARTITION BY g ORDER BY rowid ROWS BETWEEN 8 PRECEDING AND CURRENT ROW) FROM agg_input"
+check = """
+WITH per_row AS (SELECT rowid AS r, row_hash(s, d, b) AS h FROM agg_input GROUP BY rowid)
+SELECT count(*)::VARCHAR
+FROM (SELECT row_hash(s, d, b) OVER w AS a, wrap64(sum(h) OVER w) AS e
+      FROM agg_input JOIN per_row ON agg_input.rowid = per_row.r
+      WINDOW w AS (PARTITION BY g ORDER BY r ROWS BETWEEN 8 PRECEDING AND CURRENT ROW))
+WHERE a IS DISTINCT FROM e
+"""
+expect = "0"
+
+# int_sum(v) -> BIGINT: wrapping sum of the non-NULL values, NULL without any; checked against the builtin `sum`.
+
+[[case]]
+name = "int_sum/ungrouped"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    """
+CREATE TABLE sum_input AS
+SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g, nullable(i * 7919 % 100003 - 50000, i, 30, 10)::BIGINT AS v
+FROM range({rows}) t(i)
+""",
+]
+query = "SELECT int_sum(v) FROM sum_input"
+check = """
+SELECT ((SELECT count(*) FROM (SELECT int_sum(v) AS a, sum(v) AS b FROM sum_input) WHERE a IS DISTINCT FROM b::BIGINT)
+      + (SELECT count(*) FROM (SELECT int_sum(v) AS a, sum(v) AS b FROM sum_input WHERE false)
+         WHERE a IS DISTINCT FROM b::BIGINT)
+      + ((SELECT int_sum(x) FROM (VALUES (9223372036854775807::BIGINT), (1::BIGINT)) t(x))
+         IS DISTINCT FROM -9223372036854775808)::BIGINT
+      + ((SELECT int_sum(x) FROM (VALUES (NULL::BIGINT), (NULL::BIGINT)) t(x)) IS NOT NULL)::BIGINT)::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "int_sum/nulls_0"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    """
+CREATE TABLE sum_input AS
+SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g, nullable(i * 7919 % 100003 - 50000, i, 30, 0)::BIGINT AS v
+FROM range({rows}) t(i)
+""",
+]
+query = "SELECT int_sum(v) FROM sum_input"
+check = """
+SELECT count(*)::VARCHAR FROM (SELECT int_sum(v) AS a, sum(v) AS b FROM sum_input) WHERE a IS DISTINCT FROM b::BIGINT
+"""
+expect = "0"
+
+# 1,024 groups, as in `benches/functions.rs`.
+[[case]]
+name = "int_sum/grouped"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    """
+CREATE TABLE sum_input AS
+SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g, nullable(i * 7919 % 100003 - 50000, i, 30, 10)::BIGINT AS v
+FROM range({rows}) t(i)
+""",
+]
+query = "SELECT g, int_sum(v) FROM sum_input GROUP BY g"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT int_sum(v) AS a, sum(v) AS b FROM sum_input GROUP BY g)
+WHERE a IS DISTINCT FROM b::BIGINT
+"""
+expect = "0"
+
+[[case]]
+name = "int_sum/groups_4"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    """
+CREATE TABLE sum_input AS
+SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g, nullable(i * 7919 % 100003 - 50000, i, 30, 10)::BIGINT AS v
+FROM range({rows}) t(i)
+""",
+]
+query = "SELECT g % 4 AS k, int_sum(v) FROM sum_input GROUP BY k"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT int_sum(v) AS a, sum(v) AS b FROM sum_input GROUP BY g % 4)
+WHERE a IS DISTINCT FROM b::BIGINT
+"""
+expect = "0"
+
+# About rows / 4 groups of 4 rows each.
+[[case]]
+name = "int_sum/groups_quarter"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    """
+CREATE TABLE sum_input AS
+SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g, nullable(i * 7919 % 100003 - 50000, i, 30, 10)::BIGINT AS v
+FROM range({rows}) t(i)
+""",
+]
+query = "SELECT i // 4 AS k, int_sum(v) FROM sum_input GROUP BY k"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT int_sum(v) AS a, sum(v) AS b FROM sum_input GROUP BY i // 4)
+WHERE a IS DISTINCT FROM b::BIGINT
+"""
+expect = "0"
+
+[[case]]
+name = "int_sum/filter"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    """
+CREATE TABLE sum_input AS
+SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g, nullable(i * 7919 % 100003 - 50000, i, 30, 10)::BIGINT AS v
+FROM range({rows}) t(i)
+""",
+]
+query = "SELECT int_sum(v) FILTER (WHERE i % 3 <> 1) FROM sum_input"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT int_sum(v) FILTER (WHERE i % 3 <> 1) AS a, sum(v) FILTER (WHERE i % 3 <> 1) AS b FROM sum_input
+      UNION ALL
+      SELECT int_sum(v) FILTER (WHERE i < 0) AS a, sum(v) FILTER (WHERE i < 0) AS b FROM sum_input)
+WHERE a IS DISTINCT FROM b::BIGINT
+"""
+expect = "0"
+
+# A running sum without ORDER BY: DuckDB's streaming window updates and finalizes once per row.
+[[case]]
+name = "int_sum/running"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    """
+CREATE TABLE sum_input AS
+SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g, nullable(i * 7919 % 100003 - 50000, i, 30, 10)::BIGINT AS v
+FROM range({rows}) t(i)
+""",
+]
+query = "SELECT int_sum(v) OVER (ROWS UNBOUNDED PRECEDING) FROM sum_input"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT int_sum(v) OVER w AS a, sum(v) OVER w AS b FROM sum_input WINDOW w AS (ROWS UNBOUNDED PRECEDING))
+WHERE a IS DISTINCT FROM b::BIGINT
+"""
+expect = "0"
+
+# A sliding sum over partitions: DuckDB's segment tree updates and finalizes a few rows at a time.
+[[case]]
+name = "int_sum/sliding"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    """
+CREATE TABLE sum_input AS
+SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g, nullable(i * 7919 % 100003 - 50000, i, 30, 10)::BIGINT AS v
+FROM range({rows}) t(i)
+""",
+]
+query = "SELECT int_sum(v) OVER (PARTITION BY g ORDER BY i ROWS BETWEEN 8 PRECEDING AND CURRENT ROW) FROM sum_input"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT int_sum(v) OVER w AS a, sum(v) OVER w AS b FROM sum_input
+      WINDOW w AS (PARTITION BY g ORDER BY i ROWS BETWEEN 8 PRECEDING AND CURRENT ROW))
+WHERE a IS DISTINCT FROM b::BIGINT
+"""
+expect = "0"
+
+# A sliding frame of a thousand rows without partitions: each row combines many segment tree states.
+[[case]]
+name = "int_sum/sliding_1000"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    """
+CREATE TABLE sum_input AS
+SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g, nullable(i * 7919 % 100003 - 50000, i, 30, 10)::BIGINT AS v
+FROM range({rows}) t(i)
+""",
+]
+query = "SELECT int_sum(v) OVER (ORDER BY i ROWS BETWEEN 1000 PRECEDING AND CURRENT ROW) FROM sum_input"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT int_sum(v) OVER w AS a, sum(v) OVER w AS b FROM sum_input
+      WINDOW w AS (ORDER BY i ROWS BETWEEN 1000 PRECEDING AND CURRENT ROW))
+WHERE a IS DISTINCT FROM b::BIGINT
+"""
+expect = "0"
+
+# base56: a COPY format for BOOLEAN, INTEGER, BIGINT, DOUBLE and VARCHAR, as in `mod copy` of `benches/functions.rs`.
+# `base56/to` also pins the encoder to the golden files, `base56/from` the decoder to a file written by hand.
+
+[[case]]
+name = "base56/to"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    """
+CREATE TABLE copy_input AS
+SELECT nullable(i::BIGINT, i, 20, 10) AS id, nullable(i * 1.5, i, 21, 10)::DOUBLE AS x,
+       nullable('name_' || i, i, 22, 10) AS name, nullable(i % 2 = 0, i, 23, 10) AS flag,
+       nullable((i % 1000)::INTEGER, i, 24, 10) AS bucket
+FROM range({rows}) t(i)
+""",
+    "COPY copy_input TO '{tmp}/data.b56' (FORMAT base56)",
+    "CREATE TABLE copy_verify AS FROM copy_input LIMIT 0",
+    "COPY copy_verify FROM '{tmp}/data.b56' (FORMAT base56)",
+    """
+CREATE TABLE copy_edges AS
+SELECT CASE i WHEN 0 THEN -9223372036854775808 WHEN 1 THEN 9223372036854775807 WHEN 2 THEN -1 ELSE i END::BIGINT AS id,
+       CASE i WHEN 0 THEN 'NaN'::DOUBLE WHEN 1 THEN '-inf'::DOUBLE WHEN 2 THEN -0.0 WHEN 3 THEN 1e308 ELSE i / 7 END::DOUBLE AS x,
+       repeat(chr((97 + i)::INTEGER), i::INTEGER) || CASE WHEN i % 3 = 0 THEN 'é' ELSE '' END AS name,
+       i % 2 = 1 AS flag,
+       CASE i WHEN 0 THEN -2147483648 WHEN 1 THEN 2147483647 WHEN 2 THEN -1 ELSE i END::INTEGER AS bucket
+FROM range(14) t(i)
+""",
+    "COPY copy_edges TO '{tmp}/edges.b56' (FORMAT base56)",
+    "CREATE TABLE edges_verify AS FROM copy_edges LIMIT 0",
+    "COPY edges_verify FROM '{tmp}/edges.b56' (FORMAT base56)",
+    """
+COPY (SELECT i::BIGINT AS id, CASE WHEN i % 89 = 0 THEN NULL ELSE i * 1.5 END::DOUBLE AS x,
+             CASE WHEN i % 97 = 0 THEN NULL ELSE 'name_' || i END AS name,
+             CASE WHEN i % 101 = 0 THEN NULL ELSE i % 2 = 0 END AS flag, (i % 1000)::INTEGER AS bucket
+      FROM range(1000) t(i))
+TO '{tmp}/golden.b56' (FORMAT base56)
+""",
+    """
+COPY (FROM (VALUES (1, 42::BIGINT, 1.5::DOUBLE, 'duck', true, 7::INTEGER),
+                   (2, NULL, NULL, 'DuckDB!', false, NULL),
+                   (3, NULL, NULL, '', NULL, NULL)) v(k, id, x, name, flag, bucket)
+      SELECT id, x, name, flag, bucket ORDER BY k)
+TO '{tmp}/encodings.b56' (FORMAT base56)
+""",
+]
+query = "COPY copy_input TO '{tmp}/data.b56' (FORMAT base56)"
+check = """
+SELECT ((SELECT count(*) FROM ((FROM copy_input EXCEPT ALL FROM copy_verify) UNION ALL (FROM copy_verify EXCEPT ALL FROM copy_input)))
+      + (SELECT count(*) FROM ((FROM copy_edges EXCEPT ALL FROM edges_verify) UNION ALL (FROM edges_verify EXCEPT ALL FROM copy_edges)))
+      + (SELECT (size <> 48667 OR NOT starts_with(content,
+                    '#base56 BIGINT,DOUBLE,VARCHAR,BOOLEAN,INTEGER' || chr(10) ||
+                    '222222222222,~,~,~,222222' || chr(10) ||
+                    '222223222222,2222223x9Ays,573hTy63h,22,222223' || chr(10) ||
+                    '222224222222,2222223xF9MS,573hTy68H,23,222224' || chr(10)))::BIGINT
+         FROM read_text('{tmp}/golden.b56'))
+      + (SELECT (content IS DISTINCT FROM
+                    '#base56 BIGINT,DOUBLE,VARCHAR,BOOLEAN,INTEGER' || chr(10) ||
+                    '22222k222222,2222223x9Ays,5HDDPE,23,222229' || chr(10) ||
+                    '~,~,5HDDNe2ER4N,22,~' || chr(10) ||
+                    '~,~,,~,~' || chr(10))::BIGINT
+         FROM read_text('{tmp}/encodings.b56'))
+)::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "base56/to_nulls_0"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    """
+CREATE TABLE copy_input AS
+SELECT nullable(i::BIGINT, i, 20, 0) AS id, nullable(i * 1.5, i, 21, 0)::DOUBLE AS x,
+       nullable('name_' || i, i, 22, 0) AS name, nullable(i % 2 = 0, i, 23, 0) AS flag,
+       nullable((i % 1000)::INTEGER, i, 24, 0) AS bucket
+FROM range({rows}) t(i)
+""",
+    "COPY copy_input TO '{tmp}/data.b56' (FORMAT base56)",
+    "CREATE TABLE copy_verify AS FROM copy_input LIMIT 0",
+    "COPY copy_verify FROM '{tmp}/data.b56' (FORMAT base56)",
+]
+query = "COPY copy_input TO '{tmp}/data.b56' (FORMAT base56)"
+check = """
+SELECT count(*)::VARCHAR
+FROM ((FROM copy_input EXCEPT ALL FROM copy_verify) UNION ALL (FROM copy_verify EXCEPT ALL FROM copy_input))
+"""
+expect = "0"
+
+[[case]]
+name = "base56/from"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    """
+CREATE TABLE copy_input AS
+SELECT nullable(i::BIGINT, i, 20, 10) AS id, nullable(i * 1.5, i, 21, 10)::DOUBLE AS x,
+       nullable('name_' || i, i, 22, 10) AS name, nullable(i % 2 = 0, i, 23, 10) AS flag,
+       nullable((i % 1000)::INTEGER, i, 24, 10) AS bucket
+FROM range({rows}) t(i)
+""",
+    "COPY copy_input TO '{tmp}/data.b56' (FORMAT base56)",
+    "CREATE TABLE copy_target AS FROM copy_input LIMIT 0",
+    "COPY copy_target FROM '{tmp}/data.b56' (FORMAT base56)",
+    """
+COPY (FROM (VALUES (1, '#base56 BIGINT,DOUBLE,VARCHAR,BOOLEAN,INTEGER'),
+                   (2, '22222k222222,2222223x9Ays,5HDDPE,23,222229'),
+                   (3, '~,~,5HDDNe2ER4N,22,~'),
+                   (4, '9niaeZ9niaeZ,~,,~,9niaeZ')) v(k, line)
+      SELECT line ORDER BY k)
+TO '{tmp}/handmade.b56' (FORMAT csv, HEADER false, DELIMITER '|', QUOTE '')
+""",
+    "CREATE TABLE handmade (id BIGINT, x DOUBLE, name VARCHAR, flag BOOLEAN, bucket INTEGER)",
+    "COPY handmade FROM '{tmp}/handmade.b56' (FORMAT base56)",
+]
+reset = "TRUNCATE copy_target"
+query = "COPY copy_target FROM '{tmp}/data.b56' (FORMAT base56)"
+check = """
+WITH expected AS (FROM (VALUES (42::BIGINT, 1.5::DOUBLE, 'duck', true, 7::INTEGER),
+                               (NULL, NULL, 'DuckDB!', false, NULL),
+                               (-1, NULL, '', NULL, -1)) v(id, x, name, flag, bucket))
+SELECT ((SELECT count(*) FROM ((FROM copy_input EXCEPT ALL FROM copy_target) UNION ALL (FROM copy_target EXCEPT ALL FROM copy_input)))
+      + (SELECT count(*) FROM ((FROM handmade EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM handmade)))
+)::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "base56/from_nulls_0"
+rows = [1, 1000, 100_000, 1_000_000]
+setup = [
+    "CREATE MACRO nullable(value, row, seed, percent) AS CASE WHEN hash(row::UBIGINT, seed::UBIGINT) % 100 < percent THEN NULL ELSE value END",
+    """
+CREATE TABLE copy_input AS
+SELECT nullable(i::BIGINT, i, 20, 0) AS id, nullable(i * 1.5, i, 21, 0)::DOUBLE AS x,
+       nullable('name_' || i, i, 22, 0) AS name, nullable(i % 2 = 0, i, 23, 0) AS flag,
+       nullable((i % 1000)::INTEGER, i, 24, 0) AS bucket
+FROM range({rows}) t(i)
+""",
+    "COPY copy_input TO '{tmp}/data.b56' (FORMAT base56)",
+    "CREATE TABLE copy_target AS FROM copy_input LIMIT 0",
+    "COPY copy_target FROM '{tmp}/data.b56' (FORMAT base56)",
+]
+reset = "TRUNCATE copy_target"
+query = "COPY copy_target FROM '{tmp}/data.b56' (FORMAT base56)"
+check = """
+SELECT count(*)::VARCHAR
+FROM ((FROM copy_input EXCEPT ALL FROM copy_target) UNION ALL (FROM copy_target EXCEPT ALL FROM copy_input))
+"""
+expect = "0"

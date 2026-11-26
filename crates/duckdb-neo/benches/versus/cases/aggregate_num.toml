@@ -1,0 +1,536 @@
+# Aggregates with plain states, see `../rust/aggregate_num.rs`:
+# vs_sum(v), vs_avg(d), vs_count_if(b), vs_spread(v), vs_wavg(v, w), vs_sum_scaled(v, factor).
+#
+# `t` has groups `g4` (4 groups), `g1024` (1,024) and `gq` (rows / 4, four rows each). `d` and `w` are
+# multiples of 0.25 below 2^10, so sums stay exact; DOUBLE checks still allow a relative 1e-9.
+
+[[case]]
+name = "sum/ungrouped"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g1024, (i * 7919 % 100003 - 50000)::BIGINT AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_sum(v) FROM t"
+check = """
+SELECT (((SELECT vs_sum(v) FROM t) IS DISTINCT FROM (SELECT sum(v)::BIGINT FROM t))::INTEGER
+        + ((SELECT vs_sum(v) FROM t WHERE false) IS NOT NULL)::INTEGER
+        + ((SELECT vs_sum(x) FROM (VALUES (9223372036854775807), (1)) l(x)) <> -9223372036854775808)::INTEGER
+       )::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "sum/group_4"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, (i % 4)::INTEGER AS g4, (i * 7919 % 100003 - 50000)::BIGINT AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT g4, vs_sum(v) FROM t GROUP BY g4"
+check = """
+SELECT (count(*) FILTER (WHERE a IS DISTINCT FROM b::BIGINT) + (count(*) <> least({rows}, 4))::INTEGER)::VARCHAR
+FROM (SELECT vs_sum(v) AS a, sum(v) AS b FROM t GROUP BY g4)
+"""
+expect = "0"
+
+[[case]]
+name = "sum/group_1024"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g1024, (i * 7919 % 100003 - 50000)::BIGINT AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT g1024, vs_sum(v) FROM t GROUP BY g1024"
+check = """
+SELECT (count(*) FILTER (WHERE a IS DISTINCT FROM b::BIGINT) + (count(*) <> least({rows}, 1024))::INTEGER)::VARCHAR
+FROM (SELECT vs_sum(v) AS a, sum(v) AS b FROM t GROUP BY g1024)
+"""
+expect = "0"
+
+# Many tiny states: four rows per group.
+[[case]]
+name = "sum/group_rows_4"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, (i // 4)::BIGINT AS gq, (i * 7919 % 100003 - 50000)::BIGINT AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT gq, vs_sum(v) FROM t GROUP BY gq"
+check = """
+SELECT (count(*) FILTER (WHERE a IS DISTINCT FROM b::BIGINT) + (count(*) <> ({rows} + 3) // 4)::INTEGER)::VARCHAR
+FROM (SELECT vs_sum(v) AS a, sum(v) AS b FROM t GROUP BY gq)
+"""
+expect = "0"
+
+# Parallel hash aggregation: thread-local states meet in combine.
+[[case]]
+name = "sum/group_1024_threads_4"
+rows = [1, 2048, 100_000, 2_000_000]
+threads = 4
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g1024, (i * 7919 % 100003 - 50000)::BIGINT AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT g1024, vs_sum(v) FROM t GROUP BY g1024"
+check = """
+SELECT (count(*) FILTER (WHERE a IS DISTINCT FROM b::BIGINT) + (count(*) <> least({rows}, 1024))::INTEGER)::VARCHAR
+FROM (SELECT vs_sum(v) AS a, sum(v) AS b FROM t GROUP BY g1024)
+"""
+expect = "0"
+
+# The filters leave the aggregate a selection of each scanned vector: 5% and 95% of the rows.
+[[case]]
+name = "sum/where_5pct"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g1024, (i * 7919 % 100003 - 50000)::BIGINT AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_sum(v) FROM t WHERE i % 20 = 7"
+check = """
+SELECT ((SELECT vs_sum(v) FROM t WHERE i % 20 = 7) IS DISTINCT FROM (SELECT sum(v)::BIGINT FROM t WHERE i % 20 = 7))
+       ::INTEGER::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "sum/where_95pct"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g1024, (i * 7919 % 100003 - 50000)::BIGINT AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT g1024, vs_sum(v) FROM t WHERE i % 20 <> 7 GROUP BY g1024"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT vs_sum(v) AS a, sum(v) AS b FROM t WHERE i % 20 <> 7 GROUP BY g1024)
+WHERE a IS DISTINCT FROM b::BIGINT
+"""
+expect = "0"
+
+[[case]]
+name = "sum/filter_clause"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g1024, (i * 7919 % 100003 - 50000)::BIGINT AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT g1024, vs_sum(v) FILTER (WHERE i % 3 = 1) FROM t GROUP BY g1024"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT vs_sum(v) FILTER (WHERE i % 3 = 1) AS a, sum(v) FILTER (WHERE i % 3 = 1) AS b FROM t GROUP BY g1024)
+WHERE a IS DISTINCT FROM b::BIGINT
+"""
+expect = "0"
+
+# DuckDB deduplicates the arguments itself, so the aggregate sees each of the 1,000 values once.
+[[case]]
+name = "sum/distinct"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, (i * 7919 % 100003 - 50000)::BIGINT AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_sum(DISTINCT v % 1000) FROM t"
+check = """
+SELECT ((SELECT vs_sum(DISTINCT v % 1000) FROM t) IS DISTINCT FROM (SELECT sum(DISTINCT v % 1000)::BIGINT FROM t))
+       ::INTEGER::VARCHAR
+"""
+expect = "0"
+
+# Eight distinct calls: identical calls would be deduplicated by DuckDB.
+[[case]]
+name = "sum/eight_calls"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g1024, (i * 7919 % 100003 - 50000)::BIGINT AS v
+FROM range({rows}) r(i)
+"""]
+query = """
+SELECT g1024, vs_sum(v), vs_sum(v + 1), vs_sum(v + 2), vs_sum(v + 3), vs_sum(v + 4), vs_sum(v + 5), vs_sum(v + 6),
+       vs_sum(v + 7)
+FROM t GROUP BY g1024
+"""
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT vs_sum(v) AS a0, sum(v) AS b0, vs_sum(v + 3) AS a3, sum(v + 3) AS b3, vs_sum(v + 7) AS a7,
+             sum(v + 7) AS b7
+      FROM t GROUP BY g1024)
+WHERE a0 IS DISTINCT FROM b0::BIGINT OR a3 IS DISTINCT FROM b3::BIGINT OR a7 IS DISTINCT FROM b7::BIGINT
+"""
+expect = "0"
+
+[[case]]
+name = "sum/nulls_10"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g1024,
+       CASE WHEN i % 10 = 9 THEN NULL ELSE (i * 7919 % 100003 - 50000)::BIGINT END AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT g1024, vs_sum(v) FROM t GROUP BY g1024"
+check = """
+SELECT (count(*) FILTER (WHERE a IS DISTINCT FROM b::BIGINT)
+        + ((SELECT count(*) FROM t WHERE v IS NULL) <> {rows} // 10)::INTEGER)::VARCHAR
+FROM (SELECT vs_sum(v) AS a, sum(v) AS b FROM t GROUP BY g1024)
+"""
+expect = "0"
+
+# Every row NULL: each group finalizes to NULL.
+[[case]]
+name = "sum/nulls_100"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g1024, NULL::BIGINT AS v FROM range({rows}) r(i)
+"""]
+query = "SELECT g1024, vs_sum(v) FROM t GROUP BY g1024"
+check = """
+SELECT (count(*) FILTER (WHERE a IS NOT NULL) + (count(*) <> least({rows}, 1024))::INTEGER)::VARCHAR
+FROM (SELECT vs_sum(v) AS a FROM t GROUP BY g1024)
+"""
+expect = "0"
+
+[[case]]
+name = "avg/ungrouped"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, ((i * 31 % 1000) * 0.25)::DOUBLE AS d FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_avg(d) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE (a IS NULL) <> (b IS NULL) OR abs(a - b) > 1e-9 * (1 + abs(b)))
+        + ((SELECT vs_avg(d) FROM t WHERE false) IS NOT NULL)::INTEGER)::VARCHAR
+FROM (SELECT vs_avg(d) AS a, avg(d) AS b FROM t)
+"""
+expect = "0"
+
+[[case]]
+name = "avg/ungrouped_threads_4"
+rows = [1, 2048, 100_000, 2_000_000]
+threads = 4
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, ((i * 31 % 1000) * 0.25)::DOUBLE AS d FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_avg(d) FROM t"
+check = """
+SELECT count(*) FILTER (WHERE (a IS NULL) <> (b IS NULL) OR abs(a - b) > 1e-9 * (1 + abs(b)))::VARCHAR
+FROM (SELECT vs_avg(d) AS a, avg(d) AS b FROM t)
+"""
+expect = "0"
+
+[[case]]
+name = "avg/nulls_50"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g1024,
+       CASE WHEN i % 2 = 1 THEN NULL ELSE ((i * 31 % 1000) * 0.25)::DOUBLE END AS d
+FROM range({rows}) r(i)
+"""]
+query = "SELECT g1024, vs_avg(d) FROM t GROUP BY g1024"
+check = """
+SELECT count(*) FILTER (WHERE (a IS NULL) <> (b IS NULL) OR abs(a - b) > 1e-9 * (1 + abs(b)))::VARCHAR
+FROM (SELECT vs_avg(d) AS a, avg(d) AS b FROM t GROUP BY g1024)
+"""
+expect = "0"
+
+[[case]]
+name = "count_if/group_4_nulls_10"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i::BIGINT AS i, (i % 4)::INTEGER AS g4, CASE WHEN i % 10 = 9 THEN NULL ELSE i % 3 = 0 END AS b
+FROM range({rows}) r(i)
+"""]
+query = "SELECT g4, vs_count_if(b) FROM t GROUP BY g4"
+check = """
+SELECT (count(*) FILTER (WHERE a IS DISTINCT FROM c)
+        + ((SELECT vs_count_if(b) FROM t WHERE false) IS DISTINCT FROM 0)::INTEGER
+        + ((SELECT vs_count_if(NULL::BOOLEAN) FROM t) IS DISTINCT FROM 0)::INTEGER)::VARCHAR
+FROM (SELECT vs_count_if(b) AS a, count(*) FILTER (WHERE b) AS c FROM t GROUP BY g4)
+"""
+expect = "0"
+
+[[case]]
+name = "count_if/ungrouped_nulls_100"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT i::BIGINT AS i, NULL::BOOLEAN AS b FROM range({rows}) r(i)"]
+query = "SELECT vs_count_if(b) FROM t"
+check = "SELECT vs_count_if(b)::VARCHAR FROM t"
+expect = "0"
+
+[[case]]
+name = "spread/group_rows_4"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, (i // 4)::BIGINT AS gq, (i * 7919 % 100003 - 50000)::BIGINT AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT gq, vs_spread(v) FROM t GROUP BY gq"
+check = """
+SELECT (count(*) FILTER (WHERE a IS DISTINCT FROM b)
+        + ((SELECT vs_spread(x) FROM (VALUES (-9223372036854775808), (NULL), (9223372036854775807)) l(x)) <> -1)
+          ::INTEGER
+        + ((SELECT vs_spread(v) FROM t WHERE false) IS NOT NULL)::INTEGER)::VARCHAR
+FROM (SELECT vs_spread(v) AS a, max(v) - min(v) AS b FROM t GROUP BY gq)
+"""
+expect = "0"
+
+[[case]]
+name = "wavg/group_1024_nulls_10"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g1024,
+       CASE WHEN i % 10 = 9 THEN NULL ELSE ((i * 31 % 1000) * 0.25)::DOUBLE END AS d,
+       CASE WHEN i % 10 = 4 THEN NULL ELSE (1 + i % 7)::DOUBLE END AS w
+FROM range({rows}) r(i)
+"""]
+query = "SELECT g1024, vs_wavg(d, w) FROM t GROUP BY g1024"
+check = """
+SELECT count(*) FILTER (WHERE (a IS NULL) <> (b IS NULL) OR abs(a - b) > 1e-9 * (1 + abs(b)))::VARCHAR
+FROM (SELECT vs_wavg(d, w) AS a, sum(d * w) / sum(CASE WHEN d IS NOT NULL THEN w END) AS b FROM t GROUP BY g1024)
+"""
+expect = "0"
+
+# The factor is a constant folded at bind time.
+[[case]]
+name = "sum_scaled/group_1024"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g1024, (i * 7919 % 100003 - 50000)::BIGINT AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT g1024, vs_sum_scaled(v, 3) FROM t GROUP BY g1024"
+check = """
+SELECT (count(*) FILTER (WHERE a IS DISTINCT FROM b::BIGINT)
+        + ((SELECT vs_sum_scaled(x, 1 + 1) FROM (VALUES (4611686018427387904), (NULL)) l(x))
+           <> -9223372036854775808)::INTEGER)::VARCHAR
+FROM (SELECT vs_sum_scaled(v, 3) AS a, sum(v * 3) AS b FROM t GROUP BY g1024)
+"""
+expect = "0"
+
+[[case]]
+name = "mixed/four_aggregates"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g1024, (i * 7919 % 100003 - 50000)::BIGINT AS v,
+       ((i * 31 % 1000) * 0.25)::DOUBLE AS d, i % 3 = 0 AS b
+FROM range({rows}) r(i)
+"""]
+query = "SELECT g1024, vs_sum(v), vs_avg(d), vs_spread(v), vs_count_if(b) FROM t GROUP BY g1024"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT vs_sum(v) AS s, sum(v)::BIGINT AS s0, vs_avg(d) AS a, avg(d) AS a0, vs_spread(v) AS p,
+             max(v) - min(v) AS p0, vs_count_if(b) AS c, count(*) FILTER (WHERE b) AS c0
+      FROM t GROUP BY g1024)
+WHERE s IS DISTINCT FROM s0 OR abs(a - a0) > 1e-9 * (1 + abs(a0)) OR p IS DISTINCT FROM p0 OR c IS DISTINCT FROM c0
+"""
+expect = "0"
+
+# Every function once over a single row, so fixed per-query and per-callback costs dominate.
+[[case]]
+name = "mixed/one_row"
+rows = [1]
+setup = ["""
+CREATE TABLE t AS
+SELECT i::BIGINT AS i, (i * 7919 % 100003 - 50000)::BIGINT AS v, ((i * 31 % 1000) * 0.25)::DOUBLE AS d,
+       (1 + i % 7)::DOUBLE AS w, i % 3 = 0 AS b
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_sum(v), vs_avg(d), vs_count_if(b), vs_spread(v), vs_wavg(d, w), vs_sum_scaled(v, 3) FROM t"
+check = """
+SELECT concat_ws(',', vs_sum(v), vs_avg(d), vs_count_if(b), vs_spread(v), vs_wavg(d, w), vs_sum_scaled(v, 3)) FROM t
+"""
+expect = "-50000,0.0,1,0,0.0,-150000"
+
+# Without ORDER BY the running window streams: one update and one finalize per row.
+[[case]]
+name = "window/running"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, (i * 7919 % 100003 - 50000)::BIGINT AS v FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_sum(v) OVER (ROWS UNBOUNDED PRECEDING) FROM t"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT vs_sum(v) OVER w AS a, sum(v) OVER w AS b FROM t WINDOW w AS (ROWS UNBOUNDED PRECEDING))
+WHERE a IS DISTINCT FROM b::BIGINT
+"""
+expect = "0"
+
+[[case]]
+name = "window/running_ordered_nulls_50"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i::BIGINT AS i, CASE WHEN i % 2 = 1 THEN NULL ELSE (i * 7919 % 100003 - 50000)::BIGINT END AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_sum(v) OVER (ORDER BY i ROWS UNBOUNDED PRECEDING) FROM t"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT vs_sum(v) OVER w AS a, sum(v) OVER w AS b FROM t WINDOW w AS (ORDER BY i ROWS UNBOUNDED PRECEDING))
+WHERE a IS DISTINCT FROM b::BIGINT
+"""
+expect = "0"
+
+[[case]]
+name = "window/sliding_2"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, (i * 7919 % 100003 - 50000)::BIGINT AS v FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_sum(v) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT vs_sum(v) OVER w AS a, sum(v) OVER w AS b FROM t
+      WINDOW w AS (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW))
+WHERE a IS DISTINCT FROM b::BIGINT
+"""
+expect = "0"
+
+[[case]]
+name = "window/sliding_9"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, (i * 7919 % 100003 - 50000)::BIGINT AS v FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_spread(v) OVER (ORDER BY i ROWS BETWEEN 8 PRECEDING AND CURRENT ROW) FROM t"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT vs_spread(v) OVER w AS a, max(v) OVER w - min(v) OVER w AS b FROM t
+      WINDOW w AS (ORDER BY i ROWS BETWEEN 8 PRECEDING AND CURRENT ROW))
+WHERE a IS DISTINCT FROM b
+"""
+expect = "0"
+
+[[case]]
+name = "window/sliding_257"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, (i * 7919 % 100003 - 50000)::BIGINT AS v FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_sum(v) OVER (ORDER BY i ROWS BETWEEN 256 PRECEDING AND CURRENT ROW) FROM t"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT vs_sum(v) OVER w AS a, sum(v) OVER w AS b FROM t
+      WINDOW w AS (ORDER BY i ROWS BETWEEN 256 PRECEDING AND CURRENT ROW))
+WHERE a IS DISTINCT FROM b::BIGINT
+"""
+expect = "0"
+
+[[case]]
+name = "window/sliding_5000"
+rows = [1, 2048, 100_000, 500_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, ((i * 31 % 1000) * 0.25)::DOUBLE AS d FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_avg(d) OVER (ORDER BY i ROWS BETWEEN 4999 PRECEDING AND CURRENT ROW) FROM t"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT vs_avg(d) OVER w AS a, avg(d) OVER w AS b FROM t
+      WINDOW w AS (ORDER BY i ROWS BETWEEN 4999 PRECEDING AND CURRENT ROW))
+WHERE (a IS NULL) <> (b IS NULL) OR abs(a - b) > 1e-9 * (1 + abs(b))
+"""
+expect = "0"
+
+[[case]]
+name = "window/centered_9"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i::BIGINT AS i, ((i * 31 % 1000) * 0.25)::DOUBLE AS d, (1 + i % 7)::DOUBLE AS w FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_wavg(d, w) OVER (ORDER BY i ROWS BETWEEN 4 PRECEDING AND 4 FOLLOWING) FROM t"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT vs_wavg(d, w) OVER f AS a, sum(d * w) OVER f / sum(w) OVER f AS b FROM t
+      WINDOW f AS (ORDER BY i ROWS BETWEEN 4 PRECEDING AND 4 FOLLOWING))
+WHERE (a IS NULL) <> (b IS NULL) OR abs(a - b) > 1e-9 * (1 + abs(b))
+"""
+expect = "0"
+
+# Peers share `v`, so frames vary in size; `v` has about 100,000 distinct values.
+[[case]]
+name = "window/range"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, (i * 7919 % 100003 - 50000)::BIGINT AS v FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_sum(v) OVER (ORDER BY v RANGE BETWEEN 20 PRECEDING AND 20 FOLLOWING) FROM t"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT vs_sum(v) OVER w AS a, sum(v) OVER w AS b FROM t
+      WINDOW w AS (ORDER BY v RANGE BETWEEN 20 PRECEDING AND 20 FOLLOWING))
+WHERE a IS DISTINCT FROM b::BIGINT
+"""
+expect = "0"
+
+# Four rows per partition: many tiny segment trees.
+[[case]]
+name = "window/partition_small_running"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, (i // 4)::BIGINT AS gq, (i * 7919 % 100003 - 50000)::BIGINT AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_sum(v) OVER (PARTITION BY gq ORDER BY i ROWS UNBOUNDED PRECEDING) FROM t"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT vs_sum(v) OVER w AS a, sum(v) OVER w AS b FROM t
+      WINDOW w AS (PARTITION BY gq ORDER BY i ROWS UNBOUNDED PRECEDING))
+WHERE a IS DISTINCT FROM b::BIGINT
+"""
+expect = "0"
+
+# Every row in one partition, so DuckDB sorts it as a whole.
+[[case]]
+name = "window/partition_one_sliding_9"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, 0::INTEGER AS g1, (i * 7919 % 100003 - 50000)::BIGINT AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_sum(v) OVER (PARTITION BY g1 ORDER BY i ROWS BETWEEN 8 PRECEDING AND CURRENT ROW) FROM t"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT vs_sum(v) OVER w AS a, sum(v) OVER w AS b FROM t
+      WINDOW w AS (PARTITION BY g1 ORDER BY i ROWS BETWEEN 8 PRECEDING AND CURRENT ROW))
+WHERE a IS DISTINCT FROM b::BIGINT
+"""
+expect = "0"
+
+# The whole partition is every row's frame: one aggregate per partition.
+[[case]]
+name = "window/whole_partition"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, (i % 1024)::INTEGER AS g1024, (i * 7919 % 100003 - 50000)::BIGINT AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_sum(v) OVER (PARTITION BY g1024) FROM t"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT vs_sum(v) OVER w AS a, sum(v) OVER w AS b FROM t WINDOW w AS (PARTITION BY g1024))
+WHERE a IS DISTINCT FROM b::BIGINT
+"""
+expect = "0"
+
+[[case]]
+name = "window/sum_scaled_sliding_9"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i::BIGINT AS i, (i * 7919 % 100003 - 50000)::BIGINT AS v FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_sum_scaled(v, -2) OVER (ORDER BY i ROWS BETWEEN 8 PRECEDING AND CURRENT ROW) FROM t"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT vs_sum_scaled(v, -2) OVER w AS a, sum(v * -2) OVER w AS b FROM t
+      WINDOW w AS (ORDER BY i ROWS BETWEEN 8 PRECEDING AND CURRENT ROW))
+WHERE a IS DISTINCT FROM b::BIGINT
+"""
+expect = "0"

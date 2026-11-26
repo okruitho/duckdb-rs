@@ -1,0 +1,457 @@
+# Table functions; see rust/table.rs for their semantics. Checks compare the output with builtin `range()` SQL as
+# multisets (symmetric EXCEPT ALL, NULLs compare equal) and add edge calls that must produce no mismatches.
+
+# --- vs_series(n): 0 .. n-1 ---
+
+[[case]]
+name = "series/count"
+rows = [1, 2048, 100_000, 2_000_000, 20_000_000]
+query = "SELECT count(*) FROM vs_series({rows})"
+check = """
+WITH a AS (SELECT i FROM vs_series({rows})), b AS (SELECT range AS i FROM range({rows}))
+SELECT ((SELECT count(*) FROM ((FROM a EXCEPT ALL FROM b) UNION ALL (FROM b EXCEPT ALL FROM a)))
+        + (SELECT count(*) FROM vs_series(0)) + (SELECT count(*) FROM vs_series(NULL))
+        + (SELECT count(*) FROM vs_series(-5))
+        + (SELECT count(*) FROM vs_series({rows})) - {rows})::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "series/project"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT i FROM vs_series({rows})"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT i, row_number() OVER () - 1 AS r FROM vs_series({rows}))
+WHERE i IS DISTINCT FROM r
+"""
+expect = "0"
+
+[[case]]
+name = "series/where_1pct"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT i FROM vs_series({rows}) WHERE i % 100 = 0"
+check = """
+WITH a AS (SELECT i FROM vs_series({rows}) WHERE i % 100 = 0), b AS (SELECT range AS i FROM range(0, {rows}, 100))
+SELECT count(*)::VARCHAR FROM ((FROM a EXCEPT ALL FROM b) UNION ALL (FROM b EXCEPT ALL FROM a))
+"""
+expect = "0"
+
+[[case]]
+name = "series/where_90pct"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT i FROM vs_series({rows}) WHERE i % 10 <> 0"
+check = """
+WITH a AS (SELECT i FROM vs_series({rows}) WHERE i % 10 <> 0),
+     b AS (SELECT range AS i FROM range({rows}) WHERE range % 10 <> 0)
+SELECT count(*)::VARCHAR FROM ((FROM a EXCEPT ALL FROM b) UNION ALL (FROM b EXCEPT ALL FROM a))
+"""
+expect = "0"
+
+# A huge call stopped early: only the first chunks are produced.
+[[case]]
+name = "series/limit"
+rows = [1, 10, 2048]
+query = "SELECT i FROM vs_series(1_000_000_000_000) LIMIT {rows}"
+check = """
+SELECT (count(*) FILTER (WHERE i IS DISTINCT FROM r) + abs(count(*) - {rows}))::VARCHAR
+FROM (SELECT i, row_number() OVER () - 1 AS r FROM (SELECT i FROM vs_series(1_000_000_000_000) LIMIT {rows}))
+"""
+expect = "0"
+
+[[case]]
+name = "series/order_by_limit"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT i FROM vs_series({rows}) ORDER BY i DESC LIMIT 10"
+check = """
+SELECT ((SELECT list(i) FROM (SELECT i FROM vs_series({rows}) ORDER BY i DESC LIMIT 10))
+        IS DISTINCT FROM (SELECT list(range ORDER BY range DESC) FROM range(greatest({rows} - 10, 0), {rows})))
+       ::INTEGER::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "series/sum"
+rows = [1, 2048, 100_000, 2_000_000, 20_000_000]
+query = "SELECT sum(i) FROM vs_series({rows})"
+check = """
+SELECT ((SELECT sum(i) FROM vs_series({rows})) IS DISTINCT FROM (SELECT sum(range) FROM range({rows})))
+       ::INTEGER::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "series/group_by"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT i % 100 AS g, count(*), sum(i) FROM vs_series({rows}) GROUP BY g"
+check = """
+WITH a AS (SELECT i % 100 AS g, count(*) AS c, sum(i) AS s FROM vs_series({rows}) GROUP BY g),
+     b AS (SELECT range % 100 AS g, count(*) AS c, sum(range) AS s FROM range({rows}) GROUP BY g)
+SELECT count(*)::VARCHAR FROM ((FROM a EXCEPT ALL FROM b) UNION ALL (FROM b EXCEPT ALL FROM a))
+"""
+expect = "0"
+
+[[case]]
+name = "series/window"
+rows = [1, 2048, 100_000]
+query = "SELECT i, sum(i) OVER (ORDER BY i ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) FROM vs_series({rows})"
+check = """
+WITH a AS (SELECT i, sum(i) OVER (ORDER BY i ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS w FROM vs_series({rows})),
+     b AS (SELECT range AS i, sum(range) OVER (ORDER BY range ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS w
+           FROM range({rows}))
+SELECT count(*)::VARCHAR FROM ((FROM a EXCEPT ALL FROM b) UNION ALL (FROM b EXCEPT ALL FROM a))
+"""
+expect = "0"
+
+[[case]]
+name = "series/join_table"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT range * 3 AS v FROM range({rows})"]
+query = "SELECT count(*) FROM vs_series({rows}) s JOIN t ON s.i = t.v"
+check = """
+SELECT ((SELECT count(*) FROM vs_series({rows}) s JOIN t ON s.i = t.v)
+        - (SELECT count(*) FROM range({rows}) r JOIN t ON r.range = t.v))::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "series/join_call"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT count(*), sum(b.i) FROM vs_series({rows}) a JOIN vs_series_step(0, {rows}, step := 3) b ON a.i = b.i"
+check = """
+SELECT ((SELECT sum(b.i) FROM vs_series({rows}) a JOIN vs_series_step(0, {rows}, step := 3) b ON a.i = b.i)
+        IS DISTINCT FROM (SELECT sum(range) FROM range(0, {rows}, 3)))::INTEGER::VARCHAR
+"""
+expect = "0"
+
+# Fixed bind and init cost: an empty call and a one-row call.
+[[case]]
+name = "series/tiny"
+rows = [0, 1]
+query = "SELECT i FROM vs_series({rows})"
+check = "SELECT (count(*) - {rows} + coalesce(sum(i), 0))::VARCHAR FROM vs_series({rows})"
+expect = "0"
+
+[[case]]
+name = "series/union_ten_calls"
+rows = [1, 64, 2048]
+query = """
+SELECT count(*) FROM (
+  SELECT i FROM vs_series({rows}) UNION ALL SELECT i FROM vs_series({rows} + 1)
+  UNION ALL SELECT i FROM vs_series({rows} + 2) UNION ALL SELECT i FROM vs_series({rows} + 3)
+  UNION ALL SELECT i FROM vs_series({rows} + 4) UNION ALL SELECT i FROM vs_series({rows} + 5)
+  UNION ALL SELECT i FROM vs_series({rows} + 6) UNION ALL SELECT i FROM vs_series({rows} + 7)
+  UNION ALL SELECT i FROM vs_series({rows} + 8) UNION ALL SELECT i FROM vs_series({rows} + 9))
+"""
+check = """
+SELECT (sum(i) - sum(DISTINCT n * (n - 1) // 2))::VARCHAR
+FROM (SELECT i, {rows} AS n FROM vs_series({rows}) UNION ALL SELECT i, {rows} + 1 FROM vs_series({rows} + 1)
+      UNION ALL SELECT i, {rows} + 2 FROM vs_series({rows} + 2) UNION ALL SELECT i, {rows} + 3 FROM vs_series({rows} + 3)
+      UNION ALL SELECT i, {rows} + 4 FROM vs_series({rows} + 4) UNION ALL SELECT i, {rows} + 5 FROM vs_series({rows} + 5)
+      UNION ALL SELECT i, {rows} + 6 FROM vs_series({rows} + 6) UNION ALL SELECT i, {rows} + 7 FROM vs_series({rows} + 7)
+      UNION ALL SELECT i, {rows} + 8 FROM vs_series({rows} + 8) UNION ALL SELECT i, {rows} + 9 FROM vs_series({rows} + 9))
+"""
+expect = "0"
+
+[[case]]
+name = "series/unprepared"
+rows = [1, 2048, 100_000]
+unprepared = true
+query = "SELECT count(*) FROM vs_series({rows})"
+check = "SELECT (count(*) - {rows})::VARCHAR FROM vs_series({rows})"
+expect = "0"
+
+# A single-threaded scan under a four-thread instance.
+[[case]]
+name = "series/threads4"
+rows = [2048, 100_000, 2_000_000, 20_000_000]
+threads = 4
+query = "SELECT sum(i) FROM vs_series({rows})"
+check = """
+SELECT ((SELECT sum(i) FROM vs_series({rows})) IS DISTINCT FROM (SELECT sum(range) FROM range({rows})))
+       ::INTEGER::VARCHAR
+"""
+expect = "0"
+
+# --- vs_series_par(n): vs_series with a parallel scan ---
+
+[[case]]
+name = "series_par/threads4"
+rows = [2048, 100_000, 2_000_000, 20_000_000]
+threads = 4
+query = "SELECT sum(i) FROM vs_series_par({rows})"
+check = """
+WITH a AS (SELECT i FROM vs_series_par({rows})), b AS (SELECT range AS i FROM range({rows}))
+SELECT ((SELECT count(*) FROM ((FROM a EXCEPT ALL FROM b) UNION ALL (FROM b EXCEPT ALL FROM a)))
+        + (SELECT count(*) FROM vs_series_par(0)) + (SELECT count(*) FROM vs_series_par(NULL)))::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "series_par/project_threads4"
+rows = [2048, 100_000, 2_000_000]
+threads = 4
+query = "SELECT i FROM vs_series_par({rows})"
+check = "SELECT (count(DISTINCT i) - {rows} + max(i) - ({rows} - 1) + min(i))::VARCHAR FROM vs_series_par({rows})"
+expect = "0"
+
+# --- vs_series_filter(n): vs_series applying comparisons with a constant itself ---
+
+# A single pushed-down comparison skips all but the last 99 rows. `i >= a AND i < b` would reach the function as a
+# BETWEEN, whose bound inclusivity neither API exposes, so it is not claimed.
+# Identical calls in separate scalar subqueries can share their bind data, so the edge calls use distinct counts.
+[[case]]
+name = "series_filter/tail"
+rows = [1, 2048, 100_000, 2_000_000, 20_000_000]
+query = "SELECT i FROM vs_series_filter({rows}) WHERE i > {rows} - 100"
+check = """
+WITH a AS (SELECT i FROM vs_series_filter({rows}) WHERE i > {rows} - 100),
+     b AS (SELECT range AS i FROM range(greatest({rows} - 99, 0), {rows}))
+SELECT ((SELECT count(*) FROM ((FROM a EXCEPT ALL FROM b) UNION ALL (FROM b EXCEPT ALL FROM a)))
+        + (SELECT count(*) FROM vs_series_filter(101) WHERE i > 9223372036854775807)
+        + (SELECT count(*) FROM vs_series_filter(102) WHERE i <= -1)
+        + (SELECT count(*) - 1 FROM vs_series_filter(103) WHERE i <= 9223372036854775807 AND i = 99)
+        + (SELECT count(*) - 104 FROM vs_series_filter(104) WHERE i >= -9223372036854775808))::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "series_filter/wide"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT i FROM vs_series_filter({rows}) WHERE i > 10"
+check = """
+WITH a AS (SELECT i FROM vs_series_filter({rows}) WHERE i > 10), b AS (SELECT range AS i FROM range(11, {rows}))
+SELECT count(*)::VARCHAR FROM ((FROM a EXCEPT ALL FROM b) UNION ALL (FROM b EXCEPT ALL FROM a))
+"""
+expect = "0"
+
+[[case]]
+name = "series_filter/equal"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT i FROM vs_series_filter({rows}) WHERE i = {rows} - 1"
+check = "SELECT (count(*) - 1 + sum(i) - ({rows} - 1))::VARCHAR FROM vs_series_filter({rows}) WHERE i = {rows} - 1"
+expect = "0"
+
+# The range predicate is pushed down, the modulo stays with DuckDB.
+[[case]]
+name = "series_filter/residual"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT count(*) FROM vs_series_filter({rows}) WHERE i < {rows} // 10 + 1 AND i % 3 = 0"
+check = """
+WITH a AS (SELECT i FROM vs_series_filter({rows}) WHERE i < {rows} // 10 + 1 AND i % 3 = 0),
+     b AS (SELECT range AS i FROM range(0, least({rows} // 10 + 1, {rows}), 3))
+SELECT count(*)::VARCHAR FROM ((FROM a EXCEPT ALL FROM b) UNION ALL (FROM b EXCEPT ALL FROM a))
+"""
+expect = "0"
+
+# --- vs_series_step(start, stop, step := 1): range(start, stop, step) ---
+
+[[case]]
+name = "series_step/default_step"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT i FROM vs_series_step(0, {rows})"
+check = """
+WITH a AS (SELECT i FROM vs_series_step(0, {rows})), b AS (SELECT range AS i FROM range(0, {rows}))
+SELECT ((SELECT count(*) FROM ((FROM a EXCEPT ALL FROM b) UNION ALL (FROM b EXCEPT ALL FROM a)))
+        + (SELECT count(*) FROM vs_series_step(5, 5)) + (SELECT count(*) FROM vs_series_step(5, 1))
+        + (SELECT count(*) FROM vs_series_step(NULL, 5)) + (SELECT count(*) FROM vs_series_step(0, 5, step := NULL))
+        )::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "series_step/named_negative"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT i FROM vs_series_step({rows}, -{rows}, step := -3)"
+check = """
+WITH a AS (SELECT i FROM vs_series_step({rows}, -{rows}, step := -3)),
+     b AS (SELECT range AS i FROM range({rows}, -{rows}, -3)),
+     e AS (SELECT i FROM vs_series_step(-9223372036854775808, 9223372036854775807, step := 4611686018427387904)),
+     f AS (SELECT range AS i FROM range(-9223372036854775808, 9223372036854775807, 4611686018427387904)),
+     g AS (SELECT i FROM vs_series_step(9223372036854775807, -9223372036854775808, step := -9223372036854775808)),
+     h AS (SELECT range AS i FROM range(9223372036854775807, -9223372036854775808, -9223372036854775808))
+SELECT ((SELECT count(*) FROM ((FROM a EXCEPT ALL FROM b) UNION ALL (FROM b EXCEPT ALL FROM a)))
+        + (SELECT count(*) FROM ((FROM e EXCEPT ALL FROM f) UNION ALL (FROM f EXCEPT ALL FROM e)))
+        + (SELECT count(*) FROM ((FROM g EXCEPT ALL FROM h) UNION ALL (FROM h EXCEPT ALL FROM g)))
+        + abs((SELECT count(*) FROM e) - 4))::VARCHAR
+"""
+expect = "0"
+
+# --- vs_grid(n): six columns behind projection pushdown ---
+
+[[case]]
+name = "grid/count"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT count(*) FROM vs_grid({rows})"
+check = "SELECT (count(*) - {rows} + (SELECT count(*) FROM vs_grid(0)) + (SELECT count(*) FROM vs_grid(NULL)))::VARCHAR FROM vs_grid({rows})"
+expect = "0"
+
+[[case]]
+name = "grid/all_columns"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT * FROM vs_grid({rows})"
+check = """
+WITH a AS (SELECT * FROM vs_grid({rows})),
+     b AS (SELECT range AS i, range * range AS sq, range::DOUBLE / 2 AS half, 'row-' || range AS tag,
+                  range % 2 = 0 AS even, CASE WHEN range % 5 = 0 THEN NULL ELSE (range % 1000)::INTEGER END AS opt
+           FROM range({rows}))
+SELECT count(*)::VARCHAR FROM ((FROM a EXCEPT ALL FROM b) UNION ALL (FROM b EXCEPT ALL FROM a))
+"""
+expect = "0"
+
+[[case]]
+name = "grid/one_column"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT half FROM vs_grid({rows})"
+check = """
+WITH a AS (SELECT half FROM vs_grid({rows})), b AS (SELECT range::DOUBLE / 2 AS half FROM range({rows}))
+SELECT count(*)::VARCHAR FROM ((FROM a EXCEPT ALL FROM b) UNION ALL (FROM b EXCEPT ALL FROM a))
+"""
+expect = "0"
+
+[[case]]
+name = "grid/subset_reordered"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT opt, tag, sq FROM vs_grid({rows})"
+check = """
+WITH a AS (SELECT opt, tag, sq FROM vs_grid({rows})),
+     b AS (SELECT CASE WHEN range % 5 = 0 THEN NULL ELSE (range % 1000)::INTEGER END AS opt, 'row-' || range AS tag,
+                  range * range AS sq
+           FROM range({rows}))
+SELECT count(*)::VARCHAR FROM ((FROM a EXCEPT ALL FROM b) UNION ALL (FROM b EXCEPT ALL FROM a))
+"""
+expect = "0"
+
+# Filters on two output columns at about 20% and 50% selectivity.
+[[case]]
+name = "grid/where"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT tag, i FROM vs_grid({rows}) WHERE opt IS NULL OR even"
+check = """
+WITH a AS (SELECT tag, i FROM vs_grid({rows}) WHERE opt IS NULL OR even),
+     b AS (SELECT 'row-' || range AS tag, range AS i FROM range({rows}) WHERE range % 5 = 0 OR range % 2 = 0)
+SELECT count(*)::VARCHAR FROM ((FROM a EXCEPT ALL FROM b) UNION ALL (FROM b EXCEPT ALL FROM a))
+"""
+expect = "0"
+
+[[case]]
+name = "grid/group_by"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT even, count(opt), sum(sq), max(tag), avg(half) FROM vs_grid({rows}) GROUP BY even"
+check = """
+WITH a AS (SELECT even, count(opt) AS c, sum(sq) AS s, max(tag) AS m, avg(half) AS h FROM vs_grid({rows}) GROUP BY even),
+     b AS (SELECT range % 2 = 0 AS even, count(*) FILTER (WHERE range % 5 <> 0) AS c, sum(range * range) AS s,
+                  max('row-' || range) AS m, avg(range::DOUBLE / 2) AS h
+           FROM range({rows}) GROUP BY ALL)
+SELECT count(*)::VARCHAR FROM ((FROM a EXCEPT ALL FROM b) UNION ALL (FROM b EXCEPT ALL FROM a))
+"""
+expect = "0"
+
+# --- vs_words(n, len): lpad(i::VARCHAR, len, '.') ---
+
+[[case]]
+name = "words/inline_8"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT word FROM vs_words({rows}, 8)"
+check = """
+WITH a AS (SELECT word FROM vs_words({rows}, 8)), b AS (SELECT lpad(range::VARCHAR, 8, '.') AS word FROM range({rows}))
+SELECT ((SELECT count(*) FROM ((FROM a EXCEPT ALL FROM b) UNION ALL (FROM b EXCEPT ALL FROM a)))
+        + (SELECT count(*) FROM vs_words(5, NULL)) + (SELECT count(*) FROM vs_words(NULL, 3))
+        + (SELECT count(*) FILTER (WHERE word <> '') FROM vs_words(3, 0)))::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "words/long_40"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT word FROM vs_words({rows}, 40)"
+check = """
+WITH a AS (SELECT word FROM vs_words({rows}, 40)), b AS (SELECT lpad(range::VARCHAR, 40, '.') AS word FROM range({rows}))
+SELECT count(*)::VARCHAR FROM ((FROM a EXCEPT ALL FROM b) UNION ALL (FROM b EXCEPT ALL FROM a))
+"""
+expect = "0"
+
+[[case]]
+name = "words/huge_1000"
+rows = [1, 2048, 100_000]
+query = "SELECT word FROM vs_words({rows}, 1000)"
+check = """
+WITH a AS (SELECT word FROM vs_words({rows}, 1000)),
+     b AS (SELECT lpad(range::VARCHAR, 1000, '.') AS word FROM range({rows}))
+SELECT count(*)::VARCHAR FROM ((FROM a EXCEPT ALL FROM b) UNION ALL (FROM b EXCEPT ALL FROM a))
+"""
+expect = "0"
+
+# Longer numbers than `len` keep their leading digits, like lpad.
+[[case]]
+name = "words/truncated_3"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT count(*), max(word) FROM vs_words({rows}, 3)"
+check = """
+WITH a AS (SELECT word FROM vs_words({rows}, 3)), b AS (SELECT lpad(range::VARCHAR, 3, '.') AS word FROM range({rows}))
+SELECT count(*)::VARCHAR FROM ((FROM a EXCEPT ALL FROM b) UNION ALL (FROM b EXCEPT ALL FROM a))
+"""
+expect = "0"
+
+[[case]]
+name = "words/where_like"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT count(*) FROM vs_words({rows}, 16) WHERE word LIKE '%77'"
+check = """
+SELECT ((SELECT count(*) FROM vs_words({rows}, 16) WHERE word LIKE '%77')
+        - (SELECT count(*) FROM range({rows}) WHERE range::VARCHAR LIKE '%77'))::VARCHAR
+"""
+expect = "0"
+
+# --- vs_repeat_row(s, k, n): one constant row n times ---
+
+[[case]]
+name = "repeat_row/all_columns"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT * FROM vs_repeat_row('a constant longer than twelve bytes', 42, {rows})"
+check = """
+WITH a AS (SELECT * FROM vs_repeat_row('a constant longer than twelve bytes', 42, {rows})),
+     b AS (SELECT 'a constant longer than twelve bytes' AS s, 42::BIGINT AS k FROM range({rows}))
+SELECT ((SELECT count(*) FROM ((FROM a EXCEPT ALL FROM b) UNION ALL (FROM b EXCEPT ALL FROM a)))
+        + (SELECT count(*) FROM vs_repeat_row('x', 1, 0)) + (SELECT count(*) FROM vs_repeat_row('x', 1, NULL)))
+       ::VARCHAR
+"""
+expect = "0"
+
+[[case]]
+name = "repeat_row/one_column"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT k FROM vs_repeat_row('short', -7, {rows})"
+check = """
+SELECT (count(*) - {rows} + count(*) FILTER (WHERE k IS DISTINCT FROM -7))::VARCHAR
+FROM vs_repeat_row('short', -7, {rows})
+"""
+expect = "0"
+
+[[case]]
+name = "repeat_row/count"
+rows = [1, 2048, 100_000, 2_000_000, 20_000_000]
+query = "SELECT count(*) FROM vs_repeat_row('short', 1, {rows})"
+check = "SELECT (count(*) - {rows})::VARCHAR FROM vs_repeat_row('short', 1, {rows})"
+expect = "0"
+
+[[case]]
+name = "repeat_row/nulls"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT s, k FROM vs_repeat_row(NULL, NULL, {rows})"
+check = """
+SELECT (count(*) - {rows} + count(s) + count(k)
+        + (SELECT count(*) FILTER (WHERE s IS DISTINCT FROM '' OR k IS NULL) FROM vs_repeat_row('', 0, 3)))::VARCHAR
+FROM vs_repeat_row(NULL, NULL, {rows})
+"""
+expect = "0"
+
+[[case]]
+name = "repeat_row/aggregate"
+rows = [1, 2048, 100_000, 2_000_000]
+query = "SELECT s, sum(k), count(*) FROM vs_repeat_row('group', 3, {rows}) GROUP BY s"
+check = """
+SELECT (sum(k) - 3 * {rows} + count(*) - {rows} + count(DISTINCT s) - 1)::VARCHAR
+FROM vs_repeat_row('group', 3, {rows})
+"""
+expect = "0"
