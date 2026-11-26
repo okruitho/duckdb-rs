@@ -1,3 +1,8 @@
+# Numeric scalar functions; see the header of rust/scalar_num.rs for their semantics.
+# Tables are built from range() rather than passing range() to the functions directly: its column arrives as a
+# SEQUENCE (OTHER) vector, which neither API's typed reader accepts without flattening.
+
+# ---------------------------------------------------------------------------------------------------------------------
 # vs_add_one(BIGINT) -> BIGINT: wrapping v + 1, NULL in, NULL out.
 
 [[case]]
@@ -34,5 +39,402 @@ check = """
 SELECT (count(*) FILTER (WHERE vs_add_one(v) IS DISTINCT FROM v + 1)
         + (count(*) FILTER (WHERE v IS NULL) <> {rows} // 10)::BIGINT)::VARCHAR
 FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "add_one/nulls_50"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT CASE WHEN i % 2 = 1 THEN NULL ELSE i::BIGINT END AS v FROM range({rows}) r(i)"]
+query = "SELECT vs_add_one(v) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_add_one(v) IS DISTINCT FROM v + 1)
+        + (count(*) FILTER (WHERE v IS NULL) <> {rows} // 2)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "add_one/nulls_100"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT NULL::BIGINT AS v FROM range({rows}) r(i)"]
+query = "SELECT vs_add_one(v) FROM t"
+check = "SELECT (count(vs_add_one(v)) + (count(*) <> {rows})::BIGINT)::VARCHAR FROM t"
+expect = "0"
+
+[[case]]
+name = "add_one/where_1pct"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT i::BIGINT AS v FROM range({rows}) r(i)"]
+query = "SELECT vs_add_one(v) FROM t WHERE v % 100 = 0"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT v, vs_add_one(v) AS a FROM t WHERE v % 100 = 0)
+WHERE a IS DISTINCT FROM v + 1
+"""
+expect = "0"
+
+[[case]]
+name = "add_one/where_50pct"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT i::BIGINT AS v FROM range({rows}) r(i)"]
+query = "SELECT vs_add_one(v) FROM t WHERE v % 2 = 0"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT v, vs_add_one(v) AS a FROM t WHERE v % 2 = 0)
+WHERE a IS DISTINCT FROM v + 1
+"""
+expect = "0"
+
+[[case]]
+name = "add_one/where_99pct"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT i::BIGINT AS v FROM range({rows}) r(i)"]
+query = "SELECT vs_add_one(v) FROM t WHERE v % 100 <> 99"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT v, vs_add_one(v) AS a FROM t WHERE v % 100 <> 99)
+WHERE a IS DISTINCT FROM v + 1
+"""
+expect = "0"
+
+[[case]]
+name = "add_one/nested_8"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT CASE WHEN i % 10 = 9 THEN NULL ELSE i::BIGINT END AS v FROM range({rows}) r(i)"]
+query = "SELECT vs_add_one(vs_add_one(vs_add_one(vs_add_one(vs_add_one(vs_add_one(vs_add_one(vs_add_one(v)))))))) FROM t"
+check = """
+SELECT count(*)::VARCHAR FROM t
+WHERE vs_add_one(vs_add_one(vs_add_one(vs_add_one(vs_add_one(vs_add_one(vs_add_one(vs_add_one(v))))))))
+      IS DISTINCT FROM v + 8
+"""
+expect = "0"
+
+# Sixteen distinct columns, so common subexpression elimination cannot merge the calls.
+[[case]]
+name = "add_one/calls_16"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT
+    (i + 0)::BIGINT AS c0, (i + 1)::BIGINT AS c1, (i + 2)::BIGINT AS c2, (i + 3)::BIGINT AS c3,
+    (i + 4)::BIGINT AS c4, (i + 5)::BIGINT AS c5, (i + 6)::BIGINT AS c6, (i + 7)::BIGINT AS c7,
+    (i + 8)::BIGINT AS c8, (i + 9)::BIGINT AS c9, (i + 10)::BIGINT AS c10, (i + 11)::BIGINT AS c11,
+    (i + 12)::BIGINT AS c12, (i + 13)::BIGINT AS c13, (i + 14)::BIGINT AS c14, (i + 15)::BIGINT AS c15
+FROM range({rows}) r(i)
+"""]
+query = """
+SELECT vs_add_one(c0), vs_add_one(c1), vs_add_one(c2), vs_add_one(c3),
+       vs_add_one(c4), vs_add_one(c5), vs_add_one(c6), vs_add_one(c7),
+       vs_add_one(c8), vs_add_one(c9), vs_add_one(c10), vs_add_one(c11),
+       vs_add_one(c12), vs_add_one(c13), vs_add_one(c14), vs_add_one(c15)
+FROM t
+"""
+check = """
+SELECT count(*)::VARCHAR FROM t
+WHERE vs_add_one(c0) IS DISTINCT FROM c0 + 1 OR vs_add_one(c1) IS DISTINCT FROM c1 + 1
+   OR vs_add_one(c2) IS DISTINCT FROM c2 + 1 OR vs_add_one(c3) IS DISTINCT FROM c3 + 1
+   OR vs_add_one(c4) IS DISTINCT FROM c4 + 1 OR vs_add_one(c5) IS DISTINCT FROM c5 + 1
+   OR vs_add_one(c6) IS DISTINCT FROM c6 + 1 OR vs_add_one(c7) IS DISTINCT FROM c7 + 1
+   OR vs_add_one(c8) IS DISTINCT FROM c8 + 1 OR vs_add_one(c9) IS DISTINCT FROM c9 + 1
+   OR vs_add_one(c10) IS DISTINCT FROM c10 + 1 OR vs_add_one(c11) IS DISTINCT FROM c11 + 1
+   OR vs_add_one(c12) IS DISTINCT FROM c12 + 1 OR vs_add_one(c13) IS DISTINCT FROM c13 + 1
+   OR vs_add_one(c14) IS DISTINCT FROM c14 + 1 OR vs_add_one(c15) IS DISTINCT FROM c15 + 1
+"""
+expect = "0"
+
+[[case]]
+name = "add_one/order_by"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT (i * 7919 % 1000003)::BIGINT AS v FROM range({rows}) r(i)"]
+query = "SELECT v FROM t ORDER BY vs_add_one(v)"
+check = "SELECT (list(v ORDER BY vs_add_one(v)) IS DISTINCT FROM list(v ORDER BY v + 1))::INTEGER::VARCHAR FROM t"
+expect = "0"
+
+[[case]]
+name = "add_one/sum"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT CASE WHEN i % 10 = 9 THEN NULL ELSE i::BIGINT END AS v FROM range({rows}) r(i)"]
+query = "SELECT sum(vs_add_one(v)) FROM t"
+check = "SELECT (sum(vs_add_one(v)) IS DISTINCT FROM sum(v + 1))::INTEGER::VARCHAR FROM t"
+expect = "0"
+
+# A dictionary-compressed VARCHAR column in a checkpointed database: length() runs on its 16-entry dictionary and
+# hands the function a DICTIONARY vector over it.
+[[case]]
+name = "add_one/dictionary"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = [
+    "ATTACH '{tmp}/dictionary.db' AS f",
+    "CREATE TABLE f.t AS SELECT (i % 16)::VARCHAR AS s FROM range({rows}) r(i)",
+    "CHECKPOINT f",
+]
+query = "SELECT vs_add_one(length(s)) FROM f.t"
+check = "SELECT count(*)::VARCHAR FROM f.t WHERE vs_add_one(length(s)) IS DISTINCT FROM length(s) + 1"
+expect = "0"
+
+[[case]]
+name = "add_one/unprepared"
+rows = [1, 2048, 100_000]
+unprepared = true
+setup = ["CREATE TABLE t AS SELECT i::BIGINT AS v FROM range({rows}) r(i)"]
+query = "SELECT vs_add_one(v) FROM t"
+check = "SELECT count(*)::VARCHAR FROM t WHERE vs_add_one(v) IS DISTINCT FROM v + 1"
+expect = "0"
+
+# Planning folds the all-literal call by executing it once, so each unprepared query binds and runs the function.
+[[case]]
+name = "add_one/literal_unprepared"
+rows = [1]
+unprepared = true
+query = "SELECT vs_add_one(41)"
+check = "SELECT vs_add_one(41)::VARCHAR"
+expect = "42"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# vs_clamp(v DOUBLE, lo DOUBLE, hi DOUBLE) -> DOUBLE: min(max(v, lo), hi). lo > hi yields hi.
+
+[[case]]
+name = "clamp/columns"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT
+    CASE WHEN i % 10 = 9 THEN NULL ELSE (i * 7919 % 2001 - 1000) / 1000.0 END::DOUBLE AS x,
+    CASE WHEN i % 13 = 12 THEN NULL ELSE (i % 5) / 10.0 - 0.5 END::DOUBLE AS lo,
+    ((i % 7) / 10.0 - 0.2)::DOUBLE AS hi
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_clamp(x, lo, hi) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_clamp(x, lo, hi) IS DISTINCT FROM
+            CASE WHEN x IS NULL OR lo IS NULL OR hi IS NULL THEN NULL ELSE least(greatest(x, lo), hi) END)
+        + (vs_clamp('inf'::DOUBLE, 0, 1) IS DISTINCT FROM 1)::BIGINT
+        + (vs_clamp('-inf'::DOUBLE, 0, 1) IS DISTINCT FROM 0)::BIGINT
+        + (vs_clamp(0.5, 1, 0) IS DISTINCT FROM 0)::BIGINT
+        + (vs_clamp(0.5, NULL, 1) IS NOT NULL)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# Literal bounds reach the function as CONSTANT vectors next to a flat column.
+[[case]]
+name = "clamp/const_bounds"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT
+    CASE WHEN i % 10 = 9 THEN NULL ELSE (i * 7919 % 2001 - 1000) / 1000.0 END::DOUBLE AS x
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_clamp(x, 0.25, 0.75) FROM t"
+check = """
+SELECT count(*) FILTER (WHERE vs_clamp(x, 0.25, 0.75) IS DISTINCT FROM
+           CASE WHEN x IS NULL THEN NULL ELSE least(greatest(x, 0.25), 0.75) END)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# The cross product repeats the single row of b as CONSTANT vectors, so every argument is constant.
+[[case]]
+name = "clamp/const_all"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = [
+    "CREATE TABLE t AS SELECT i::BIGINT AS v FROM range({rows}) r(i)",
+    "CREATE TABLE b AS SELECT 0.9::DOUBLE AS x, 0.25::DOUBLE AS lo, 0.75::DOUBLE AS hi",
+]
+query = "SELECT vs_clamp(x, lo, hi) FROM t, b"
+check = """
+SELECT (count(*) FILTER (WHERE c IS DISTINCT FROM 0.75) + (count(*) <> {rows})::BIGINT)::VARCHAR
+FROM (SELECT vs_clamp(x, lo, hi) AS c FROM t, b)
+"""
+expect = "0"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# vs_is_even(BIGINT) -> BOOLEAN: v % 2 = 0, as a WHERE predicate.
+
+[[case]]
+name = "is_even/where"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT CASE WHEN i % 10 = 9 THEN NULL ELSE i - 1000 END::BIGINT AS v FROM range({rows}) r(i)"]
+query = "SELECT v FROM t WHERE vs_is_even(v)"
+check = """
+SELECT (count(*) FILTER (WHERE vs_is_even(v) IS DISTINCT FROM v % 2 = 0)
+        + ((SELECT count(*) FROM t WHERE vs_is_even(v)) <> count(*) FILTER (WHERE v % 2 = 0))::BIGINT
+        + (vs_is_even((-9223372036854775808)::BIGINT) IS DISTINCT FROM true)::BIGINT
+        + (vs_is_even(-3) IS DISTINCT FROM false)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "is_even/where_nested"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT CASE WHEN i % 10 = 9 THEN NULL ELSE i - 1000 END::BIGINT AS v FROM range({rows}) r(i)"]
+query = "SELECT v FROM t WHERE vs_is_even(vs_add_one(v))"
+check = """
+SELECT (count(*) FILTER (WHERE vs_is_even(vs_add_one(v)) IS DISTINCT FROM (v + 1) % 2 = 0)
+        + ((SELECT count(*) FROM t WHERE vs_is_even(vs_add_one(v))) <> count(*) FILTER (WHERE (v + 1) % 2 = 0))::BIGINT
+       )::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# vs_coalesce_zero(BIGINT) -> BIGINT: special NULL handling, NULL becomes 0, never NULL.
+
+[[case]]
+name = "coalesce_zero/nulls_0"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT (i - 1000)::BIGINT AS v FROM range({rows}) r(i)"]
+query = "SELECT vs_coalesce_zero(v) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_coalesce_zero(v) IS DISTINCT FROM coalesce(v, 0))
+        + (vs_coalesce_zero(NULL) IS DISTINCT FROM 0)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "coalesce_zero/nulls_50"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT CASE WHEN i % 2 = 0 THEN NULL ELSE i - 1000 END::BIGINT AS v FROM range({rows}) r(i)"]
+query = "SELECT vs_coalesce_zero(v) FROM t"
+check = "SELECT count(*) FILTER (WHERE vs_coalesce_zero(v) IS DISTINCT FROM coalesce(v, 0))::VARCHAR FROM t"
+expect = "0"
+
+[[case]]
+name = "coalesce_zero/nulls_100"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT NULL::BIGINT AS v FROM range({rows}) r(i)"]
+query = "SELECT vs_coalesce_zero(v) FROM t"
+check = "SELECT (count(*) FILTER (WHERE vs_coalesce_zero(v) IS DISTINCT FROM 0) + (count(*) <> {rows})::BIGINT)::VARCHAR FROM t"
+expect = "0"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# vs_checked_div(a BIGINT, b BIGINT) -> BIGINT: truncating a / b, NULL for b = 0 and for MIN / -1.
+
+[[case]]
+name = "checked_div/project"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT
+    CASE WHEN i % 10 = 9 THEN NULL WHEN i % 100 = 7 THEN -9223372036854775808 ELSE i * 37 - 50000 END::BIGINT AS a,
+    (i % 11 - 5)::BIGINT AS b
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_checked_div(a, b) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_checked_div(a, b) IS DISTINCT FROM
+            CASE WHEN b = 0 OR (a = -9223372036854775808 AND b = -1) THEN NULL ELSE a // b END)
+        + (vs_checked_div((-9223372036854775808)::BIGINT, -1) IS NOT NULL)::BIGINT
+        + (vs_checked_div(1, 0) IS NOT NULL)::BIGINT
+        + (vs_checked_div(-7, 2) IS DISTINCT FROM -3)::BIGINT
+        + (vs_checked_div((-9223372036854775808)::BIGINT, 1) IS DISTINCT FROM (-9223372036854775808)::BIGINT)::BIGINT
+       )::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# vs_mix(a INTEGER, b BIGINT, c DOUBLE, d SMALLINT) -> DOUBLE: a * c + b - d in double arithmetic.
+
+[[case]]
+name = "mix/project"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT
+    (i % 1000 - 500)::INTEGER AS a,
+    (i * 3)::BIGINT AS b,
+    CASE WHEN i % 10 = 9 THEN NULL ELSE (i % 100) / 8.0 END::DOUBLE AS c,
+    (i % 300 - 150)::SMALLINT AS d
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_mix(a, b, c, d) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_mix(a, b, c, d) IS DISTINCT FROM a::DOUBLE * c + b::DOUBLE - d::DOUBLE)
+        + (vs_mix(2147483647, 9223372036854775807, 1e290, (-32768)::SMALLINT) IS DISTINCT FROM
+           2147483647::DOUBLE * 1e290 + 9223372036854775807::DOUBLE + 32768::DOUBLE)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# vs_strict_sqrt(DOUBLE) -> DOUBLE: sqrt(v), an error for negative v. The timed query never fails; the check reaches
+# the error through TRY, which turns each failing row into NULL.
+
+[[case]]
+name = "strict_sqrt/project"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT CASE WHEN i % 10 = 9 THEN NULL ELSE i / 7 END::DOUBLE AS x FROM range({rows}) r(i)"]
+query = "SELECT vs_strict_sqrt(x) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_strict_sqrt(x) IS DISTINCT FROM sqrt(x))
+        + (count(TRY(vs_strict_sqrt(x - 3))) <> count(*) FILTER (WHERE x >= 3))::BIGINT
+        + (TRY(vs_strict_sqrt(-1.0)) IS NOT NULL)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# vs_scale(v BIGINT, factor BIGINT) -> BIGINT: wrapping v * factor; bind reads the constant factor once.
+
+[[case]]
+name = "scale/const_factor"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT CASE WHEN i % 10 = 9 THEN NULL ELSE i - 1000 END::BIGINT AS v FROM range({rows}) r(i)"]
+query = "SELECT vs_scale(v, 3) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_scale(v, 3) IS DISTINCT FROM v * 3)
+        + count(vs_scale(v, NULL::BIGINT))
+        + (vs_scale(4611686018427387904, 2) IS DISTINCT FROM (-9223372036854775808)::BIGINT)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# Sixteen call sites with different factors: sixteen binds per prepare and no common subexpressions.
+[[case]]
+name = "scale/calls_16"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT CASE WHEN i % 10 = 9 THEN NULL ELSE i - 1000 END::BIGINT AS v FROM range({rows}) r(i)"]
+query = """
+SELECT vs_scale(v, 1), vs_scale(v, 2), vs_scale(v, 3), vs_scale(v, 4),
+       vs_scale(v, 5), vs_scale(v, 6), vs_scale(v, 7), vs_scale(v, 8),
+       vs_scale(v, 9), vs_scale(v, 10), vs_scale(v, 11), vs_scale(v, 12),
+       vs_scale(v, 13), vs_scale(v, 14), vs_scale(v, 15), vs_scale(v, 16)
+FROM t
+"""
+check = """
+SELECT count(*)::VARCHAR FROM t
+WHERE vs_scale(v, 1) IS DISTINCT FROM v * 1 OR vs_scale(v, 2) IS DISTINCT FROM v * 2
+   OR vs_scale(v, 3) IS DISTINCT FROM v * 3 OR vs_scale(v, 4) IS DISTINCT FROM v * 4
+   OR vs_scale(v, 5) IS DISTINCT FROM v * 5 OR vs_scale(v, 6) IS DISTINCT FROM v * 6
+   OR vs_scale(v, 7) IS DISTINCT FROM v * 7 OR vs_scale(v, 8) IS DISTINCT FROM v * 8
+   OR vs_scale(v, 9) IS DISTINCT FROM v * 9 OR vs_scale(v, 10) IS DISTINCT FROM v * 10
+   OR vs_scale(v, 11) IS DISTINCT FROM v * 11 OR vs_scale(v, 12) IS DISTINCT FROM v * 12
+   OR vs_scale(v, 13) IS DISTINCT FROM v * 13 OR vs_scale(v, 14) IS DISTINCT FROM v * 14
+   OR vs_scale(v, 15) IS DISTINCT FROM v * 15 OR vs_scale(v, 16) IS DISTINCT FROM v * 16
+"""
+expect = "0"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Every function once on a one-row table: the fixed cost per query and per call.
+
+[[case]]
+name = "all/one_row"
+rows = [1]
+setup = ["CREATE TABLE t AS SELECT i::BIGINT AS v, (i / 2 + 0.5)::DOUBLE AS x, i::INTEGER AS a, i::SMALLINT AS d FROM range({rows}) r(i)"]
+query = """
+SELECT vs_add_one(v), vs_clamp(x, 0.0, 1.0), vs_is_even(v), vs_coalesce_zero(v),
+       vs_checked_div(v, 3), vs_mix(a, v, x, d), vs_strict_sqrt(x), vs_scale(v, 3)
+FROM t
+"""
+check = """
+SELECT count(*)::VARCHAR FROM t
+WHERE vs_add_one(v) IS DISTINCT FROM v + 1
+   OR vs_clamp(x, 0.0, 1.0) IS DISTINCT FROM least(greatest(x, 0.0), 1.0)
+   OR vs_is_even(v) IS DISTINCT FROM v % 2 = 0
+   OR vs_coalesce_zero(v) IS DISTINCT FROM v
+   OR vs_checked_div(v, 3) IS DISTINCT FROM v // 3
+   OR vs_mix(a, v, x, d) IS DISTINCT FROM a::DOUBLE * x + v::DOUBLE - d::DOUBLE
+   OR vs_strict_sqrt(x) IS DISTINCT FROM sqrt(x)
+   OR vs_scale(v, 3) IS DISTINCT FROM v * 3
 """
 expect = "0"
