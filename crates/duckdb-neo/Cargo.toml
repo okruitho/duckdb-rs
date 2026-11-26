@@ -86,6 +86,10 @@ targets = []
 name = "functions"
 harness = false
 
+[[bench]]
+name = "versus"
+harness = false
+
 [[example]]
 name = "002-extension"
 crate-type = ["cdylib"]

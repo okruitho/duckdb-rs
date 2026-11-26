@@ -1,0 +1,38 @@
+# vs_add_one(BIGINT) -> BIGINT: wrapping v + 1, NULL in, NULL out.
+
+[[case]]
+name = "add_one/project"
+rows = [1, 64, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT i::BIGINT AS v FROM range({rows}) r(i)"]
+query = "SELECT vs_add_one(v) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_add_one(v) IS DISTINCT FROM v + 1)
+        + (vs_add_one(9223372036854775807) IS DISTINCT FROM (-9223372036854775808)::BIGINT)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+# The filter slices its output, so the function receives a selection of the scanned vector.
+[[case]]
+name = "add_one/filtered"
+rows = [1, 64, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT i::BIGINT AS v FROM range({rows}) r(i)"]
+query = "SELECT vs_add_one(v) FROM t WHERE v % 3 <> 1"
+check = """
+SELECT count(*)::VARCHAR
+FROM (SELECT v, vs_add_one(v) AS a FROM t WHERE v % 3 <> 1)
+WHERE a IS DISTINCT FROM v + 1
+"""
+expect = "0"
+
+[[case]]
+name = "add_one/nulls_10"
+rows = [1, 64, 2048, 100_000, 2_000_000]
+setup = ["CREATE TABLE t AS SELECT CASE WHEN i % 10 = 9 THEN NULL ELSE i::BIGINT END AS v FROM range({rows}) r(i)"]
+query = "SELECT vs_add_one(v) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE vs_add_one(v) IS DISTINCT FROM v + 1)
+        + (count(*) FILTER (WHERE v IS NULL) <> {rows} // 10)::BIGINT)::VARCHAR
+FROM t
+"""
+expect = "0"
