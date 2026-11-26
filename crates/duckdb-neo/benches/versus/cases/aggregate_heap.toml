@@ -1,0 +1,487 @@
+# Aggregates whose states own heap memory (see rust/aggregate_heap.rs for the semantics).
+#
+# Shared columns: `i` is the row number, `g4`, `g1024` and `gq` give 4, 1,024 and about rows / 4 groups, `v` is a
+# BIGINT, `d` a DOUBLE and `s` a VARCHAR. Every check compares with builtin SQL and counts the mismatching rows:
+#   vs_longest(s)       arg_min(s, {'l': -strlen(s), 's': s}) FILTER (WHERE s IS NOT NULL)
+#   vs_distinct_count   count(DISTINCT v)
+#   vs_median(d)        quantile_disc(d, 0.5)
+#   vs_sorted_list(v)   list_sort(list(v) FILTER (WHERE v IS NOT NULL))
+#   vs_top3(v)          max(v, 3)
+#   vs_concat_sorted(s) string_agg(s, ',' ORDER BY s)
+
+# ---------------------------------------------------------------------------------------------------------------------
+# vs_longest
+# ---------------------------------------------------------------------------------------------------------------------
+
+# Short strings, with empty and multi-byte ones, so ties and byte lengths matter.
+[[case]]
+name = "longest/ungrouped"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, CASE WHEN i % 101 = 0 THEN '' WHEN i % 101 = 1 THEN 'é' || (i % 7) ELSE 'k' || (i * 7919 % 1009) END AS s
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_longest(s) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE a IS DISTINCT FROM b) + count(*) FILTER (WHERE e IS NOT NULL))::VARCHAR
+FROM (SELECT vs_longest(s) AS a, arg_min(s, {'l': -strlen(s), 's': s}) FILTER (WHERE s IS NOT NULL) AS b,
+             vs_longest(s) FILTER (WHERE false) AS e
+      FROM t)
+"""
+expect = "0"
+
+# Long strings, which do not fit inline, in 1,024 states.
+[[case]]
+name = "longest/groups_1024"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, (i % 1024)::INTEGER AS g1024, repeat('long-', 3 + i % 5) || (i * 7919 % 100003) AS s
+FROM range({rows}) r(i)
+"""]
+query = "SELECT g1024, vs_longest(s) FROM t GROUP BY g1024"
+check = """
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b)::VARCHAR
+FROM (SELECT vs_longest(s) AS a, arg_min(s, {'l': -strlen(s), 's': s}) FILTER (WHERE s IS NOT NULL) AS b
+      FROM t GROUP BY g1024)
+"""
+expect = "0"
+
+[[case]]
+name = "longest/nulls_50"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, (i % 4)::INTEGER AS g4, CASE WHEN i % 2 = 1 THEN NULL ELSE 'k' || (i * 7919 % 100003) END AS s
+FROM range({rows}) r(i)
+"""]
+query = "SELECT g4, vs_longest(s) FROM t GROUP BY g4"
+check = """
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b)::VARCHAR
+FROM (SELECT vs_longest(s) AS a, arg_min(s, {'l': -strlen(s), 's': s}) FILTER (WHERE s IS NOT NULL) AS b
+      FROM t GROUP BY g4)
+"""
+expect = "0"
+
+# DuckDB aggregates each partition once and repeats the result on its rows.
+[[case]]
+name = "longest/whole_partition"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, (i % 1024)::INTEGER AS g1024, 'k' || (i * 7919 % 100003) AS s
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_longest(s) OVER (PARTITION BY g1024) FROM t"
+check = """
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b)::VARCHAR
+FROM (SELECT vs_longest(s) OVER w AS a,
+             arg_min(s, {'l': -strlen(s), 's': s}) FILTER (WHERE s IS NOT NULL) OVER w AS b
+      FROM t WINDOW w AS (PARTITION BY g1024))
+"""
+expect = "0"
+
+[[case]]
+name = "longest/running"
+rows = [1, 2048, 100_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, CASE WHEN i % 10 = 9 THEN NULL ELSE 'k' || (i * 7919 % 100003) END AS s
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_longest(s) OVER (ORDER BY i ROWS UNBOUNDED PRECEDING) FROM t"
+check = """
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b)::VARCHAR
+FROM (SELECT vs_longest(s) OVER w AS a,
+             arg_min(s, {'l': -strlen(s), 's': s}) FILTER (WHERE s IS NOT NULL) OVER w AS b
+      FROM t WINDOW w AS (ORDER BY i ROWS UNBOUNDED PRECEDING))
+"""
+expect = "0"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# vs_distinct_count
+# ---------------------------------------------------------------------------------------------------------------------
+
+[[case]]
+name = "distinct_count/low_card"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT i, (i * 7919 % 100)::BIGINT AS v FROM range({rows}) r(i)"]
+query = "SELECT vs_distinct_count(v) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE a IS DISTINCT FROM b) + count(*) FILTER (WHERE e IS DISTINCT FROM 0))::VARCHAR
+FROM (SELECT vs_distinct_count(v) AS a, count(DISTINCT v) AS b, vs_distinct_count(v) FILTER (WHERE false) AS e
+      FROM t)
+"""
+expect = "0"
+
+# Every value distinct but a few, including both extremes: the set grows to the row count.
+[[case]]
+name = "distinct_count/high_card"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, CASE i % 1000 WHEN 1 THEN 9223372036854775807 WHEN 2 THEN -9223372036854775808
+                        ELSE i * 7919 % 1000003 - 500000 END::BIGINT AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_distinct_count(v) FROM t"
+check = """
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b)::VARCHAR
+FROM (SELECT vs_distinct_count(v) AS a, count(DISTINCT v) AS b FROM t)
+"""
+expect = "0"
+
+# About rows / 4 groups of four rows each: allocation and destruction of many small sets dominate.
+[[case]]
+name = "distinct_count/groups_quarter"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT i, i // 4 AS gq, (i * 7919 % 3)::BIGINT AS v FROM range({rows}) r(i)"]
+query = "SELECT gq, vs_distinct_count(v) FROM t GROUP BY gq"
+check = """
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b)::VARCHAR
+FROM (SELECT vs_distinct_count(v) AS a, count(DISTINCT v) AS b FROM t GROUP BY gq)
+"""
+expect = "0"
+
+[[case]]
+name = "distinct_count/filter_clause"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i, (i % 1024)::INTEGER AS g1024, (i * 7919 % 5000)::BIGINT AS v FROM range({rows}) r(i)
+"""]
+query = "SELECT g1024, vs_distinct_count(v) FILTER (WHERE i % 3 = 0) FROM t GROUP BY g1024"
+check = """
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b)::VARCHAR
+FROM (SELECT vs_distinct_count(v) FILTER (WHERE i % 3 = 0) AS a, count(DISTINCT v) FILTER (WHERE i % 3 = 0) AS b
+      FROM t GROUP BY g1024)
+"""
+expect = "0"
+
+[[case]]
+name = "distinct_count/partitioned_sliding_9"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, (i % 4)::INTEGER AS g4, CASE WHEN i % 10 = 9 THEN NULL ELSE i * 7919 % 7 END::BIGINT AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_distinct_count(v) OVER (PARTITION BY g4 ORDER BY i ROWS BETWEEN 8 PRECEDING AND CURRENT ROW) FROM t"
+check = """
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b)::VARCHAR
+FROM (SELECT vs_distinct_count(v) OVER w AS a, count(DISTINCT v) OVER w AS b
+      FROM t WINDOW w AS (PARTITION BY g4 ORDER BY i ROWS BETWEEN 8 PRECEDING AND CURRENT ROW))
+"""
+expect = "0"
+
+# Four threads build partial sets that combine merges.
+[[case]]
+name = "distinct_count/threads_4"
+rows = [1, 2048, 100_000, 1_000_000]
+threads = 4
+setup = ["CREATE TABLE t AS SELECT i, (i * 7919 % 1000003)::BIGINT AS v FROM range({rows}) r(i)"]
+query = "SELECT vs_distinct_count(v) FROM t"
+check = """
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b)::VARCHAR
+FROM (SELECT vs_distinct_count(v) AS a, count(DISTINCT v) AS b FROM t)
+"""
+expect = "0"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# vs_median
+# ---------------------------------------------------------------------------------------------------------------------
+
+[[case]]
+name = "median/ungrouped"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT i, (i * 7919 % 100003)::DOUBLE / 8 - 6000 AS d FROM range({rows}) r(i)"]
+query = "SELECT vs_median(d) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE a IS DISTINCT FROM b) + count(*) FILTER (WHERE e IS NOT NULL))::VARCHAR
+FROM (SELECT vs_median(d) AS a, quantile_disc(d, 0.5) AS b, vs_median(d) FILTER (WHERE false) AS e FROM t)
+"""
+expect = "0"
+
+[[case]]
+name = "median/groups_1024_nulls_10"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, (i % 1024)::INTEGER AS g1024, CASE WHEN i % 10 = 9 THEN NULL ELSE (i * 7919 % 100003)::DOUBLE / 8 END AS d
+FROM range({rows}) r(i)
+"""]
+query = "SELECT g1024, vs_median(d) FROM t GROUP BY g1024"
+check = """
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b)::VARCHAR
+FROM (SELECT vs_median(d) AS a, quantile_disc(d, 0.5) AS b FROM t GROUP BY g1024)
+"""
+expect = "0"
+
+# The filter reaches the aggregate as a selection over the scanned vector.
+[[case]]
+name = "median/where"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i, (i % 4)::INTEGER AS g4, (i * 7919 % 100003)::DOUBLE / 8 - 6000 AS d FROM range({rows}) r(i)
+"""]
+query = "SELECT g4, vs_median(d) FROM t WHERE i % 3 <> 1 GROUP BY g4"
+check = """
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b)::VARCHAR
+FROM (SELECT vs_median(d) AS a, quantile_disc(d, 0.5) AS b FROM t WHERE i % 3 <> 1 GROUP BY g4)
+"""
+expect = "0"
+
+[[case]]
+name = "median/sliding_257"
+rows = [1, 2048, 100_000]
+setup = ["CREATE TABLE t AS SELECT i, (i * 7919 % 100003)::DOUBLE / 8 AS d FROM range({rows}) r(i)"]
+query = "SELECT vs_median(d) OVER (ORDER BY i ROWS BETWEEN 128 PRECEDING AND 128 FOLLOWING) FROM t"
+check = """
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b)::VARCHAR
+FROM (SELECT vs_median(d) OVER w AS a, quantile_disc(d, 0.5) OVER w AS b
+      FROM t WINDOW w AS (ORDER BY i ROWS BETWEEN 128 PRECEDING AND 128 FOLLOWING))
+"""
+expect = "0"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# vs_sorted_list
+# ---------------------------------------------------------------------------------------------------------------------
+
+[[case]]
+name = "sorted_list/ungrouped"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, CASE i % 1000 WHEN 1 THEN 9223372036854775807 WHEN 2 THEN -9223372036854775808
+                        ELSE i * 7919 % 1000003 - 500000 END::BIGINT AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_sorted_list(v) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE a IS DISTINCT FROM b) + count(*) FILTER (WHERE e IS NOT NULL))::VARCHAR
+FROM (SELECT vs_sorted_list(v) AS a, list_sort(list(v) FILTER (WHERE v IS NOT NULL)) AS b,
+             vs_sorted_list(v) FILTER (WHERE false) AS e
+      FROM t)
+"""
+expect = "0"
+
+# Many four-element lists; their elements fill one result child per output chunk.
+[[case]]
+name = "sorted_list/groups_quarter"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT i, i // 4 AS gq, (i * 7919 % 1000003)::BIGINT AS v FROM range({rows}) r(i)"]
+query = "SELECT gq, vs_sorted_list(v) FROM t GROUP BY gq"
+check = """
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b)::VARCHAR
+FROM (SELECT vs_sorted_list(v) AS a, list_sort(list(v) FILTER (WHERE v IS NOT NULL)) AS b FROM t GROUP BY gq)
+"""
+expect = "0"
+
+[[case]]
+name = "sorted_list/sliding_2"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, CASE WHEN i % 2 = 1 THEN NULL ELSE i * 7919 % 1000003 END::BIGINT AS v FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_sorted_list(v) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t"
+check = """
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b)::VARCHAR
+FROM (SELECT vs_sorted_list(v) OVER w AS a, list_sort(list(v) FILTER (WHERE v IS NOT NULL) OVER w) AS b
+      FROM t WINDOW w AS (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW))
+"""
+expect = "0"
+
+[[case]]
+name = "sorted_list/all_null"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT i, (i % 4)::INTEGER AS g4, NULL::BIGINT AS v FROM range({rows}) r(i)"]
+query = "SELECT g4, vs_sorted_list(v) FROM t GROUP BY g4"
+check = """
+SELECT count(*) FILTER (WHERE a IS NOT NULL)::VARCHAR FROM (SELECT vs_sorted_list(v) AS a FROM t GROUP BY g4)
+"""
+expect = "0"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# vs_top3
+# ---------------------------------------------------------------------------------------------------------------------
+
+[[case]]
+name = "top3/ungrouped"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, CASE i % 1000 WHEN 1 THEN 9223372036854775807 WHEN 2 THEN -9223372036854775808
+                        ELSE i * 7919 % 1000 END::BIGINT AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_top3(v) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE a IS DISTINCT FROM b) + count(*) FILTER (WHERE e IS NOT NULL))::VARCHAR
+FROM (SELECT vs_top3(v) AS a, max(v, 3) AS b, vs_top3(v) FILTER (WHERE false) AS e FROM t)
+"""
+expect = "0"
+
+# Groups of about 1,000 rows with repeated values, so the top three often hold duplicates.
+[[case]]
+name = "top3/groups_1024_nulls_10"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, (i % 1024)::INTEGER AS g1024, CASE WHEN i % 10 = 9 THEN NULL ELSE i * 7919 % 50 END::BIGINT AS v
+FROM range({rows}) r(i)
+"""]
+query = "SELECT g1024, vs_top3(v) FROM t GROUP BY g1024"
+check = """
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b)::VARCHAR
+FROM (SELECT vs_top3(v) AS a, max(v, 3) AS b FROM t GROUP BY g1024)
+"""
+expect = "0"
+
+# The state needs no destructor, so DuckDB can stream the running window.
+[[case]]
+name = "top3/running"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT i, (i * 7919 % 1000003)::BIGINT AS v FROM range({rows}) r(i)"]
+query = "SELECT vs_top3(v) OVER (ORDER BY i ROWS UNBOUNDED PRECEDING) FROM t"
+check = """
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b)::VARCHAR
+FROM (SELECT vs_top3(v) OVER w AS a, max(v, 3) OVER w AS b FROM t WINDOW w AS (ORDER BY i ROWS UNBOUNDED PRECEDING))
+"""
+expect = "0"
+
+[[case]]
+name = "top3/partitioned_sliding_9"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i, (i % 1024)::INTEGER AS g1024, (i * 7919 % 1000003)::BIGINT AS v FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_top3(v) OVER (PARTITION BY g1024 ORDER BY i ROWS BETWEEN 8 PRECEDING AND CURRENT ROW) FROM t"
+check = """
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b)::VARCHAR
+FROM (SELECT vs_top3(v) OVER w AS a, max(v, 3) OVER w AS b
+      FROM t WINDOW w AS (PARTITION BY g1024 ORDER BY i ROWS BETWEEN 8 PRECEDING AND CURRENT ROW))
+"""
+expect = "0"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# vs_concat_sorted
+# ---------------------------------------------------------------------------------------------------------------------
+
+[[case]]
+name = "concat_sorted/groups_1024"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, (i % 1024)::INTEGER AS g1024, CASE WHEN i % 101 = 0 THEN '' ELSE 'k' || (i * 7919 % 1009) END AS s
+FROM range({rows}) r(i)
+"""]
+query = "SELECT g1024, vs_concat_sorted(s) FROM t GROUP BY g1024"
+check = """
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b)::VARCHAR
+FROM (SELECT vs_concat_sorted(s) AS a, string_agg(s, ',' ORDER BY s) AS b FROM t GROUP BY g1024)
+"""
+expect = "0"
+
+# Long strings in about rows / 4 groups: every state owns four heap strings.
+[[case]]
+name = "concat_sorted/groups_quarter"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT i, i // 4 AS gq, repeat('long-', 3 + i % 5) || (i * 7919 % 100003) AS s FROM range({rows}) r(i)
+"""]
+query = "SELECT gq, vs_concat_sorted(s) FROM t GROUP BY gq"
+check = """
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b)::VARCHAR
+FROM (SELECT vs_concat_sorted(s) AS a, string_agg(s, ',' ORDER BY s) AS b FROM t GROUP BY gq)
+"""
+expect = "0"
+
+[[case]]
+name = "concat_sorted/sliding_9"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["CREATE TABLE t AS SELECT i, 'k' || (i * 7919 % 1009) AS s FROM range({rows}) r(i)"]
+query = "SELECT vs_concat_sorted(s) OVER (ORDER BY i ROWS BETWEEN 4 PRECEDING AND 4 FOLLOWING) FROM t"
+check = """
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b)::VARCHAR
+FROM (SELECT vs_concat_sorted(s) OVER w AS a, string_agg(s, ',' ORDER BY s) OVER w AS b
+      FROM t WINDOW w AS (ORDER BY i ROWS BETWEEN 4 PRECEDING AND 4 FOLLOWING))
+"""
+expect = "0"
+
+[[case]]
+name = "concat_sorted/nulls_10"
+rows = [1, 2048, 100_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, CASE WHEN i % 10 = 9 THEN NULL WHEN i % 101 = 1 THEN 'é' || (i % 7) ELSE 'k' || (i * 7919 % 1009) END AS s
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_concat_sorted(s) FROM t"
+check = """
+SELECT (count(*) FILTER (WHERE a IS DISTINCT FROM b) + count(*) FILTER (WHERE e IS NOT NULL))::VARCHAR
+FROM (SELECT vs_concat_sorted(s) AS a, string_agg(s, ',' ORDER BY s) AS b,
+             vs_concat_sorted(s) FILTER (WHERE false) AS e
+      FROM t)
+"""
+expect = "0"
+
+[[case]]
+name = "concat_sorted/threads_4"
+rows = [1, 2048, 100_000, 1_000_000]
+threads = 4
+setup = ["""
+CREATE TABLE t AS SELECT i, (i % 4)::INTEGER AS g4, 'k' || (i * 7919 % 100003) AS s FROM range({rows}) r(i)
+"""]
+query = "SELECT g4, vs_concat_sorted(s) FROM t GROUP BY g4"
+check = """
+SELECT count(*) FILTER (WHERE a IS DISTINCT FROM b)::VARCHAR
+FROM (SELECT vs_concat_sorted(s) AS a, string_agg(s, ',' ORDER BY s) AS b FROM t GROUP BY g4)
+"""
+expect = "0"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Every function in one query
+# ---------------------------------------------------------------------------------------------------------------------
+
+# One row: the fixed cost of six aggregates, each with one state.
+[[case]]
+name = "all/one_row"
+rows = [1]
+setup = ["CREATE TABLE t AS SELECT 7::BIGINT AS v, 2.5::DOUBLE AS d, 'only' AS s"]
+query = """
+SELECT vs_longest(s), vs_distinct_count(v), vs_median(d), vs_sorted_list(v), vs_top3(v), vs_concat_sorted(s) FROM t
+"""
+check = """
+SELECT ((vs_longest(s) IS DISTINCT FROM 'only')::INTEGER + (vs_distinct_count(v) IS DISTINCT FROM 1)::INTEGER
+        + (vs_median(d) IS DISTINCT FROM 2.5)::INTEGER + (vs_sorted_list(v) IS DISTINCT FROM [7])::INTEGER
+        + (vs_top3(v) IS DISTINCT FROM [7])::INTEGER + (vs_concat_sorted(s) IS DISTINCT FROM 'only')::INTEGER)::VARCHAR
+FROM t
+"""
+expect = "0"
+
+[[case]]
+name = "all/groups_1024"
+rows = [1, 2048, 100_000, 1_000_000]
+setup = ["""
+CREATE TABLE t AS
+SELECT i, (i % 1024)::INTEGER AS g1024, (i * 7919 % 100)::BIGINT AS v, (i * 7919 % 100003)::DOUBLE / 8 AS d,
+       'k' || (i * 7919 % 1009) AS s
+FROM range({rows}) r(i)
+"""]
+query = """
+SELECT g1024, vs_longest(s), vs_distinct_count(v), vs_median(d), vs_sorted_list(v), vs_top3(v), vs_concat_sorted(s)
+FROM t GROUP BY g1024
+"""
+check = """
+SELECT count(*) FILTER (WHERE a1 IS DISTINCT FROM b1 OR a2 IS DISTINCT FROM b2 OR a3 IS DISTINCT FROM b3
+                           OR a4 IS DISTINCT FROM b4 OR a5 IS DISTINCT FROM b5 OR a6 IS DISTINCT FROM b6)::VARCHAR
+FROM (SELECT vs_longest(s) AS a1, arg_min(s, {'l': -strlen(s), 's': s}) FILTER (WHERE s IS NOT NULL) AS b1,
+             vs_distinct_count(v) AS a2, count(DISTINCT v) AS b2,
+             vs_median(d) AS a3, quantile_disc(d, 0.5) AS b3,
+             vs_sorted_list(v) AS a4, list_sort(list(v) FILTER (WHERE v IS NOT NULL)) AS b4,
+             vs_top3(v) AS a5, max(v, 3) AS b5,
+             vs_concat_sorted(s) AS a6, string_agg(s, ',' ORDER BY s) AS b6
+      FROM t GROUP BY g1024)
+"""
+expect = "0"
