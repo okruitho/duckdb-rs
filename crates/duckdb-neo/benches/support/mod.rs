@@ -8,6 +8,7 @@
 
 pub mod base56;
 pub mod dash_split;
+pub mod int_sum;
 pub mod merge_struct;
 pub mod nulls;
 pub mod row_hash;
@@ -67,6 +68,7 @@ impl Fixture {
         merge_struct::register(&conn)?;
         dash_split::register(&conn)?;
         row_hash::register(&conn)?;
+        int_sum::register(&conn)?;
         base56::register(&conn)?;
         Ok(Self {
             conn,

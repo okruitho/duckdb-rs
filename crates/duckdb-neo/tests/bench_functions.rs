@@ -5,7 +5,7 @@
 mod support;
 
 use duckdb_neo::{Parameters, Result, connection::Connection};
-use support::{Fixture, base56, dash_split, merge_struct, nulls::Nulls, row_hash};
+use support::{Fixture, base56, dash_split, int_sum, merge_struct, nulls::Nulls, row_hash};
 
 const ROWS: usize = 5_000;
 
@@ -154,6 +154,13 @@ fn row_hash_is_order_independent() -> Result<()> {
     let fixture = Fixture::new()?;
     row_hash::create_input(&fixture.conn, ROWS)?;
     row_hash::verify(&fixture.conn)
+}
+
+#[test]
+fn int_sum_matches_sum() -> Result<()> {
+    let fixture = Fixture::new()?;
+    int_sum::create_input(&fixture.conn, ROWS)?;
+    int_sum::verify(&fixture.conn)
 }
 
 fn assert_null_rate(conn: &Connection, source: &str, column: &str, percent: u8) -> Result<()> {

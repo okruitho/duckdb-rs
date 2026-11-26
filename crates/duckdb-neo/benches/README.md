@@ -13,6 +13,10 @@ regressions, and [`scripts/neo_bench.py`](../../../scripts/neo_bench.py) compare
 | `table::dash_split` | `dash_split(input VARCHAR, n BIGINT)` splits `input` on `-` into at most `n` parts, like `str::splitn`, returning `(idx BIGINT, part VARCHAR)` rows | Table function scan state, projection pushdown, `VARCHAR` writes |
 | `aggregate::row_hash_ungrouped` | `row_hash(s VARCHAR, d DOUBLE, b BOOLEAN)` sums per-row hashes into a `UBIGINT` | Aggregate updates into a single state |
 | `aggregate::row_hash_grouped` | `row_hash` with `GROUP BY` over 1,024 groups | Aggregate updates, combine and finalize over many states |
+| `aggregate::int_sum_ungrouped` | `int_sum(v BIGINT)` sums into a `BIGINT` | Fixed costs of aggregate updates into a single state |
+| `aggregate::int_sum_grouped` | `int_sum` with `GROUP BY` over 1,024 groups | Fixed costs of aggregate updates, combine and finalize |
+| `aggregate::int_sum_running` | `int_sum` over `ROWS UNBOUNDED PRECEDING` | DuckDB's streaming window, one update and finalize call per row |
+| `aggregate::int_sum_sliding` | `int_sum` over a 9-row frame in 1,024 partitions | DuckDB's segment tree, updates and finalizes over a few rows at a time |
 | `copy::base56_to` | `COPY ... TO ... (FORMAT base56)` writes each value's bytes base56-encoded | `COPY TO` batches, `ColumnDataCollection` scans, DuckDB file system writes |
 | `copy::base56_from` | `COPY ... FROM ... (FORMAT base56)` decodes such a file into a table | `COPY FROM` execution, writes to the output chunk |
 

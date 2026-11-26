@@ -8,7 +8,7 @@ mod support;
 
 use divan::{Bencher, counter::ItemsCount};
 use duckdb_neo::{Parameters, connection::Connection};
-use support::{Fixture, base56, bench_rows, dash_split, merge_struct, row_hash};
+use support::{Fixture, base56, bench_rows, dash_split, int_sum, merge_struct, row_hash};
 
 fn main() {
     support::nulls::Nulls::from_env().expect("valid NEO_BENCH_NULL_PERCENT");
@@ -64,6 +64,33 @@ mod aggregate {
         row_hash::create_input(&fixture.conn, rows).unwrap();
         row_hash::verify(&fixture.conn).unwrap();
         bench_query(bencher, &fixture.conn, row_hash::GROUPED_QUERY, rows);
+    }
+
+    fn int_sum_fixture(rows: usize) -> Fixture {
+        let fixture = Fixture::new().unwrap();
+        int_sum::create_input(&fixture.conn, rows).unwrap();
+        int_sum::verify(&fixture.conn).unwrap();
+        fixture
+    }
+
+    #[divan::bench(args = bench_rows())]
+    fn int_sum_ungrouped(bencher: Bencher<'_, '_>, rows: usize) {
+        bench_query(bencher, &int_sum_fixture(rows).conn, int_sum::UNGROUPED_QUERY, rows);
+    }
+
+    #[divan::bench(args = bench_rows())]
+    fn int_sum_grouped(bencher: Bencher<'_, '_>, rows: usize) {
+        bench_query(bencher, &int_sum_fixture(rows).conn, int_sum::GROUPED_QUERY, rows);
+    }
+
+    #[divan::bench(args = bench_rows())]
+    fn int_sum_running(bencher: Bencher<'_, '_>, rows: usize) {
+        bench_query(bencher, &int_sum_fixture(rows).conn, int_sum::RUNNING_QUERY, rows);
+    }
+
+    #[divan::bench(args = bench_rows())]
+    fn int_sum_sliding(bencher: Bencher<'_, '_>, rows: usize) {
+        bench_query(bencher, &int_sum_fixture(rows).conn, int_sum::SLIDING_QUERY, rows);
     }
 }
 
