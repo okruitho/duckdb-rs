@@ -137,6 +137,7 @@ Keep each job's default run under a few seconds; trim the largest row count wher
 ```sh
 python3 scripts/neo_versus.py build                      # both runners
 python3 scripts/neo_versus.py check [--filter F]         # every case at its two smallest row counts
+python3 scripts/neo_versus.py check --all-rows [--filter F]   # every row count; takes no lock, safe in parallel
 python3 scripts/neo_versus.py run [--filter F] [--rows 1,2048] [--repetitions 3] [--json out.json]
 python3 scripts/neo_versus.py perf <family/case> --rows N [--lang rust|cpp|both]
 ```
