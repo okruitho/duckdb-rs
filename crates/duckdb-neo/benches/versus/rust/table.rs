@@ -30,7 +30,7 @@ use duckdb_neo::{
         TableFilterPushdownCallbacks, TableFunctionBuilder, TableFunctionCallbacks,
     },
     value::Value,
-    vector::{NativeElement, WritableNativeElement},
+    vector::{NativeElement, VectorWriter, WritableNativeElement},
 };
 
 /// Rows a parallel scan claims at a time, which also sizes its thread count.
@@ -88,25 +88,24 @@ fn format_decimal(buffer: &mut [u8; 20], value: u64) -> &[u8] {
     &buffer[start..]
 }
 
-fn push_ascii(text: &mut String, bytes: &[u8]) {
-    text.extend(bytes.iter().map(|&byte| char::from(byte)));
-}
-
-fn write_tag(text: &mut String, i: i64) {
+fn write_tag(writer: &mut VectorWriter<'_, String>, row: usize, i: i64) -> Result<()> {
     let mut digits = [0u8; 20];
-    text.clear();
-    text.push_str("row-");
-    push_ascii(text, format_decimal(&mut digits, i as u64));
+    let digits = std::str::from_utf8(format_decimal(&mut digits, i as u64)).expect("decimal digits are ASCII");
+    writer.set_with(row, 4 + digits.len(), |tag| {
+        tag.push_str("row-")?;
+        tag.push_str(digits)
+    })
 }
 
 // Like `lpad(i::VARCHAR, len, '.')`, which keeps the leading `len` digits of a longer number.
-fn write_word(word: &mut String, i: i64, padding: &str) {
+fn write_word(writer: &mut VectorWriter<'_, String>, row: usize, i: i64, padding: &str) -> Result<()> {
     let mut digits = [0u8; 20];
     let digits = format_decimal(&mut digits, i as u64);
     let shown = digits.len().min(padding.len());
-    word.clear();
-    word.push_str(&padding[..padding.len() - shown]);
-    push_ascii(word, &digits[..shown]);
+    writer.set_with(row, padding.len(), |word| {
+        word.push_str(&padding[..padding.len() - shown])?;
+        word.push_str(std::str::from_utf8(&digits[..shown]).expect("decimal digits are ASCII"))
+    })
 }
 
 /// Where a single-threaded scan continues.
@@ -232,10 +231,8 @@ impl TableFunctionCallbacks for Grid {
                     let mut vector = output.get_vector_at_mut::<String>(position)?;
                     vector.set_size(rows)?;
                     let mut writer = vector.writer()?;
-                    let mut tag = String::new();
                     for row in 0..rows {
-                        write_tag(&mut tag, at(row));
-                        writer.set(row, &tag)?;
+                        write_tag(&mut writer, row, at(row))?;
                     }
                 }
                 4 => fill_column::<bool>(output, position, rows, |row| at(row) % 2 == 0)?,
@@ -266,10 +263,9 @@ pub struct WordsBind {
     padding: String,
 }
 
-/// The reused buffer of one scan.
+/// Where a scan continues.
 pub struct WordsScan {
     position: i64,
-    word: String,
 }
 
 pub struct Words;
@@ -308,10 +304,7 @@ impl TableFunctionCallbacks for Words {
         _global_state: Option<&Self::GlobalState>,
         _column_data: InitColumnData<'_>,
     ) -> Result<Option<Self::LocalState>> {
-        Ok(Some(WordsScan {
-            position: 0,
-            word: String::new(),
-        }))
+        Ok(Some(WordsScan { position: 0 }))
     }
 
     fn exec(
@@ -329,8 +322,7 @@ impl TableFunctionCallbacks for Words {
         vector.set_size(rows)?;
         let mut writer = vector.writer()?;
         for row in 0..rows {
-            write_word(&mut scan.word, scan.position + row as i64, &bind_data.padding);
-            writer.set(row, &scan.word)?;
+            write_word(&mut writer, row, scan.position + row as i64, &bind_data.padding)?;
         }
         scan.position += rows as i64;
         Ok(())

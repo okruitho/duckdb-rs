@@ -4,8 +4,9 @@ use crate::raw::RawExt;
 use crate::{Error, Result, check_api_call, ffi, logical_type::LogicalTypeID};
 
 use super::{
-    Arena, DuckDBBytes, HasDuckDBBytes, NativeElement, PlainNative, ReadableNativeElement, Selection, StorageKind,
-    Vector, VectorReader, WritableNativeElement, not_flat, not_writable, out_of_bounds, reader::RowLayout,
+    Arena, BytesBuffer, DuckDBBytes, HasDuckDBBytes, NativeElement, PlainNative, ReadableNativeElement, Selection,
+    StorageKind, StrBuffer, Vector, VectorReader, WritableNativeElement, not_flat, not_writable, out_of_bounds,
+    reader::RowLayout,
 };
 
 /// Exclusive access to a writable flat vector.
@@ -872,7 +873,72 @@ impl VectorWriter<'_, String> {
     }
 }
 
+impl VectorWriter<'_, String> {
+    /// Build a row's text in place, in at most `capacity` bytes, and mark the row valid.
+    ///
+    /// `fill` pushes the text; pushes beyond `capacity` fail. Short results are stored inline, longer
+    /// ones in this vector's arena, where unused capacity stays reserved until the vector is reset.
+    /// If `fill` fails or panics, the row holds an empty string and keeps its validity. A failure
+    /// before `fill` runs (`capacity` above `u32::MAX`, or the arena allocation) leaves the row unchanged.
+    ///
+    /// ```
+    /// # use duckdb_neo::{DuckDBType, Result, data_chunk::DataChunk, environment::{Environment, StorageLocation}};
+    /// # fn main() -> Result<()> {
+    /// # let conn = Environment::new()?.open(StorageLocation::InMemory)?.connect()?;
+    /// let mut chunk = DataChunk::create(&conn, &[String::logical_type(&conn)?], true)?;
+    /// let mut vector = chunk.get_vector_at_mut::<String>(0)?;
+    /// vector.set_size(1)?;
+    /// let mut writer = vector.writer()?;
+    /// let input = "a string longer than twelve bytes";
+    /// writer.set_with(0, input.len(), |buffer| {
+    ///     buffer.push_str(input)?;
+    ///     buffer.as_mut_str().make_ascii_uppercase();
+    ///     Ok(())
+    /// })?;
+    /// # drop(writer);
+    /// assert_eq!(vector.reader()?.get(0)?, Some("A STRING LONGER THAN TWELVE BYTES"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline(always)]
+    pub fn set_with(
+        &mut self,
+        index: usize,
+        capacity: usize,
+        fill: impl FnOnce(&mut StrBuffer<'_>) -> Result<()>,
+    ) -> Result<()> {
+        if index >= self.len() {
+            return Err(out_of_bounds(index, self.len()));
+        }
+        // SAFETY: The row is in bounds; a fresh buffer is empty, and a `StrBuffer` only holds UTF-8.
+        unsafe {
+            self.write_byte_buffer(index, capacity, |bytes| fill(StrBuffer::from_bytes_mut(bytes)))?;
+            self.mark_valid_unchecked(index);
+        }
+        Ok(())
+    }
+}
+
 impl VectorWriter<'_, crate::types::UncheckedString> {
+    /// Build a row's text in place, as with [`VectorWriter::<String>::set_with`].
+    #[inline(always)]
+    pub fn set_with(
+        &mut self,
+        index: usize,
+        capacity: usize,
+        fill: impl FnOnce(&mut StrBuffer<'_>) -> Result<()>,
+    ) -> Result<()> {
+        if index >= self.len() {
+            return Err(out_of_bounds(index, self.len()));
+        }
+        // SAFETY: The row is in bounds; a fresh buffer is empty, and a `StrBuffer` only holds UTF-8.
+        unsafe {
+            self.write_byte_buffer(index, capacity, |bytes| fill(StrBuffer::from_bytes_mut(bytes)))?;
+            self.mark_valid_unchecked(index);
+        }
+        Ok(())
+    }
+
     /// Concatenate UTF-8 fragments, as with [`VectorWriter::<String>::set_parts`].
     #[inline(always)]
     pub fn set_parts(&mut self, index: usize, parts: Option<&[&str]>) -> Result<()> {
@@ -902,6 +968,27 @@ impl VectorWriter<'_, crate::types::BlobValue> {
         }
         // SAFETY: Non-NULL rows are initialized; BLOB has no descendants.
         unsafe { self.set_validity_unchecked(index, parts.is_some()) }
+    }
+}
+
+impl VectorWriter<'_, crate::types::BlobValue> {
+    /// Build a row's bytes in place, as with [`VectorWriter::<String>::set_with`].
+    #[inline(always)]
+    pub fn set_with(
+        &mut self,
+        index: usize,
+        capacity: usize,
+        fill: impl FnOnce(&mut BytesBuffer<'_>) -> Result<()>,
+    ) -> Result<()> {
+        if index >= self.len() {
+            return Err(out_of_bounds(index, self.len()));
+        }
+        // SAFETY: The row is in bounds, and arbitrary bytes are valid BLOB storage.
+        unsafe {
+            self.write_byte_buffer(index, capacity, fill)?;
+            self.mark_valid_unchecked(index);
+        }
+        Ok(())
     }
 }
 
@@ -945,6 +1032,111 @@ impl<T: HasDuckDBBytes> VectorWriter<'_, T> {
             DuckDBBytes::write_parts(slot, parts, || self.arena())
         }
     }
+
+    /// # Safety
+    /// `index` must be in bounds, and every value `fill` can build must be valid for the logical type.
+    #[inline(always)]
+    unsafe fn write_byte_buffer(
+        &mut self,
+        index: usize,
+        capacity: usize,
+        fill: impl FnOnce(&mut BytesBuffer<'_>) -> Result<()>,
+    ) -> Result<()> {
+        // SAFETY: The row is in bounds, and long bytes are built in this vector's arena.
+        unsafe {
+            let slot = self.data.cast::<DuckDBBytes<'_>>().add(index);
+            DuckDBBytes::write_with(slot, capacity, || self.arena(), fill)
+        }
+    }
+}
+
+impl<T: HasDuckDBBytes + WritableNativeElement> VectorWriter<'_, T> {
+    /// Copy row `source_row` of `source`, value or NULL, into row `index` without decoding it.
+    ///
+    /// Inline values are copied as they are, longer ones into this vector's arena. Both element types
+    /// must store the same logical type, e.g. any `VARCHAR` marker into [`String`]. The bytes are
+    /// copied unvalidated, so they are exactly as valid as the source's (see [`VarcharBytes`]).
+    ///
+    /// [`VarcharBytes`]: crate::types::VarcharBytes
+    ///
+    /// A vector cannot be copied into itself:
+    ///
+    /// ```compile_fail,E0502
+    /// use duckdb_neo::{Result, vector::Vector};
+    ///
+    /// fn copy(vector: &mut Vector<'_, String>) -> Result<()> {
+    ///     let reader = vector.reader()?;
+    ///     vector.writer()?.copy_row(0, &reader, 1)
+    /// }
+    /// ```
+    #[inline]
+    pub fn copy_row<S: HasDuckDBBytes>(
+        &mut self,
+        index: usize,
+        source: &VectorReader<'_, S>,
+        source_row: usize,
+    ) -> Result<()> {
+        check_same_bytes_type::<S, T>()?;
+        if index >= self.len() {
+            return Err(out_of_bounds(index, self.len()));
+        }
+        if source_row >= source.len() {
+            return Err(out_of_bounds(source_row, source.len()));
+        }
+        // SAFETY: both rows are in bounds, and the types share their storage.
+        unsafe { self.copy_row_unchecked(index, source, source_row) }
+    }
+
+    /// Copy every row of `source`, values and NULLs, into the first rows of this vector, as with
+    /// [`Self::copy_row`].
+    pub fn copy_bytes_from<S: HasDuckDBBytes>(&mut self, source: &VectorReader<'_, S>) -> Result<()> {
+        check_same_bytes_type::<S, T>()?;
+        let len = source.len();
+        if len > self.len() {
+            return Err(out_of_bounds(len - 1, self.len()));
+        }
+        for row in 0..len {
+            // SAFETY: the row is in bounds of both, and the types share their storage.
+            unsafe { self.copy_row_unchecked(row, source, row)? };
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    /// `index` and `source_row` must be rows of this writer and `source`, whose types share storage.
+    #[inline(always)]
+    unsafe fn copy_row_unchecked<S: HasDuckDBBytes>(
+        &mut self,
+        index: usize,
+        source: &VectorReader<'_, S>,
+        source_row: usize,
+    ) -> Result<()> {
+        // SAFETY: the caller guarantees the rows; a valid physical slot holds a value of the shared
+        // logical type, which is copied as stored, long bytes into this vector's arena.
+        unsafe {
+            match source.physical_index_unchecked(source_row) {
+                Some(physical) => {
+                    let value = &*source.as_ptr().cast::<DuckDBBytes<'_>>().add(physical);
+                    let slot = self.data.cast::<DuckDBBytes<'_>>().add(index);
+                    DuckDBBytes::write_copy(slot, value, || self.arena())?;
+                    self.mark_valid_unchecked(index);
+                    Ok(())
+                }
+                None => self.set_null_unchecked(index),
+            }
+        }
+    }
+}
+
+fn check_same_bytes_type<S: NativeElement, T: NativeElement>() -> Result<()> {
+    if S::TYPE_ID != T::TYPE_ID {
+        return Err(Error::invalid_input(format!(
+            "cannot copy {:?} rows into a {:?} vector",
+            S::TYPE_ID,
+            T::TYPE_ID
+        )));
+    }
+    Ok(())
 }
 
 #[inline]

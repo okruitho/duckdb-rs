@@ -78,7 +78,10 @@ ffi_enum_redeclaration! {
     }
 }
 
-pub use crate::{arena::Arena, bytes::DuckDBBytes};
+pub use crate::{
+    arena::Arena,
+    bytes::{BytesBuffer, DuckDBBytes, StrBuffer},
+};
 
 mod array_writer;
 mod child;
