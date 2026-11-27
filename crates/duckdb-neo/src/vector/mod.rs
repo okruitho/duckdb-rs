@@ -432,7 +432,7 @@ impl<'a, T: NativeElement> Vector<'a, T> {
     }
 
     /// Return the prepared read metadata, fetched once per state; `OTHER` storage has none.
-    #[inline]
+    #[inline(always)]
     fn view(&self) -> Result<Option<reader::CachedReader>> {
         if self.kind == StorageKind::Other {
             return Ok(None);
@@ -440,7 +440,7 @@ impl<'a, T: NativeElement> Vector<'a, T> {
         if let Some(view) = self.view.get() {
             return Ok(Some(*view));
         }
-        let view = check_api_call!(ffi::duckdb_v2_vector_get_view, self.handle, RET)?;
+        let view = vector_view(self.handle)?;
         // SAFETY: DuckDB returned a current view of this vector, including its constant validity slot.
         let view = unsafe { reader::CachedReader::new(view, self.kind, self.len) };
         let _ = self.view.set(view);
@@ -765,7 +765,7 @@ impl<T: NativeElement> Vector<'_, T> {
     /// Prepare a storage-specific reader, along with readers for every descendant.
     ///
     /// Returns an error for [`StorageKind::Other`]; flatten the vector explicitly first.
-    #[inline]
+    #[inline(always)]
     pub fn reader(&self) -> Result<VectorReader<'_, T>> {
         VectorReader::new(self)
     }
@@ -775,6 +775,25 @@ impl<T: NativeElement> Vector<'_, T> {
     /// This is the slow path; prefer [`VectorReader::get`] or [`VectorReader::iter`].
     pub fn get_value_slow(&self, index: usize) -> Result<Value> {
         check_api_call!(ffi::duckdb_v2_vector_get_value, self.handle, index as u64, RET).map(|handle| Value { handle })
+    }
+}
+
+/// Fetch a vector's view, reading the fields one at a time.
+///
+/// DuckDB stores the fields separately, so copying the struct as a whole would reload them as one, stalling store forwarding.
+#[inline(always)]
+fn vector_view(handle: ffi::duckdb_v2_vector_handle) -> Result<ffi::duckdb_v2_vector_view> {
+    let mut view = std::mem::MaybeUninit::<ffi::duckdb_v2_vector_view>::uninit();
+    check_api_call!(ffi::duckdb_v2_vector_get_view, handle, view.as_mut_ptr())?;
+    let view = view.as_ptr();
+    // SAFETY: DuckDB wrote every field on success. Volatile reads keep the loads field-sized.
+    unsafe {
+        Ok(ffi::duckdb_v2_vector_view {
+            data: std::ptr::read_volatile(&raw const (*view).data),
+            validity: std::ptr::read_volatile(&raw const (*view).validity),
+            sel: std::ptr::read_volatile(&raw const (*view).sel),
+            count: std::ptr::read_volatile(&raw const (*view).count),
+        })
     }
 }
 
