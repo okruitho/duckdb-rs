@@ -55,20 +55,48 @@ fn vector_from_handle_fetches_children_only_for_nested_types() -> crate::Result<
     let conn = env.open(StorageLocation::InMemory)?.connect()?;
     let mut result = conn.query(
         "SELECT 42::INTEGER, 'text', [1, 2]::INTEGER[], {'a': 1, 'b': 'x'}, union_value(n := 1), \
-         [1, 2]::INTEGER[2], MAP {1: 2}",
+         [1, 2]::INTEGER[2], MAP {1: 2}, 1::VARIANT, 'b'::ENUM('a', 'b'), 1.5::DECIMAL(18, 3), (1, 'x')",
         Parameters::None,
     )?;
     let mut chunk = result.next_chunk()?.expect("one result chunk");
+    let mut ids = Vec::new();
     let child_counts = (0..chunk.col_count())
         .map(|index| {
-            let vector = Vector::<crate::vector::Unknown>::from_handle(
-                &chunk.get_vector_handle_at(index)?,
-                super::Access::Shared,
-            )?;
-            Ok(vector.children().map(|children| children.col_count()))
+            let handle = chunk.get_vector_handle_at(index)?;
+            let vector = Vector::<crate::vector::Unknown>::from_handle(&handle, super::Access::Shared)?;
+            // The type id alone must predict what DuckDB reports.
+            let reported = crate::check_api_call!(crate::ffi::duckdb_v2_vector_get_child_count, handle, RET)?;
+            let fetched = vector.children().map(|children| children.col_count());
+            assert_eq!(fetched.unwrap_or(0) as u64, reported, "column {index}");
+            ids.push(vector.logical_type().id()?);
+            Ok(fetched)
         })
         .collect::<crate::Result<Vec<_>>>()?;
-    assert_eq!(child_counts, [None, None, Some(1), Some(2), Some(2), Some(1), Some(1)]);
+    assert_eq!(
+        ids[7..],
+        [
+            LogicalTypeID::Variant,
+            LogicalTypeID::Enum,
+            LogicalTypeID::Decimal,
+            LogicalTypeID::Tuple
+        ]
+    );
+    assert_eq!(
+        child_counts,
+        [
+            None,
+            None,
+            Some(1),
+            Some(2),
+            Some(2),
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+            Some(2)
+        ]
+    );
 
     // Types that validate by id still reject other ids, also through a later cast.
     assert!(chunk.get_vector_at::<i32>(0).is_ok());

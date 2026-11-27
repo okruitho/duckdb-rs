@@ -47,8 +47,7 @@ fn collect_array<V, const N: usize>(indices: [usize; N], mut wrap: impl FnMut(us
             }
         }
     }
-    // SAFETY: every slot was initialized, and `MaybeUninit<V>` has the layout of `V`. A panic in
-    // `wrap` only leaks the slots written before it.
+    // SAFETY: every slot was initialized, and `MaybeUninit<V>` has the layout of `V`.
     Ok(unsafe { std::ptr::read(vectors.as_ptr().cast::<[V; N]>()) })
 }
 
@@ -75,7 +74,7 @@ pub(crate) type GetArgument = fn(*mut c_void, usize) -> Result<ffi::duckdb_v2_ve
 /// Where a [`VectorCollection`] finds the handles of its vectors.
 #[derive(Debug)]
 enum Handles {
-    /// Fetched up front, such as a chunk's vectors or a nested vector's children.
+    /// Fetched up front, such as a nested vector's children.
     Fetched(Vec<ffi::duckdb_v2_vector_handle>),
     /// A callback's arguments, fetched from DuckDB on access instead of copied into an array.
     Arguments {
@@ -796,6 +795,49 @@ mod tests {
         assert!(panics(&mut || drop(chunk.get_vector_at_mut::<i64>(1))));
         assert!(panics(&mut || drop(chunk.get_vector_array_mut([0, 1]))));
         Ok(())
+    }
+
+    #[test]
+    fn test_collect_array_drops_each_wrapped_item_once() {
+        use std::cell::Cell;
+
+        struct Counted<'a>(&'a Cell<usize>);
+        impl Drop for Counted<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let drops = Cell::new(0);
+        for failing in 0..4 {
+            drops.set(0);
+            let result = super::collect_array([0, 1, 2, 3], |index| match index == failing {
+                true => Err(crate::Error::invalid_input("failed")),
+                false => Ok(Counted(&drops)),
+            });
+            assert!(result.is_err());
+            assert_eq!(drops.get(), failing, "failure at {failing}");
+        }
+
+        drops.set(0);
+        let vectors = super::collect_array([0, 1, 2], |_| Ok(Counted(&drops))).unwrap();
+        assert_eq!(drops.get(), 0);
+        drop(vectors);
+        assert_eq!(drops.get(), 3);
+
+        let empty: [Counted<'_>; 0] = super::collect_array([], |_| unreachable!("no index")).unwrap();
+        assert_eq!(empty.len(), 0);
+
+        // A panic leaks the items wrapped before it instead of dropping them.
+        drops.set(0);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::collect_array([0, 1, 2], |index| match index {
+                2 => panic!("wrap panicked"),
+                _ => Ok(Counted(&drops)),
+            })
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(drops.get(), 0);
     }
 
     #[test]

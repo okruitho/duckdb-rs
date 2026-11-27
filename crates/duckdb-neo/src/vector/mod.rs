@@ -683,11 +683,11 @@ impl<'a, T: NativeElement> Vector<'a, T> {
         }
     }
 
-    /// Turn writable output into a constant vector, returning the rebuilt vector.
+    /// Turn writable output into a constant vector, returning it with its new storage.
     ///
     /// `value` must have the vector's logical type. Every logical row contains
-    /// `value`, or is `NULL` when `value` is `NULL`. DuckDB copies `value`, so a
-    /// borrowed value can be reused for later vectors.
+    /// `value`, or is `NULL` when `value` is `NULL`. It takes `&Value` as well as
+    /// `Value`, since DuckDB copies it: one value can fill many vectors.
     ///
     /// The returned vector is not writable: a constant holds a single
     /// slot, so per-row writes would go past its buffer.
@@ -717,7 +717,7 @@ impl<'a, T: NativeElement> Vector<'a, T> {
         Ok(self)
     }
 
-    /// Turn writable output into an arithmetic sequence, returning the rebuilt vector.
+    /// Turn writable output into an arithmetic sequence, returning it with its new storage.
     ///
     /// Produces `count` values following `start + index * increment`. The
     /// sequence uses [`StorageKind::Other`] and must be flattened before typed
