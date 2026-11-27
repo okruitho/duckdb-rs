@@ -391,6 +391,7 @@ fn union_rows(
                 format!("Make `{variant}` a row's active member and borrow its writer, to write the member's row.");
             methods.push(quote! {
                 #[doc = #doc]
+                #[inline]
                 pub fn #method(
                     &mut self,
                     row: ::core::primitive::usize,
@@ -433,6 +434,7 @@ fn union_rows(
             impl #row_impl_generics #row_writer for #writer_ident #writer_generics #row_where_clause {
                 type Value = #ident #type_generics;
 
+                #[inline]
                 fn len(&self) -> ::core::primitive::usize {
                     self.inner.len()
                 }
@@ -444,6 +446,7 @@ fn union_rows(
                     }
                 }
 
+                #[inline]
                 fn set_null(&mut self, row: ::core::primitive::usize) -> ::duckdb_neo::Result<()> {
                     self.inner.set_null(row)
                 }

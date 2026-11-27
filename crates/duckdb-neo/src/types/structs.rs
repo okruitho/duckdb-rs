@@ -64,8 +64,12 @@ unsafe impl WritableNativeElement for Struct {
 /// Runtime support for the struct derives in `duckdb-loadable-macros`; not a stable API.
 pub mod derive_support {
     use crate::{
-        Error, Result, data_chunk::VectorCollection, logical_type::LogicalType, logical_type::LogicalTypeID,
-        value::Value, vector::NativeElement,
+        Error, Result,
+        data_chunk::VectorCollection,
+        logical_type::LogicalType,
+        logical_type::LogicalTypeID,
+        value::Value,
+        vector::{NativeElement, RowWriter},
     };
 
     use super::param_names_match;
@@ -97,6 +101,14 @@ pub mod derive_support {
             .or_else(|| names.iter().position(|field| field.eq_ignore_ascii_case(name)))
             .ok_or_else(|| Error::invalid_input(format!("STRUCT field '{name}' is missing")))?;
         value.get_child(index)
+    }
+
+    /// NULL a row whose field write failed with `error`, then return the error.
+    #[cold]
+    #[inline(never)]
+    pub fn null_failed_row<W: RowWriter + ?Sized>(writer: &mut W, row: usize, error: Error) -> Result<()> {
+        writer.set_null(row)?;
+        Err(error)
     }
 
     /// Reject a SQL NULL for a field whose Rust type is not optional.
@@ -639,6 +651,53 @@ mod tests {
         })
         .join()
         .unwrap()
+    }
+
+    #[derive(Debug, crate::AsDuckDB)]
+    #[duckdb(writer)]
+    struct Tagged {
+        key: i32,
+        items: List<i32>,
+    }
+
+    #[test]
+    fn struct_writer_nulls_a_row_whose_field_write_fails() -> Result<()> {
+        let env = Environment::new()?;
+        let conn = env.open(StorageLocation::InMemory)?.connect()?;
+        let mut chunk = DataChunk::create(&conn, &[Tagged::logical_type(&conn)?], true)?;
+        let mut vector = chunk.get_vector_at_mut::<Tagged>(0)?;
+        vector.set_size(3)?;
+        vector
+            .children_mut()
+            .unwrap()
+            .get_vector_at_mut::<List<i32>>(1)?
+            .set_child_size(1)?;
+        {
+            let mut writer = vector.row_writer()?;
+            let too_long = Tagged {
+                key: 1,
+                items: List(vec![Some(1), Some(2)]),
+            };
+            assert!(writer.set(0, &too_long).is_err());
+            writer.set(
+                1,
+                &Tagged {
+                    key: 2,
+                    items: List(vec![Some(3)]),
+                },
+            )?;
+            assert!(writer.set(3, &too_long).is_err());
+        }
+        let reader = vector.reader()?;
+        assert_eq!(
+            (0..3).map(|row| reader.is_null(row)).collect::<Result<Vec<_>>>()?,
+            [true, false, false]
+        );
+        let keys = vector.children().unwrap().get_vector_at::<i32>(0)?.reader()?;
+        assert_eq!(keys.get(0)?, None);
+        assert_eq!(keys.get(1)?, Some(&2));
+        assert_eq!(vector.get_value_slow(1)?.dbg_string()?, "{'key': 2, 'items': [3]}");
+        Ok(())
     }
 
     #[test]
