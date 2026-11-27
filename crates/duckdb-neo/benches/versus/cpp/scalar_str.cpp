@@ -10,7 +10,8 @@
 //   which is split once at bind time.
 // - vs_null_if_empty(s): NULL for '' and NULL, otherwise `s`.
 //
-// Results are built from valid VARCHAR input, so they are placed without UTF-8 validation.
+// Results are built from valid VARCHAR input, so they are placed without UTF-8 validation, and in place where the
+// length is known up front.
 #include "registry.hpp"
 
 #include <algorithm>
@@ -26,17 +27,19 @@ using namespace duckdb::cxx;
 
 namespace {
 
-// Concatenates the parts inline or into one heap allocation.
-varchar_t Concat(Arena &heap, std::string_view first, std::string_view second, std::string_view third) {
-	const auto size = first.size() + second.size() + third.size();
+// Builds a string of `size` bytes in place: inline, or in one heap allocation. `fill` writes the bytes.
+template <class FILL>
+varchar_t BuildString(Arena &heap, const char *function, size_t size, FILL &&fill) {
 	if (size > std::numeric_limits<uint32_t>::max()) {
-		throw InvalidInputException("vs_wrap: the result exceeds 4 GiB");
+		throw InvalidInputException(std::string(function) + ": the result exceeds 4 GiB");
 	}
-	char inlined[varchar_t::INLINE_LENGTH];
-	auto *bytes = size <= varchar_t::INLINE_LENGTH ? inlined : reinterpret_cast<char *>(heap.Allocate(size));
-	auto *end = std::copy(first.begin(), first.end(), bytes);
-	end = std::copy(second.begin(), second.end(), end);
-	std::copy(third.begin(), third.end(), end);
+	if (size <= varchar_t::INLINE_LENGTH) {
+		char inlined[varchar_t::INLINE_LENGTH];
+		fill(inlined);
+		return varchar_t(inlined, static_cast<uint32_t>(size));
+	}
+	auto *bytes = reinterpret_cast<char *>(heap.Allocate(size));
+	fill(bytes);
 	return varchar_t(bytes, static_cast<uint32_t>(size));
 }
 
@@ -48,14 +51,15 @@ void LenExec(ScalarFunction::ExecInput &input) {
 void UpperAsciiExec(ScalarFunction::ExecInput &input) {
 	auto result = input.GetResult();
 	auto heap = result.GetHeap();
-	std::string buffer;
 	ScalarExecutor::Execute<varchar_t, varchar_t>(input, [&](varchar_t value) {
-		buffer.assign(value.data(), value.size());
-		for (auto &byte : buffer) {
-			// Branch-free, like Rust's `u8::to_ascii_uppercase`: flip the case bit of 'a'..='z'.
-			byte = static_cast<char>(byte ^ (static_cast<unsigned char>(byte - 'a') < 26 ? 0x20 : 0));
-		}
-		return heap.AddStringUnsafe(buffer);
+		return BuildString(heap, "vs_upper_ascii", value.size(), [&](char *bytes) {
+			const auto *source = value.data();
+			for (size_t i = 0; i < value.size(); i++) {
+				// Branch-free, like Rust's `u8::to_ascii_uppercase`: flip the case bit of 'a'..='z'.
+				const auto byte = source[i];
+				bytes[i] = static_cast<char>(byte ^ (static_cast<unsigned char>(byte - 'a') < 26 ? 0x20 : 0));
+			}
+		});
 	});
 }
 
@@ -64,24 +68,28 @@ void WrapExec(ScalarFunction::ExecInput &input) {
 	auto heap = result.GetHeap();
 	ScalarExecutor::Execute<varchar_t, varchar_t, varchar_t, varchar_t>(
 	    input, [&](varchar_t value, varchar_t prefix, varchar_t suffix) {
-		    return Concat(heap, prefix.view(), value.view(), suffix.view());
+		    const auto size = size_t(prefix.size()) + value.size() + suffix.size();
+		    return BuildString(heap, "vs_wrap", size, [&](char *bytes) {
+			    std::memcpy(bytes, prefix.data(), prefix.size());
+			    std::memcpy(bytes + prefix.size(), value.data(), value.size());
+			    std::memcpy(bytes + prefix.size() + value.size(), suffix.data(), suffix.size());
+		    });
 	    });
 }
 
 void RepeatExec(ScalarFunction::ExecInput &input) {
 	auto result = input.GetResult();
 	auto heap = result.GetHeap();
-	std::string buffer;
 	ScalarExecutor::Execute<std::optional<varchar_t>, varchar_t, int32_t>(
 	    input, [&](varchar_t value, int32_t count) -> std::optional<varchar_t> {
 		    if (count < 0) {
 			    return std::nullopt;
 		    }
-		    buffer.clear();
-		    for (int32_t i = 0; i < count; i++) {
-			    buffer.append(value.data(), value.size());
-		    }
-		    return heap.AddStringUnsafe(buffer);
+		    return BuildString(heap, "vs_repeat", size_t(value.size()) * size_t(count), [&](char *bytes) {
+			    for (int32_t i = 0; i < count; i++) {
+				    std::memcpy(bytes + size_t(i) * value.size(), value.data(), value.size());
+			    }
+		    });
 	    });
 }
 
@@ -90,7 +98,9 @@ void FirstWordExec(ScalarFunction::ExecInput &input) {
 	auto heap = result.GetHeap();
 	ScalarExecutor::Execute<varchar_t, varchar_t>(input, [&](varchar_t value) {
 		const auto text = value.view();
-		return heap.AddStringUnsafe(text.substr(0, text.find(' ')));
+		// A plain loop like the Rust side's, rather than a libc memchr call for mostly short strings.
+		const auto space = std::find(text.begin(), text.end(), ' ');
+		return heap.AddStringUnsafe(text.substr(0, static_cast<size_t>(space - text.begin())));
 	});
 }
 
@@ -138,9 +148,8 @@ void HasPrefixAnyExec(ScalarFunction::ExecInput &input) {
 	auto result = input.GetResult();
 	ScalarExecutor::Execute<bool, varchar_t>(input.GetArg(0), result, input.GetRowCount(), [&](varchar_t value) {
 		const auto text = value.view();
-		return std::any_of(prefixes.begin(), prefixes.end(), [&](const std::string &prefix) {
-			return text.size() >= prefix.size() && text.compare(0, prefix.size(), prefix) == 0;
-		});
+		return std::any_of(prefixes.begin(), prefixes.end(),
+		                   [&](const std::string &prefix) { return text.substr(0, prefix.size()) == prefix; });
 	});
 }
 

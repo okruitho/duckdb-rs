@@ -217,7 +217,8 @@ query = "SELECT vs_repeat(s, n) FROM t"
 check = """
 SELECT (count(*) FILTER (WHERE vs_repeat(s, n) IS DISTINCT FROM CASE WHEN n < 0 THEN NULL ELSE repeat(s, n) END)
         + (vs_repeat('ab', 0) <> '')::BIGINT + (vs_repeat('ab', -1) IS NOT NULL)::BIGINT
-        + (vs_repeat('', 5) <> '')::BIGINT + (vs_repeat('ab', 7) <> 'ababababababab')::BIGINT)::VARCHAR
+        + (vs_repeat('', 5) <> '')::BIGINT + (vs_repeat('ab', 7) <> 'ababababababab')::BIGINT
+        + (try(vs_repeat('abc', 2147483647)) IS NOT NULL)::BIGINT)::VARCHAR
 FROM t
 """
 expect = "0"

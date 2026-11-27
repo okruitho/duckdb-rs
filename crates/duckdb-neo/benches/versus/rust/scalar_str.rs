@@ -9,6 +9,8 @@
 //! - `vs_has_prefix_any(s, prefixes)`: whether `s` starts with any entry of the constant comma-separated
 //!   `prefixes`, which is split once at bind time.
 //! - `vs_null_if_empty(s)`: NULL for '' and NULL, otherwise `s`.
+//!
+//! Inputs are read as `UncheckedString`: DuckDB guarantees valid UTF-8 in VARCHAR, so reads skip validation.
 
 use duckdb_neo::{
     DuckDBType, Error, Result,
@@ -18,13 +20,14 @@ use duckdb_neo::{
     enums::FunctionProperty,
     scalar::{MicroScalar, ScalarBindCallbacks, ScalarCallbacks, ScalarFunctionBuilder},
     signature::{FunctionParameter, SignatureBuilder},
+    types::UncheckedString,
     vector::{CombinedVectorIterator, Unknown, Vector},
 };
 
 fn register_len(conn: &Connection) -> Result<()> {
     MicroScalar::create(
         "vs_len",
-        |_context, input: Vector<'_, String>, mut output: Vector<'_, i64>| {
+        |_context, input: Vector<'_, UncheckedString>, mut output: Vector<'_, i64>| {
             let mut writer = output.writer()?;
             for (row, value) in input.reader()?.iter().enumerate() {
                 writer.set_option(row, value.map(|value| value.len() as i64).as_ref())?;
@@ -38,7 +41,7 @@ fn register_len(conn: &Connection) -> Result<()> {
 fn register_upper_ascii(conn: &Connection) -> Result<()> {
     MicroScalar::create(
         "vs_upper_ascii",
-        |_context, input: Vector<'_, String>, mut output: Vector<'_, String>| {
+        |_context, input: Vector<'_, UncheckedString>, mut output: Vector<'_, String>| {
             let mut writer = output.writer()?;
             let mut buffer = String::new();
             for (row, value) in input.reader()?.iter().enumerate() {
@@ -68,9 +71,9 @@ fn register_wrap(conn: &Connection) -> Result<()> {
         "vs_wrap",
         signature,
         |_context, input: &mut VectorCollection, mut output: Vector<'_, String>| {
-            let strings = input.get_vector_at::<String>(0)?;
-            let prefixes = input.get_vector_at::<String>(1)?;
-            let suffixes = input.get_vector_at::<String>(2)?;
+            let strings = input.get_vector_at::<UncheckedString>(0)?;
+            let prefixes = input.get_vector_at::<UncheckedString>(1)?;
+            let suffixes = input.get_vector_at::<UncheckedString>(2)?;
             let rows = CombinedVectorIterator::new((strings.reader()?, prefixes.reader()?, suffixes.reader()?))?;
             let mut writer = output.writer()?;
             for (row, values) in rows.enumerate() {
@@ -96,7 +99,7 @@ fn register_repeat(conn: &Connection) -> Result<()> {
         "vs_repeat",
         signature,
         |_context, input: &mut VectorCollection, mut output: Vector<'_, String>| {
-            let strings = input.get_vector_at::<String>(0)?;
+            let strings = input.get_vector_at::<UncheckedString>(0)?;
             let counts = input.get_vector_at::<i32>(1)?;
             let rows = CombinedVectorIterator::new((strings.reader()?, counts.reader()?))?;
             let mut writer = output.writer()?;
@@ -104,6 +107,9 @@ fn register_repeat(conn: &Connection) -> Result<()> {
             for (row, values) in rows.enumerate() {
                 match values {
                     (Some(value), Some(&count)) if count >= 0 => {
+                        if value.len() * count as usize > u32::MAX as usize {
+                            return Err(Error::invalid_input("vs_repeat: the result exceeds 4 GiB"));
+                        }
                         buffer.clear();
                         for _ in 0..count {
                             buffer.push_str(value);
@@ -122,10 +128,12 @@ fn register_repeat(conn: &Connection) -> Result<()> {
 fn register_first_word(conn: &Connection) -> Result<()> {
     MicroScalar::create(
         "vs_first_word",
-        |_context, input: Vector<'_, String>, mut output: Vector<'_, String>| {
+        |_context, input: Vector<'_, UncheckedString>, mut output: Vector<'_, String>| {
             let mut writer = output.writer()?;
             for (row, value) in input.reader()?.iter().enumerate() {
-                let word = value.map(|value| value.split_once(' ').map_or(value, |(word, _)| word));
+                // A byte search: `str::split_once(' ')` runs a char searcher that verifies each match.
+                let word =
+                    value.map(|value| &value[..value.bytes().position(|byte| byte == b' ').unwrap_or(value.len())]);
                 writer.set_option(row, word)?;
             }
             Ok(())
@@ -143,8 +151,8 @@ fn register_count_char(conn: &Connection) -> Result<()> {
         "vs_count_char",
         signature,
         |_context, input: &mut VectorCollection, mut output: Vector<'_, i64>| {
-            let strings = input.get_vector_at::<String>(0)?;
-            let needles = input.get_vector_at::<String>(1)?;
+            let strings = input.get_vector_at::<UncheckedString>(0)?;
+            let needles = input.get_vector_at::<UncheckedString>(1)?;
             let rows = CombinedVectorIterator::new((strings.reader()?, needles.reader()?))?;
             let mut writer = output.writer()?;
             for (row, values) in rows.enumerate() {
@@ -183,7 +191,7 @@ impl ScalarCallbacks for HasPrefixAny {
         let prefixes = bind_data.expect("with_bind sets the prefixes");
         let mut output = output.cast::<bool>()?;
         output.set_size(input.row_count()?)?;
-        let strings = input.get_vector_at::<String>(0)?;
+        let strings = input.get_vector_at::<UncheckedString>(0)?;
         let mut writer = output.writer()?;
         for (row, value) in strings.reader()?.iter().enumerate() {
             let matched = value.map(|value| prefixes.iter().any(|prefix| value.starts_with(prefix.as_str())));
@@ -217,7 +225,7 @@ fn register_has_prefix_any(conn: &Connection) -> Result<()> {
 fn register_null_if_empty(conn: &Connection) -> Result<()> {
     MicroScalar::create(
         "vs_null_if_empty",
-        |_context, input: Vector<'_, String>, mut output: Vector<'_, String>| {
+        |_context, input: Vector<'_, UncheckedString>, mut output: Vector<'_, String>| {
             let mut writer = output.writer()?;
             for (row, value) in input.reader()?.iter().enumerate() {
                 writer.set_option(row, value.filter(|value| !value.is_empty()))?;

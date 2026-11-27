@@ -16,9 +16,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 
 using namespace duckdb::cxx;
 
@@ -57,30 +59,31 @@ void FillSeries(DataChunk &chunk, idx_t rows, int64_t first) {
 	chunk.GetVector(0).SetSize(rows);
 }
 
-void AppendDecimal(std::string &text, uint64_t value) {
-	char digits[20];
-	size_t start = sizeof(digits);
+// Writes the decimal digits of value so that they end just before end, returning where they start.
+auto FormatDecimal(char *end, uint64_t value) -> char * {
 	auto rest = value;
 	do {
-		digits[--start] = static_cast<char>('0' + rest % 10);
+		*--end = static_cast<char>('0' + rest % 10);
 		rest /= 10;
 	} while (rest != 0);
-	text.append(digits + start, sizeof(digits) - start);
+	return end;
 }
 
-void WriteTag(std::string &text, int64_t i) {
-	text.clear();
-	text.append("row-");
-	AppendDecimal(text, static_cast<uint64_t>(i));
+auto FormatTag(char (&buffer)[24], int64_t i) -> std::string_view {
+	auto *end = buffer + sizeof(buffer);
+	auto *start = FormatDecimal(end, static_cast<uint64_t>(i)) - 4;
+	std::memcpy(start, "row-", 4);
+	return std::string_view(start, static_cast<size_t>(end - start));
 }
 
 // Like lpad(i::VARCHAR, len, '.'), which keeps the leading len digits of a longer number.
-void WriteWord(std::string &word, std::string &digits, int64_t i, size_t len) {
-	digits.clear();
-	AppendDecimal(digits, static_cast<uint64_t>(i));
-	const auto shown = std::min(digits.size(), len);
-	word.assign(len - shown, '.');
-	word.append(digits, 0, shown);
+void WriteWord(std::string &word, int64_t i, const std::string &padding) {
+	char digits[20];
+	auto *end = digits + sizeof(digits);
+	auto *start = FormatDecimal(end, static_cast<uint64_t>(i));
+	const auto shown = std::min(static_cast<size_t>(end - start), padding.size());
+	word.assign(padding, 0, padding.size() - shown);
+	word.append(start, shown);
 }
 
 // Where a single-threaded scan continues.
@@ -157,11 +160,10 @@ void GridExec(TableFunction::ExecInput &input) {
 			auto vec = chunk.GetVector(position);
 			auto heap = vec.GetHeap();
 			auto *out = vec.GetDataMutable<varchar_t>();
-			std::string tag;
+			char tag[24];
 			for (idx_t row = 0; row < rows; row++) {
-				WriteTag(tag, at(row));
 				// The text is ASCII, which Rust's `&str` guarantees on the other side.
-				out[row] = heap.AddStringUnsafe(tag);
+				out[row] = heap.AddStringUnsafe(FormatTag(tag, at(row)));
 			}
 			break;
 		}
@@ -190,16 +192,16 @@ void GridExec(TableFunction::ExecInput &input) {
 	scan.position += static_cast<int64_t>(rows);
 }
 
+// padding is len dots, the longest prefix a word needs.
 struct WordsBind {
 	int64_t count = 0;
-	size_t len = 0;
+	std::string padding;
 };
 
-// Reused buffers of one scan.
+// The reused buffer of one scan.
 struct WordsScan {
 	int64_t position = 0;
 	std::string word;
-	std::string digits;
 };
 
 void WordsBind_(TableFunction::BindInput &input) {
@@ -217,7 +219,7 @@ void WordsBind_(TableFunction::BindInput &input) {
 	}
 	input.AddResultColumn("word", input.GetContext().GetFactory().CreateType(LogicalTypeId::VARCHAR));
 	input.SetCardinality(static_cast<idx_t>(count), true);
-	input.SetBindData<WordsBind>(WordsBind {count, len});
+	input.SetBindData<WordsBind>(WordsBind {count, std::string(len, '.')});
 }
 
 void WordsInitLocal(TableFunction::InitLocalInput &input) {
@@ -233,7 +235,7 @@ void WordsExec(TableFunction::ExecInput &input) {
 	auto heap = vec.GetHeap();
 	auto *out = vec.GetDataMutable<varchar_t>();
 	for (idx_t row = 0; row < rows; row++) {
-		WriteWord(scan.word, scan.digits, scan.position + static_cast<int64_t>(row), bind.len);
+		WriteWord(scan.word, scan.position + static_cast<int64_t>(row), bind.padding);
 		// The text is ASCII, which Rust's `&str` guarantees on the other side.
 		out[row] = heap.AddStringUnsafe(scan.word);
 	}

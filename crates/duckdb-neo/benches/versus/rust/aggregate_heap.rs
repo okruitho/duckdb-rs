@@ -98,11 +98,12 @@ impl AggregateCallbacks for Longest {
         mut states: States<'_, LongestState>,
     ) -> Result<()> {
         let values = argument::<UncheckedString>(data)?;
-        for (row, value) in values.reader()?.iter().enumerate() {
+        // `for_each` resolves the vector's storage once; a `for` loop dispatches on it per row.
+        values.reader()?.iter().enumerate().for_each(|(row, value)| {
             if let Some(value) = value {
                 states[row].offer(value);
             }
-        }
+        });
         Ok(())
     }
 
@@ -162,11 +163,11 @@ impl AggregateCallbacks for DistinctCount {
         mut states: States<'_, DistinctCountState>,
     ) -> Result<()> {
         let values = argument::<i64>(data)?;
-        for (row, value) in values.reader()?.iter().enumerate() {
+        values.reader()?.iter().enumerate().for_each(|(row, value)| {
             if let Some(value) = value {
                 states[row].values.insert(*value);
             }
-        }
+        });
         Ok(())
     }
 
@@ -224,11 +225,11 @@ impl AggregateCallbacks for Median {
         mut states: States<'_, MedianState>,
     ) -> Result<()> {
         let values = argument::<f64>(data)?;
-        for (row, value) in values.reader()?.iter().enumerate() {
+        values.reader()?.iter().enumerate().for_each(|(row, value)| {
             if let Some(value) = value {
                 states[row].values.push(*value);
             }
-        }
+        });
         Ok(())
     }
 
@@ -296,11 +297,11 @@ impl AggregateCallbacks for SortedList {
         mut states: States<'_, SortedListState>,
     ) -> Result<()> {
         let values = argument::<i64>(data)?;
-        for (row, value) in values.reader()?.iter().enumerate() {
+        values.reader()?.iter().enumerate().for_each(|(row, value)| {
             if let Some(value) = value {
                 states[row].values.push(*value);
             }
-        }
+        });
         Ok(())
     }
 
@@ -340,9 +341,7 @@ impl AggregateCallbacks for SortedList {
             sorted.clear();
             sorted.extend_from_slice(&state.values);
             sorted.sort_unstable();
-            for (element, value) in sorted.iter().enumerate() {
-                writer.elements().set(offset + element, value)?;
-            }
+            writer.elements().write_slice(offset, &sorted)?;
             writer.set_entry(row, ListIndex::new(offset as u64, sorted.len() as u64))?;
             offset += sorted.len();
         }
@@ -397,11 +396,11 @@ impl AggregateCallbacks for Top3 {
         mut states: States<'_, Top3State>,
     ) -> Result<()> {
         let values = argument::<i64>(data)?;
-        for (row, value) in values.reader()?.iter().enumerate() {
+        values.reader()?.iter().enumerate().for_each(|(row, value)| {
             if let Some(value) = value {
                 states[row].offer(*value);
             }
-        }
+        });
         Ok(())
     }
 
@@ -439,9 +438,7 @@ impl AggregateCallbacks for Top3 {
                 writer.set_null(row)?;
                 continue;
             }
-            for (element, value) in state.values[..state.len].iter().enumerate() {
-                writer.elements().set(offset + element, value)?;
-            }
+            writer.elements().write_slice(offset, &state.values[..state.len])?;
             writer.set_entry(row, ListIndex::new(offset as u64, state.len as u64))?;
             offset += state.len;
         }
@@ -475,11 +472,11 @@ impl AggregateCallbacks for ConcatSorted {
         mut states: States<'_, ConcatSortedState>,
     ) -> Result<()> {
         let values = argument::<UncheckedString>(data)?;
-        for (row, value) in values.reader()?.iter().enumerate() {
+        values.reader()?.iter().enumerate().for_each(|(row, value)| {
             if let Some(value) = value {
                 states[row].values.push(value.to_owned());
             }
-        }
+        });
         Ok(())
     }
 

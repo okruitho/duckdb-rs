@@ -46,7 +46,8 @@ void StateSize(AggregateFunction::SizeInput &input) {
 template <class STATE>
 void StateInit(AggregateFunction::InitInput &input) {
 	auto states = input.GetStates();
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	const auto count = input.GetStateCount();
+	for (idx_t i = 0; i < count; i++) {
 		new (states[i]) STATE();
 	}
 }
@@ -54,7 +55,8 @@ void StateInit(AggregateFunction::InitInput &input) {
 template <class STATE>
 void StateDestroy(AggregateFunction::DestroyInput &input) {
 	auto states = input.GetStates();
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	const auto count = input.GetStateCount();
+	for (idx_t i = 0; i < count; i++) {
 		StateAt<STATE>(states, i).~STATE();
 	}
 }
@@ -122,7 +124,8 @@ void LongestUpdate(AggregateFunction::UpdateInput &input) {
 	const auto view = ArgumentView(input);
 	const auto *values = view.Data<varchar_t>();
 	auto states = input.GetStates();
-	for (idx_t i = 0; i < input.GetRowCount(); i++) {
+	const auto count = input.GetRowCount();
+	for (idx_t i = 0; i < count; i++) {
 		if (view.IsValid(i)) {
 			Offer(StateAt<LongestState>(states, i), values[view.SelAt(i)].view());
 		}
@@ -132,7 +135,8 @@ void LongestUpdate(AggregateFunction::UpdateInput &input) {
 void LongestCombine(AggregateFunction::CombineInput &input) {
 	auto sources = input.GetSources();
 	auto targets = input.GetTargets();
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	const auto count = input.GetStateCount();
+	for (idx_t i = 0; i < count; i++) {
 		const auto &source = StateAt<LongestState>(sources, i);
 		if (source.value) {
 			Offer(StateAt<LongestState>(targets, i), *source.value);
@@ -147,7 +151,8 @@ void LongestFinalize(AggregateFunction::FinalizeInput &input) {
 	auto heap = result.GetHeap();
 	auto *out = result.GetDataMutable<varchar_t>();
 	const auto offset = input.GetResultOffset();
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	const auto count = input.GetStateCount();
+	for (idx_t i = 0; i < count; i++) {
 		const auto &state = StateAt<LongestState>(states, i);
 		if (state.value) {
 			WriteString(heap, out, offset + i, *state.value);
@@ -165,7 +170,8 @@ void DistinctCountUpdate(AggregateFunction::UpdateInput &input) {
 	const auto view = ArgumentView(input);
 	const auto *values = view.Data<int64_t>();
 	auto states = input.GetStates();
-	for (idx_t i = 0; i < input.GetRowCount(); i++) {
+	const auto count = input.GetRowCount();
+	for (idx_t i = 0; i < count; i++) {
 		if (view.IsValid(i)) {
 			StateAt<DistinctCountState>(states, i).values.insert(values[view.SelAt(i)]);
 		}
@@ -175,7 +181,8 @@ void DistinctCountUpdate(AggregateFunction::UpdateInput &input) {
 void DistinctCountCombine(AggregateFunction::CombineInput &input) {
 	auto sources = input.GetSources();
 	auto targets = input.GetTargets();
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	const auto count = input.GetStateCount();
+	for (idx_t i = 0; i < count; i++) {
 		const auto &source = StateAt<DistinctCountState>(sources, i);
 		StateAt<DistinctCountState>(targets, i).values.insert(source.values.begin(), source.values.end());
 	}
@@ -186,7 +193,8 @@ void DistinctCountFinalize(AggregateFunction::FinalizeInput &input) {
 	auto result = input.GetResult();
 	auto *out = result.GetDataMutable<int64_t>();
 	const auto offset = input.GetResultOffset();
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	const auto count = input.GetStateCount();
+	for (idx_t i = 0; i < count; i++) {
 		out[offset + i] = static_cast<int64_t>(StateAt<DistinctCountState>(states, i).values.size());
 	}
 }
@@ -199,7 +207,8 @@ void MedianUpdate(AggregateFunction::UpdateInput &input) {
 	const auto view = ArgumentView(input);
 	const auto *values = view.Data<double>();
 	auto states = input.GetStates();
-	for (idx_t i = 0; i < input.GetRowCount(); i++) {
+	const auto count = input.GetRowCount();
+	for (idx_t i = 0; i < count; i++) {
 		if (view.IsValid(i)) {
 			StateAt<MedianState>(states, i).values.push_back(values[view.SelAt(i)]);
 		}
@@ -209,7 +218,8 @@ void MedianUpdate(AggregateFunction::UpdateInput &input) {
 void MedianCombine(AggregateFunction::CombineInput &input) {
 	auto sources = input.GetSources();
 	auto targets = input.GetTargets();
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	const auto count = input.GetStateCount();
+	for (idx_t i = 0; i < count; i++) {
 		const auto &source = StateAt<MedianState>(sources, i).values;
 		auto &target = StateAt<MedianState>(targets, i).values;
 		target.insert(target.end(), source.begin(), source.end());
@@ -223,7 +233,8 @@ void MedianFinalize(AggregateFunction::FinalizeInput &input) {
 	ResultNulls nulls {result};
 	auto *out = result.GetDataMutable<double>();
 	const auto offset = input.GetResultOffset();
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	const auto count = input.GetStateCount();
+	for (idx_t i = 0; i < count; i++) {
 		auto &values = StateAt<MedianState>(states, i).values;
 		if (values.empty()) {
 			nulls.SetNull(offset + i);
@@ -243,7 +254,8 @@ void SortedListUpdate(AggregateFunction::UpdateInput &input) {
 	const auto view = ArgumentView(input);
 	const auto *values = view.Data<int64_t>();
 	auto states = input.GetStates();
-	for (idx_t i = 0; i < input.GetRowCount(); i++) {
+	const auto count = input.GetRowCount();
+	for (idx_t i = 0; i < count; i++) {
 		if (view.IsValid(i)) {
 			StateAt<SortedListState>(states, i).values.push_back(values[view.SelAt(i)]);
 		}
@@ -253,7 +265,8 @@ void SortedListUpdate(AggregateFunction::UpdateInput &input) {
 void SortedListCombine(AggregateFunction::CombineInput &input) {
 	auto sources = input.GetSources();
 	auto targets = input.GetTargets();
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	const auto count = input.GetStateCount();
+	for (idx_t i = 0; i < count; i++) {
 		const auto &source = StateAt<SortedListState>(sources, i).values;
 		auto &target = StateAt<SortedListState>(targets, i).values;
 		target.insert(target.end(), source.begin(), source.end());
@@ -269,13 +282,14 @@ void SortedListFinalize(AggregateFunction::FinalizeInput &input) {
 	auto child = result.GetChild(0);
 	auto child_offset = child.GetSize();
 	idx_t elements = 0;
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	const auto count = input.GetStateCount();
+	for (idx_t i = 0; i < count; i++) {
 		elements += StateAt<SortedListState>(states, i).values.size();
 	}
 	child.SetSize(child_offset + elements);
 	auto *child_data = child.GetDataMutable<int64_t>();
 	auto *entries = result.GetDataMutable<list_entry_t>();
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	for (idx_t i = 0; i < count; i++) {
 		auto &values = StateAt<SortedListState>(states, i).values;
 		if (values.empty()) {
 			nulls.SetNull(offset + i);
@@ -315,7 +329,8 @@ void Top3Update(AggregateFunction::UpdateInput &input) {
 	const auto view = ArgumentView(input);
 	const auto *values = view.Data<int64_t>();
 	auto states = input.GetStates();
-	for (idx_t i = 0; i < input.GetRowCount(); i++) {
+	const auto count = input.GetRowCount();
+	for (idx_t i = 0; i < count; i++) {
 		if (view.IsValid(i)) {
 			Offer(StateAt<Top3State>(states, i), values[view.SelAt(i)]);
 		}
@@ -325,7 +340,8 @@ void Top3Update(AggregateFunction::UpdateInput &input) {
 void Top3Combine(AggregateFunction::CombineInput &input) {
 	auto sources = input.GetSources();
 	auto targets = input.GetTargets();
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	const auto count = input.GetStateCount();
+	for (idx_t i = 0; i < count; i++) {
 		const auto &source = StateAt<Top3State>(sources, i);
 		auto &target = StateAt<Top3State>(targets, i);
 		for (idx_t j = 0; j < source.len; j++) {
@@ -342,13 +358,14 @@ void Top3Finalize(AggregateFunction::FinalizeInput &input) {
 	auto child = result.GetChild(0);
 	auto child_offset = child.GetSize();
 	idx_t elements = 0;
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	const auto count = input.GetStateCount();
+	for (idx_t i = 0; i < count; i++) {
 		elements += StateAt<Top3State>(states, i).len;
 	}
 	child.SetSize(child_offset + elements);
 	auto *child_data = child.GetDataMutable<int64_t>();
 	auto *entries = result.GetDataMutable<list_entry_t>();
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	for (idx_t i = 0; i < count; i++) {
 		const auto &state = StateAt<Top3State>(states, i);
 		if (state.len == 0) {
 			nulls.SetNull(offset + i);
@@ -369,7 +386,8 @@ void ConcatSortedUpdate(AggregateFunction::UpdateInput &input) {
 	const auto view = ArgumentView(input);
 	const auto *values = view.Data<varchar_t>();
 	auto states = input.GetStates();
-	for (idx_t i = 0; i < input.GetRowCount(); i++) {
+	const auto count = input.GetRowCount();
+	for (idx_t i = 0; i < count; i++) {
 		if (view.IsValid(i)) {
 			StateAt<ConcatSortedState>(states, i).values.emplace_back(values[view.SelAt(i)].view());
 		}
@@ -379,7 +397,8 @@ void ConcatSortedUpdate(AggregateFunction::UpdateInput &input) {
 void ConcatSortedCombine(AggregateFunction::CombineInput &input) {
 	auto sources = input.GetSources();
 	auto targets = input.GetTargets();
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	const auto count = input.GetStateCount();
+	for (idx_t i = 0; i < count; i++) {
 		const auto &source = StateAt<ConcatSortedState>(sources, i).values;
 		auto &target = StateAt<ConcatSortedState>(targets, i).values;
 		target.insert(target.end(), source.begin(), source.end());
@@ -394,7 +413,8 @@ void ConcatSortedFinalize(AggregateFunction::FinalizeInput &input) {
 	auto *out = result.GetDataMutable<varchar_t>();
 	const auto offset = input.GetResultOffset();
 	std::string joined;
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	const auto count = input.GetStateCount();
+	for (idx_t i = 0; i < count; i++) {
 		auto &values = StateAt<ConcatSortedState>(states, i).values;
 		if (values.empty()) {
 			nulls.SetNull(offset + i);
