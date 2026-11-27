@@ -155,19 +155,13 @@ impl CastFunctionCallbacks for DoubleToCents {
         input: Vector<'_, f64>,
         mut output: Vector<'_, i64>,
     ) -> Result<()> {
-        let mut writer = output.writer()?;
-        for (row, value) in input.reader()?.iter().enumerate() {
-            let Some(&value) = value else {
-                writer.set_null(row)?;
-                continue;
-            };
-            match double_to_cents(value) {
-                Some(cents) => writer.set(row, &cents)?,
-                None if mode == CastMode::Try => writer.set_null(row)?,
-                None => return Err(Error::invalid_input("DOUBLE value out of vs_cents range")),
-            }
+        let (input, mut writer) = (input.reader()?, output.writer()?);
+        if mode == CastMode::Try {
+            return writer.map_option_from(&input, |value| value.and_then(|&value| double_to_cents(value)));
         }
-        Ok(())
+        writer.try_map_from(&input, |&value| {
+            double_to_cents(value).ok_or_else(|| Error::invalid_input("DOUBLE value out of vs_cents range"))
+        })
     }
 }
 
@@ -184,11 +178,9 @@ impl CastFunctionCallbacks for CentsToDouble {
         input: Vector<'_, i64>,
         mut output: Vector<'_, f64>,
     ) -> Result<()> {
-        let mut writer = output.writer()?;
-        for (row, cents) in input.reader()?.iter().enumerate() {
-            writer.set_option(row, cents.map(|&cents| cents as f64 / 100.0).as_ref())?;
-        }
-        Ok(())
+        output
+            .writer()?
+            .map_from(&input.reader()?, |&cents| cents as f64 / 100.0)
     }
 }
 
@@ -206,19 +198,13 @@ impl CastFunctionCallbacks for VarcharToCents {
         input: Vector<'_, UncheckedString>,
         mut output: Vector<'_, i64>,
     ) -> Result<()> {
-        let mut writer = output.writer()?;
-        for (row, text) in input.reader()?.iter().enumerate() {
-            let Some(text) = text else {
-                writer.set_null(row)?;
-                continue;
-            };
-            match parse_cents(text) {
-                Some(cents) => writer.set(row, &cents)?,
-                None if mode == CastMode::Try => writer.set_null(row)?,
-                None => return Err(conversion_error(text, CENTS_TYPE)),
-            }
+        let (input, mut writer) = (input.reader()?, output.writer()?);
+        if mode == CastMode::Try {
+            return writer.map_option_from(&input, |text| text.and_then(parse_cents));
         }
-        Ok(())
+        writer.try_map_from(&input, |text| {
+            parse_cents(text).ok_or_else(|| conversion_error(text, CENTS_TYPE))
+        })
     }
 }
 
@@ -290,19 +276,13 @@ impl CastFunctionCallbacks for HexToBigint {
         input: Vector<'_, UncheckedString>,
         mut output: Vector<'_, i64>,
     ) -> Result<()> {
-        let mut writer = output.writer()?;
-        for (row, text) in input.reader()?.iter().enumerate() {
-            let Some(text) = text else {
-                writer.set_null(row)?;
-                continue;
-            };
-            match parse_hex(text) {
-                Some(value) => writer.set(row, &value)?,
-                None if mode == CastMode::Try => writer.set_null(row)?,
-                None => return Err(conversion_error(text, "BIGINT")),
-            }
+        let (input, mut writer) = (input.reader()?, output.writer()?);
+        if mode == CastMode::Try {
+            return writer.map_option_from(&input, |text| text.and_then(parse_hex));
         }
-        Ok(())
+        writer.try_map_from(&input, |text| {
+            parse_hex(text).ok_or_else(|| conversion_error(text, "BIGINT"))
+        })
     }
 }
 

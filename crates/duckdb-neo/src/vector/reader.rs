@@ -1,6 +1,8 @@
 use std::ops::Range;
 
-use super::{NativeElement, ReadableNativeElement, StorageKind, Vector, other_not_readable, out_of_bounds};
+use super::{
+    NativeElement, PlainNative, ReadableNativeElement, StorageKind, Vector, other_not_readable, out_of_bounds,
+};
 use crate::Result;
 use crate::ffi;
 
@@ -249,6 +251,24 @@ impl<'vec, T: NativeElement> VectorReader<'vec, T> {
         unsafe { self.cached().storage.physical_index_unchecked(self.view(), index) }
     }
 
+    /// Return the storage of every row, for loops that resolve it once.
+    #[inline(always)]
+    pub(crate) fn layout(&self) -> RowLayout {
+        let view = self.view();
+        match self.cached().storage {
+            ReaderStorage::Flat => RowLayout::Flat {
+                validity: view.validity,
+            },
+            ReaderStorage::Constant(reader) => RowLayout::Constant {
+                is_null: reader.is_null,
+            },
+            ReaderStorage::Dictionary(_) => RowLayout::Dictionary {
+                selection: view.sel,
+                validity: view.validity,
+            },
+        }
+    }
+
     /// # Safety
     /// `index` must be a logical row, and the physical storage must hold DuckDB list entries.
     #[inline(always)]
@@ -337,6 +357,80 @@ impl<'vec, T: ReadableNativeElement> VectorReader<'vec, T> {
         }
         // SAFETY: Flat storage uses the logical index directly; validity was checked above.
         Some(unsafe { T::get(self, index, index) })
+    }
+}
+
+impl<'vec, T: PlainNative> VectorReader<'vec, T> {
+    /// Borrow every row's value when the storage is flat without a validity mask, else return `None`.
+    ///
+    /// Every row is then valid, so `values[row]` is what [`Self::get`] returns for `row`, and a loop
+    /// over the slice can vectorize. Constant, dictionary and masked vectors need [`Self::iter`].
+    ///
+    /// ```
+    /// # use duckdb_neo::{Parameters, Result, environment::{Environment, StorageLocation}};
+    /// # fn main() -> Result<()> {
+    /// # let conn = Environment::new()?.open(StorageLocation::InMemory)?.connect()?;
+    /// let chunk = conn.query("SELECT i::BIGINT FROM range(3) t(i)", Parameters::None)?.next_chunk()?.unwrap();
+    /// let vector = chunk.get_vector_at::<i64>(0)?;
+    /// assert_eq!(vector.reader()?.valid_values(), Some(&[0, 1, 2][..]));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn valid_values(&self) -> Option<&'vec [T]> {
+        let view = self.view();
+        if !matches!(self.cached().storage, ReaderStorage::Flat) || !view.validity.is_null() {
+            return None;
+        }
+        if self.is_empty() {
+            return Some(&[]);
+        }
+        if view.data.is_null() {
+            return None;
+        }
+        // SAFETY: flat storage without a mask holds a valid, initialized row in each of its `len` slots, which
+        // `get` also reads; `T` is the slot type, and the shared vector borrow keeps the storage alive and unchanged.
+        Some(unsafe { std::slice::from_raw_parts(view.data.cast::<T>(), self.len()) })
+    }
+}
+
+/// A reader's storage, resolved once for loops over all of its rows.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RowLayout {
+    /// Row `i` is slot `i`; `validity` is null when every row is valid.
+    Flat { validity: *const u64 },
+    /// Every row reads slot zero.
+    Constant { is_null: bool },
+    /// `selection` holds every row's slot; `validity` is indexed by slot.
+    Dictionary {
+        selection: *const u32,
+        validity: *const u64,
+    },
+}
+
+impl RowLayout {
+    /// Return the validity of rows `start..end`, at most 64, as bit `i` for row `start + i`.
+    ///
+    /// # Safety
+    /// `start..end` must be rows of the layout's reader, and `start` a multiple of 64.
+    #[inline(always)]
+    pub(crate) unsafe fn validity_word(&self, start: usize, end: usize) -> u64 {
+        match *self {
+            Self::Flat { validity } if validity.is_null() => u64::MAX,
+            // SAFETY: the caller guarantees the rows are in bounds, and the mask covers them.
+            Self::Flat { validity } => unsafe { *validity.add(start / 64) },
+            Self::Constant { is_null } => (!is_null as u64).wrapping_neg(),
+            Self::Dictionary { validity, .. } if validity.is_null() => u64::MAX,
+            Self::Dictionary { selection, validity } => {
+                let mut bits = 0;
+                for row in start..end {
+                    // SAFETY: as above, and the selection holds the rows.
+                    let physical = unsafe { *selection.add(row) } as usize;
+                    bits |= (unsafe { *validity.add(physical / 64) } >> (physical % 64) & 1) << (row - start);
+                }
+                bits
+            }
+        }
     }
 }
 

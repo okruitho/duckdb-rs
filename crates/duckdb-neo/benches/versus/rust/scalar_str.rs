@@ -28,11 +28,7 @@ fn register_len(conn: &Connection) -> Result<()> {
     MicroScalar::create(
         "vs_len",
         |_context, input: Vector<'_, UncheckedString>, mut output: Vector<'_, i64>| {
-            let mut writer = output.writer()?;
-            for (row, value) in input.reader()?.iter().enumerate() {
-                writer.set_option(row, value.map(|value| value.len() as i64).as_ref())?;
-            }
-            Ok(())
+            output.writer()?.map_from(&input.reader()?, |value| value.len() as i64)
         },
     )
     .register(conn)
@@ -192,12 +188,9 @@ impl ScalarCallbacks for HasPrefixAny {
         let mut output = output.cast::<bool>()?;
         output.set_size(input.row_count()?)?;
         let strings = input.get_vector_at::<UncheckedString>(0)?;
-        let mut writer = output.writer()?;
-        for (row, value) in strings.reader()?.iter().enumerate() {
-            let matched = value.map(|value| prefixes.iter().any(|prefix| value.starts_with(prefix.as_str())));
-            writer.set_option(row, matched.as_ref())?;
-        }
-        Ok(())
+        output.writer()?.map_from(&strings.reader()?, |value| {
+            prefixes.iter().any(|prefix| value.starts_with(prefix.as_str()))
+        })
     }
 }
 

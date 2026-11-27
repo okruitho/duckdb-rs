@@ -4,8 +4,8 @@ use crate::raw::RawExt;
 use crate::{Error, Result, check_api_call, ffi, logical_type::LogicalTypeID};
 
 use super::{
-    Arena, DuckDBBytes, HasDuckDBBytes, NativeElement, PlainNative, Selection, StorageKind, Vector, VectorReader,
-    WritableNativeElement, not_flat, not_writable, out_of_bounds,
+    Arena, DuckDBBytes, HasDuckDBBytes, NativeElement, PlainNative, ReadableNativeElement, Selection, StorageKind,
+    Vector, VectorReader, WritableNativeElement, not_flat, not_writable, out_of_bounds, reader::RowLayout,
 };
 
 /// Exclusive access to a writable flat vector.
@@ -577,6 +577,230 @@ impl<T: PlainNative> VectorWriter<'_, T> {
                 let word = validity.add(words);
                 *word = (*word & keep) | (mask[words] & !keep);
             }
+        }
+        Ok(())
+    }
+
+    /// Write `f(value)` for every row of `input` into the first rows of this vector; NULL rows stay NULL
+    /// without calling `f`.
+    ///
+    /// The input's storage and validity are resolved once, and validity is written a word at a time,
+    /// so a flat input without NULLs runs a loop LLVM can vectorize. Fails if `input` is longer.
+    ///
+    /// ```
+    /// # use duckdb_neo::{Parameters, Result, environment::{Environment, StorageLocation}, scalar::MicroScalar, vector::Vector};
+    /// # fn main() -> Result<()> {
+    /// # let conn = Environment::new()?.open(StorageLocation::InMemory)?.connect()?;
+    /// MicroScalar::create("plus_one", |_ctx, input: Vector<'_, i64>, mut output: Vector<'_, i64>| {
+    ///     output.writer()?.map_from(&input.reader()?, |value| value.wrapping_add(1))
+    /// })
+    /// .register(&conn)?;
+    /// let chunk = conn.query("SELECT plus_one(v) FROM (VALUES (1), (NULL)) t(v)", Parameters::None)?
+    ///     .next_chunk()?.unwrap();
+    /// let rows = chunk.get_vector_at::<i64>(0)?.reader()?.iter().collect::<Vec<_>>();
+    /// assert_eq!(rows, [Some(&2), None]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn map_from<'v, I: ReadableNativeElement + 'v>(
+        &mut self,
+        input: &VectorReader<'v, I>,
+        mut f: impl FnMut(I::Ref<'v>) -> T,
+    ) -> Result<()> {
+        self.map_reader(input, true, |value| Ok(value.map(&mut f)))
+    }
+
+    /// As [`Self::map_from`], but `f` gets `None` for NULL rows and its `None` makes the row NULL.
+    ///
+    /// ```
+    /// # use duckdb_neo::{Parameters, Result, environment::{Environment, StorageLocation}, scalar::MicroScalar, vector::Vector};
+    /// # fn main() -> Result<()> {
+    /// # let conn = Environment::new()?.open(StorageLocation::InMemory)?.connect()?;
+    /// MicroScalar::create("swap_null", |_ctx, input: Vector<'_, i64>, mut output: Vector<'_, i64>| {
+    ///     output.writer()?.map_option_from(&input.reader()?, |value| match value {
+    ///         Some(0) => None,
+    ///         Some(value) => Some(*value),
+    ///         None => Some(0),
+    ///     })
+    /// })
+    /// .set_property(duckdb_neo::enums::FunctionProperty::HasSpecialNullHandling(true))
+    /// .register(&conn)?;
+    /// let chunk = conn.query("SELECT swap_null(v) FROM (VALUES (0), (NULL), (5)) t(v)", Parameters::None)?
+    ///     .next_chunk()?.unwrap();
+    /// let rows = chunk.get_vector_at::<i64>(0)?.reader()?.iter().collect::<Vec<_>>();
+    /// assert_eq!(rows, [None, Some(&0), Some(&5)]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn map_option_from<'v, I: ReadableNativeElement + 'v>(
+        &mut self,
+        input: &VectorReader<'v, I>,
+        mut f: impl FnMut(Option<I::Ref<'v>>) -> Option<T>,
+    ) -> Result<()> {
+        self.map_reader(input, false, |value| Ok(f(value)))
+    }
+
+    /// As [`Self::map_from`] with a fallible `f`, returning its first error.
+    ///
+    /// After an error, the rows of `input` are partly written: each row holds its old or its new value.
+    #[inline]
+    pub fn try_map_from<'v, I: ReadableNativeElement + 'v>(
+        &mut self,
+        input: &VectorReader<'v, I>,
+        mut f: impl FnMut(I::Ref<'v>) -> Result<T>,
+    ) -> Result<()> {
+        self.map_reader(input, true, |value| value.map(&mut f).transpose())
+    }
+
+    #[inline(always)]
+    fn map_reader<'v, I: ReadableNativeElement + 'v>(
+        &mut self,
+        input: &VectorReader<'v, I>,
+        propagate_nulls: bool,
+        f: impl FnMut(Option<I::Ref<'v>>) -> Result<Option<T>>,
+    ) -> Result<()> {
+        let reader = input.clone();
+        let len = reader.len();
+        if len > self.len() {
+            return Err(out_of_bounds(len - 1, self.len()));
+        }
+        // SAFETY: the layout describes the reader's `len` rows, and `I::get` reads the slot of a valid row.
+        unsafe {
+            self.map_layout(
+                len,
+                reader.layout(),
+                propagate_nulls,
+                |physical, row| I::get(&reader, physical, row),
+                f,
+            )
+        }
+    }
+
+    /// Write rows `0..len` with `f` over the rows of `layout`, each read as `read(physical, row)`.
+    ///
+    /// With `propagate_nulls`, NULL rows become NULL without calling `f`; otherwise `f` gets `None`.
+    ///
+    /// # Safety
+    /// `len` must not exceed [`Self::len`], `layout` must describe at least `len` rows, and `read` must be sound for
+    /// each valid row and its slot.
+    #[inline(always)]
+    unsafe fn map_layout<V>(
+        &mut self,
+        len: usize,
+        layout: RowLayout,
+        propagate_nulls: bool,
+        read: impl Fn(usize, usize) -> V,
+        mut f: impl FnMut(Option<V>) -> Result<Option<T>>,
+    ) -> Result<()> {
+        // SAFETY (every arm): the caller guarantees the layout covers `len` rows and `read` is sound for valid ones;
+        // the validity words only report rows the layout marks valid.
+        unsafe {
+            match layout {
+                RowLayout::Flat { validity } if validity.is_null() => self.write_rows(
+                    len,
+                    propagate_nulls,
+                    |_, _| u64::MAX,
+                    |row, valid| f(valid.then(|| read(row, row))),
+                ),
+                RowLayout::Flat { validity } => self.write_rows(
+                    len,
+                    propagate_nulls,
+                    |start, _| *validity.add(start / 64),
+                    |row, valid| f(valid.then(|| read(row, row))),
+                ),
+                RowLayout::Constant { is_null } => self.write_rows(
+                    len,
+                    propagate_nulls,
+                    |_, _| if is_null { 0 } else { u64::MAX },
+                    |row, valid| f(valid.then(|| read(0, row))),
+                ),
+                RowLayout::Dictionary { selection, .. } => self.write_rows(
+                    len,
+                    propagate_nulls,
+                    |start, end| layout.validity_word(start, end),
+                    |row, valid| f(valid.then(|| read(*selection.add(row) as usize, row))),
+                ),
+            }
+        }
+    }
+
+    /// Write rows `0..len` from `row(index, valid)`, a word of 64 rows at a time; `None` writes NULL.
+    ///
+    /// `valid(start, end)` returns the input validity of rows `start..end`, bit `i` for row `start + i`. With
+    /// `propagate_nulls`, rows without the bit become NULL without calling `row`.
+    ///
+    /// # Safety
+    /// `len` must not exceed [`Self::len`], and both closures must be sound for every row below `len`.
+    #[inline(always)]
+    unsafe fn write_rows(
+        &mut self,
+        len: usize,
+        propagate_nulls: bool,
+        valid: impl Fn(usize, usize) -> u64,
+        mut row: impl FnMut(usize, bool) -> Result<Option<T>>,
+    ) -> Result<()> {
+        let data = self.data.cast::<T>();
+        let mut start = 0;
+        while start < len {
+            let end = len.min(start + 64);
+            let rows = u64::MAX >> (64 - (end - start));
+            let input = valid(start, end) & rows;
+            let mut output = 0;
+            if input == rows {
+                output = rows;
+                for index in start..end {
+                    match row(index, true)? {
+                        // SAFETY: the caller guarantees the row is in bounds, and `T` is the slot type.
+                        Some(value) => unsafe { data.add(index).write(value) },
+                        None => output &= !(1 << (index - start)),
+                    }
+                }
+            } else if propagate_nulls {
+                let mut bits = input;
+                while bits != 0 {
+                    let index = start + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    if let Some(value) = row(index, true)? {
+                        // SAFETY: as above.
+                        unsafe { data.add(index).write(value) };
+                        output |= 1 << (index - start);
+                    }
+                }
+            } else {
+                for index in start..end {
+                    let bit = 1 << (index - start);
+                    if let Some(value) = row(index, input & bit != 0)? {
+                        // SAFETY: as above.
+                        unsafe { data.add(index).write(value) };
+                        output |= bit;
+                    }
+                }
+            }
+            // SAFETY: the rows are in bounds, and the valid ones were just written.
+            unsafe { self.store_validity_word(start / 64, output, rows)? };
+            start = end;
+        }
+        Ok(())
+    }
+}
+
+impl<T: NativeElement> VectorWriter<'_, T> {
+    /// Set the bits `rows` of validity word `word` to `bits`, allocating the mask only for a NULL row.
+    ///
+    /// # Safety
+    /// The word must be within the mask, and rows marked valid must hold initialized values.
+    #[inline(always)]
+    unsafe fn store_validity_word(&mut self, word: usize, bits: u64, rows: u64) -> Result<()> {
+        if bits == rows && self.validity.is_null() {
+            return Ok(());
+        }
+        let validity = self.allocated_validity()?;
+        // SAFETY: the caller guarantees the word is within the writable mask.
+        unsafe {
+            let slot = validity.add(word);
+            *slot = (*slot & !rows) | bits;
         }
         Ok(())
     }
