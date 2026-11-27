@@ -75,7 +75,6 @@ impl std::fmt::Debug for DuckDBBytes<'_> {
     }
 }
 
-type DuckDBV2BytesUnion = ffi::duckdb_v2_bytes__bindgen_ty_1;
 type DuckDBV2BytesPointer = ffi::duckdb_v2_bytes__bindgen_ty_1__bindgen_ty_1;
 type DuckDBV2BytesInlined = ffi::duckdb_v2_bytes__bindgen_ty_1__bindgen_ty_2;
 impl<'arena> DuckDBBytes<'arena> {
@@ -128,22 +127,24 @@ impl<'arena> DuckDBBytes<'arena> {
             return Ok(());
         }
 
-        let mut pointer = DuckDBV2BytesPointer {
-            length,
-            prefix: Default::default(),
-            ptr: arena()?.allocate(length as usize)?.cast(),
-        };
-        // SAFETY: the allocation holds `length` bytes, and the prefix is a local of its size. The prefix
-        // comes from the parts rather than the fresh arena copy, for the reason above.
+        let ptr = arena()?.allocate(length as usize)?;
+        // SAFETY: the caller guarantees the slot, and the allocation holds `length` bytes. Each field is
+        // stored straight into the slot, the prefix from the parts rather than the fresh arena copy, for
+        // the reason above; the parts hold more than the 4 prefix bytes.
         unsafe {
-            copy_parts(parts, pointer.ptr.cast(), length as usize);
-            copy_parts(parts, pointer.prefix.as_mut_ptr().cast(), pointer.prefix.len());
-            slot.write(Self {
-                data: ffi::duckdb_v2_bytes {
-                    value: DuckDBV2BytesUnion { pointer },
-                },
-                _marker: PhantomData,
-            });
+            copy_parts(parts, ptr, length as usize);
+            let slot = slot.cast::<DuckDBV2BytesPointer>();
+            (&raw mut (*slot).length).write(length);
+            let prefix = (&raw mut (*slot).prefix).cast::<u8>();
+            match parts {
+                [first, ..] if first.as_ref().len() >= 4 => {
+                    prefix
+                        .cast::<[u8; 4]>()
+                        .write_unaligned(first.as_ref().as_ptr().cast::<[u8; 4]>().read_unaligned());
+                }
+                _ => copy_prefix(parts, prefix),
+            }
+            (&raw mut (*slot).ptr).write(ptr.cast());
         }
         Ok(())
     }
@@ -222,6 +223,25 @@ unsafe fn copy_short(value: &[u8], destination: *mut u8) {
     }
 }
 
+/// Copy the first 4 bytes of the concatenated `parts` byte by byte, without a `memcpy` call.
+///
+/// # Safety
+/// `destination` must be valid for writes of 4 bytes, and `parts` must hold at least as many.
+#[inline(always)]
+unsafe fn copy_prefix<P: AsRef<[u8]> + ?Sized>(parts: &[&P], destination: *mut u8) {
+    let mut offset = 0;
+    for part in parts {
+        for &byte in part.as_ref() {
+            if offset == 4 {
+                return;
+            }
+            // SAFETY: `offset < 4`, within the destination.
+            unsafe { destination.add(offset).write(byte) };
+            offset += 1;
+        }
+    }
+}
+
 /// # Safety
 /// `destination` must be valid for writes of `limit` bytes, and `parts` must hold at least as many.
 #[inline(always)]
@@ -289,6 +309,9 @@ mod tests {
                 let raw = unsafe { std::mem::transmute_copy::<DuckDBBytes<'_>, [u8; 16]>(&encoded) };
                 if len <= ffi::DUCKDB_V2_BYTES_INLINE_LENGTH as usize {
                     assert!(raw[4 + len..].iter().all(|byte| *byte == 0), "length {len} padding");
+                } else {
+                    assert_eq!(raw[..4], (len as u32).to_ne_bytes(), "length {len}");
+                    assert_eq!(raw[4..8], source[..4], "length {len} prefix");
                 }
             }
             Ok(())
@@ -305,6 +328,8 @@ mod tests {
                 &[b"1234", b"", b"56789012"],
                 &[b"a", b"", b"bc", b"defghijklm"],
                 &[b"", b"a longer first part", b"", b"suffix"],
+                &[b"abcd", b"efghijklm"],
+                &[b"ab", b"", b"c", b"defghijklmnop"],
                 &[&[0xf0, 0x9f], &[0xa6, 0x86]],
                 &[&[0, 255], b"long binary payload", &[128]],
             ];
