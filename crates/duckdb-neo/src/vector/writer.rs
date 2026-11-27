@@ -747,7 +747,7 @@ impl<T: PlainNative> VectorWriter<'_, T> {
             let end = len.min(start + 64);
             let rows = u64::MAX >> (64 - (end - start));
             let input = valid(start, end) & rows;
-            let mut output = 0;
+            let mut output;
             if input == rows {
                 output = rows;
                 for index in start..end {
@@ -758,23 +758,24 @@ impl<T: PlainNative> VectorWriter<'_, T> {
                     }
                 }
             } else if propagate_nulls {
+                output = input;
                 let mut bits = input;
                 while bits != 0 {
                     let index = start + bits.trailing_zeros() as usize;
                     bits &= bits - 1;
-                    if let Some(value) = row(index, true)? {
+                    match row(index, true)? {
                         // SAFETY: as above.
-                        unsafe { data.add(index).write(value) };
-                        output |= 1 << (index - start);
+                        Some(value) => unsafe { data.add(index).write(value) },
+                        None => output &= !(1 << (index - start)),
                     }
                 }
             } else {
+                output = rows;
                 for index in start..end {
-                    let bit = 1 << (index - start);
-                    if let Some(value) = row(index, input & bit != 0)? {
+                    match row(index, input >> (index - start) & 1 != 0)? {
                         // SAFETY: as above.
-                        unsafe { data.add(index).write(value) };
-                        output |= bit;
+                        Some(value) => unsafe { data.add(index).write(value) },
+                        None => output &= !(1 << (index - start)),
                     }
                 }
             }
