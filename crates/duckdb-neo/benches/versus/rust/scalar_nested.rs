@@ -17,7 +17,7 @@ use duckdb_neo::{
     scalar::MicroScalar,
     signature::{FunctionParameter, SignatureBuilder},
     types::{Array, List, Map, Struct, UncheckedString},
-    vector::{CombinedVectorIterator, RowReader, RowWriter, Vector},
+    vector::{CombinedVectorIterator, RowReader, Vector},
 };
 
 #[derive(AsDuckDB)]
@@ -228,18 +228,10 @@ fn register_make_point(conn: &Connection) -> Result<()> {
         |_context, input, mut output: Vector<'_, Point>| {
             let [xs, ys] = input.get_vector_array_mut([0, 1])?;
             let (xs, ys) = (xs.cast::<f64>()?, ys.cast::<f64>()?);
-            let mut writer = output.row_writer()?;
-            for (row, (x, y)) in CombinedVectorIterator::new((xs.reader()?, ys.reader()?))?.enumerate() {
-                match (x, y) {
-                    // Rows start valid, so writing the fields is enough.
-                    (Some(x), Some(y)) => {
-                        writer.x.set(row, x)?;
-                        writer.y.set(row, y)?;
-                    }
-                    _ => writer.set_null(row)?,
-                }
-            }
-            Ok(())
+            let points = CombinedVectorIterator::new((xs.reader()?, ys.reader()?))?;
+            output
+                .struct_fields_writer()?
+                .write_from(points.map(|(x, y)| Some((*x?, *y?))))
         },
     )
     .register(conn)

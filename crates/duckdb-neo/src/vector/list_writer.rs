@@ -1,12 +1,10 @@
 use std::{borrow::Borrow, ptr::NonNull};
 
 use super::{
-    Elements, NativeElement, PlainNative, ReadableNativeElement, RowLayout, RowWriter, Unknown, Vector, VectorReader,
-    VectorWriter, WithWriter, WritableNativeElement, out_of_bounds,
+    Elements, NativeElement, PlainFields, PlainNative, ReadableNativeElement, RowLayout, RowWriter, Unknown, Vector,
+    VectorReader, VectorWriter, WithWriter, WritableNativeElement, out_of_bounds, struct_fields::field_count_mismatch,
 };
-use crate::{
-    Result, data_chunk::VectorCollection, error::Error, logical_type::LogicalTypeID, types::List, types::ListIndex,
-};
+use crate::{Result, error::Error, logical_type::LogicalTypeID, types::List, types::ListIndex};
 
 /// Writes `LIST` rows into a writable flat vector whose element child is already sized.
 ///
@@ -666,124 +664,6 @@ impl<T: NativeElement> Drop for FinishList<'_, T> {
     fn drop(&mut self) {
         let _ = self.0.finish();
     }
-}
-
-/// Plain field types of a `STRUCT`, in order, as a tuple such as `(f64, f64)`, for [`StructListAppender`].
-pub trait PlainFields: sealed::Sealed + Copy {
-    #[doc(hidden)]
-    type Writers<'w>;
-    #[doc(hidden)]
-    type Columns: Copy;
-
-    /// Prepare one writer per field, failing unless the fields are exactly `Self`'s types, with `len` rows each.
-    ///
-    /// # Safety
-    /// `fields` must be the children of a flat, writable `STRUCT` vector, exclusively borrowed for `'w`.
-    #[doc(hidden)]
-    unsafe fn writers<'w>(fields: &mut VectorCollection, len: usize) -> Result<Self::Writers<'w>>;
-
-    /// Reacquire every field's buffers, failing unless each has `len` rows.
-    #[doc(hidden)]
-    fn refresh(writers: &mut Self::Writers<'_>, len: usize) -> Result<()>;
-
-    #[doc(hidden)]
-    fn columns(writers: &mut Self::Writers<'_>) -> Self::Columns;
-
-    /// # Safety
-    /// `end` must not exceed any field's length, and the rows must be written before anything reads them.
-    #[doc(hidden)]
-    unsafe fn mark_valid_range(writers: &mut Self::Writers<'_>, start: usize, end: usize);
-
-    /// # Safety
-    /// `index` must be a row of every column.
-    #[doc(hidden)]
-    unsafe fn write(columns: Self::Columns, index: usize, value: Self);
-
-    /// # Safety
-    /// `start..end` must be rows of every column.
-    #[doc(hidden)]
-    unsafe fn zero(columns: Self::Columns, start: usize, end: usize);
-}
-
-mod sealed {
-    pub trait Sealed {}
-}
-
-macro_rules! plain_fields {
-    ($($field:ident $index:tt),+) => {
-        impl<$($field: PlainNative + 'static),+> sealed::Sealed for ($($field,)+) {}
-
-        impl<$($field: PlainNative + 'static),+> PlainFields for ($($field,)+) {
-            type Writers<'w> = ($(VectorWriter<'w, $field>,)+);
-            type Columns = ($(*mut $field,)+);
-
-            unsafe fn writers<'w>(fields: &mut VectorCollection, len: usize) -> Result<Self::Writers<'w>> {
-                let mut children = fields.cached_iter_mut()?;
-                let writers = ($({
-                    let child = children.next().ok_or_else(|| field_count_mismatch($index))?;
-                    child.validate_as::<$field>()?;
-                    // SAFETY: the caller guarantees an exclusive borrow of the STRUCT, whose field wrappers outlive the
-                    // writer; the child was just validated as the field's type.
-                    unsafe { VectorWriter::from_raw(NonNull::from(child).cast::<Vector<'w, $field>>())? }
-                },)+);
-                if children.next().is_some() {
-                    return Err(field_count_mismatch([$($index),+].len()));
-                }
-                $(check_field_len(writers.$index.len(), len)?;)+
-                Ok(writers)
-            }
-
-            fn refresh(writers: &mut Self::Writers<'_>, len: usize) -> Result<()> {
-                $(
-                    writers.$index.refresh_all()?;
-                    check_field_len(writers.$index.len(), len)?;
-                )+
-                Ok(())
-            }
-
-            #[inline(always)]
-            fn columns(writers: &mut Self::Writers<'_>) -> Self::Columns {
-                ($(writers.$index.as_mut_ptr().cast::<$field>(),)+)
-            }
-
-            unsafe fn mark_valid_range(writers: &mut Self::Writers<'_>, start: usize, end: usize) {
-                // SAFETY: the caller guarantees the rows are in bounds and written before any read.
-                unsafe { $(writers.$index.mark_valid_range(start, end);)+ }
-            }
-
-            #[inline(always)]
-            unsafe fn write(columns: Self::Columns, index: usize, value: Self) {
-                // SAFETY: the caller guarantees the row is in bounds, and each column holds slots of its field's type.
-                unsafe { $(columns.$index.add(index).write(value.$index);)+ }
-            }
-
-            unsafe fn zero(columns: Self::Columns, start: usize, end: usize) {
-                // SAFETY: the caller guarantees the rows are in bounds; zero bytes are a valid `PlainNative` value.
-                unsafe { $(columns.$index.add(start).write_bytes(0, end - start);)+ }
-            }
-        }
-    };
-}
-
-plain_fields!(A 0);
-plain_fields!(A 0, B 1);
-plain_fields!(A 0, B 1, C 2);
-plain_fields!(A 0, B 1, C 2, D 3);
-plain_fields!(A 0, B 1, C 2, D 3, E 4);
-plain_fields!(A 0, B 1, C 2, D 3, E 4, G 5);
-
-fn check_field_len(field: usize, len: usize) -> Result<()> {
-    if field != len {
-        return Err(Error::invalid_input(format!(
-            "a STRUCT field has {field} rows, not the STRUCT's {len}"
-        )));
-    }
-    Ok(())
-}
-
-#[cold]
-fn field_count_mismatch(fields: usize) -> Error {
-    Error::invalid_input(format!("the STRUCT elements do not have exactly {fields} fields"))
 }
 
 /// Writes `LIST` rows of `STRUCT` elements whose fields are the plain types `F`, borrowed by

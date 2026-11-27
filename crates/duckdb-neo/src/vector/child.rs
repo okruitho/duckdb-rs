@@ -1,8 +1,8 @@
 use std::ops::Deref;
 
 use super::{
-    ArrayWriter, ListAppender, ListWriter, MapWriter, NativeElement, PlainFields, StructListAppender, UnionWriter,
-    UnionWriters, Unknown, Vector, VectorWriter, WithWriter,
+    ArrayWriter, ListAppender, ListWriter, MapWriter, NativeElement, PlainFields, StructFieldsWriter,
+    StructListAppender, UnionWriter, UnionWriters, Unknown, Vector, VectorWriter, WithWriter,
 };
 use crate::{
     Result,
@@ -104,6 +104,13 @@ impl<T: NativeElement> ChildVector<'_, T> {
     /// See [`Vector::union_writer`].
     pub fn union_writer<'w, M: UnionWriters + 'w>(&'w mut self) -> Result<UnionWriter<'w, M>> {
         self.0.union_writer()
+    }
+}
+
+impl<T: NativeElement> ChildVector<'_, T> {
+    /// See [`Vector::struct_fields_writer`]; it keeps every row of this vector.
+    pub fn struct_fields_writer<F: PlainFields>(&mut self) -> Result<StructFieldsWriter<'_, F>> {
+        self.0.struct_fields_writer()
     }
 }
 
