@@ -125,15 +125,15 @@ unsafe impl WritableNativeElement for rust_decimal::Decimal {
             width,
             scale,
         };
-        decimal
-            .check()
-            .map_err(|_| Error::invalid_input(format!("{value} does not fit DECIMAL({width}, {scale})")))?;
-        // SAFETY: The caller guarantees a writable row; the storage integer matches its width.
+        let unfit = || Error::invalid_input(format!("{value} does not fit DECIMAL({width}, {scale})"));
+        decimal.check().map_err(|_| unfit())?;
+        // SAFETY: The caller guarantees a writable row; the storage integer matches its width, and every `Ok`
+        // writes the whole slot.
         unsafe {
             match width {
-                1..=4 => vector.write_internal(index, decimal.to_primitive::<i16>()),
-                5..=9 => vector.write_internal(index, decimal.to_primitive::<i32>()),
-                10..=18 => vector.write_internal(index, decimal.to_primitive::<i64>()),
+                1..=4 => vector.write_internal(index, Some(decimal.to_primitive::<i16>().ok_or_else(unfit)?)),
+                5..=9 => vector.write_internal(index, Some(decimal.to_primitive::<i32>().ok_or_else(unfit)?)),
+                10..=18 => vector.write_internal(index, Some(decimal.to_primitive::<i64>().ok_or_else(unfit)?)),
                 _ => vector.write_internal(index, Some(HugeDecimal(decimal.value))),
             }
         }

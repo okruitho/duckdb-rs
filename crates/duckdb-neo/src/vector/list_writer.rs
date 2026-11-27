@@ -315,9 +315,12 @@ impl<T: NativeElement> Vector<'_, List<T>> {
         Ok(value)
     }
 
-    /// Return the number of elements in the child.
+    /// Return the number of elements in the child; fails if the vector has none, e.g. after [`Vector::make_sequence`].
     pub fn child_len(&self) -> Result<usize> {
-        self.list_child_len()
+        let children = self
+            .children()
+            .ok_or_else(|| Error::invalid_input("the LIST vector has no element child"))?;
+        Ok(children.get_untyped_vector_at(0)?.len())
     }
 }
 
@@ -392,7 +395,6 @@ impl<'w, T: NativeElement> ListAppender<'w, T> {
         self.claim(additional).map(|_| ())
     }
 
-    /// Make room for `count` more elements, returning where they start.
     #[inline(always)]
     fn claim(&mut self, count: usize) -> Result<usize> {
         let start = self.used;
@@ -412,10 +414,20 @@ impl<'w, T: NativeElement> ListAppender<'w, T> {
         // SAFETY: elements from `used` are written before a row's entry covers them, and `finish` cuts the
         // child to `used` before anything can read the vector.
         let result = unsafe { self.elements.vector_mut().set_size_uninit(reserved) };
+        // A failed resize can still replace the buffers, so refresh either way; `reserved` moves only once the
+        // writer's pointers are current, which `finish` relies on.
+        if let Err(error) = self.elements.refresh_all() {
+            self.reserved = self.used;
+            // SAFETY: shrinking exposes no new elements.
+            if unsafe { self.elements.vector_mut().set_size_uninit(self.used) }.is_err() {
+                // Elements past `used` would be exposed uninitialized, behind stale pointers.
+                std::process::abort();
+            }
+            return Err(error);
+        }
         let old = self.reserved;
-        self.reserved = self.elements.vector().len();
-        self.elements.refresh_all()?;
-        // SAFETY: the new elements are in bounds; written ones hold values and NULL ones clear their bits.
+        self.reserved = self.elements.len();
+        // SAFETY: the new elements are in bounds, and are written before a row's entry covers them.
         unsafe { self.elements.mark_valid_range(old.min(self.reserved), self.reserved) };
         result
     }
@@ -438,19 +450,22 @@ impl<'w, T: NativeElement> ListAppender<'w, T> {
 
     /// Cut the child to the elements in use, or zero the others if that fails.
     fn finish(&mut self) -> Result<()> {
-        if self.used == self.reserved {
+        let (used, reserved) = (self.used, self.reserved);
+        if used == reserved {
             return Ok(());
         }
-        let used = self.used;
         self.reserved = used;
         // SAFETY: shrinking exposes no new elements.
         let result = unsafe { self.elements.vector_mut().set_size_uninit(used) };
         if result.is_err() {
-            let child = self.elements.vector_mut();
-            let len = child.len();
-            if child.init_rows(used, len).is_err() {
-                // Elements past `used` would stay uninitialized.
-                std::process::abort();
+            // SAFETY: elements `used..reserved` are in bounds of the buffer the writer holds, current since the last
+            // `grow`, which DuckDB only replaces when it grows; zero bytes are a valid value.
+            unsafe {
+                self.elements
+                    .as_mut_ptr()
+                    .cast::<u8>()
+                    .add(used * self.element_size)
+                    .write_bytes(0, (reserved - used) * self.element_size);
             }
         }
         result
@@ -470,16 +485,17 @@ impl<T: WritableNativeElement> ListAppender<'_, T> {
         self.check_row(row)?;
         let values = values.into_iter();
         let start = self.claim(values.size_hint().0)?;
-        let mut end = start;
+        let mut written = Remark {
+            appender: self,
+            start,
+            end: start,
+        };
         for value in values {
-            if let Err(error) = self.set_element(end, value) {
-                // Later rows expect unused elements to be marked valid.
-                // SAFETY: the elements are in bounds, and `finish` cuts them off unless a row overwrites them.
-                unsafe { self.elements.mark_valid_range(start, (end + 1).min(self.reserved)) };
-                return Err(error);
-            }
-            end += 1;
+            written.appender.set_element(written.end, value)?;
+            written.end += 1;
         }
+        let end = written.end;
+        std::mem::forget(written);
         // SAFETY: the row is in bounds, and the elements were just written.
         unsafe { self.commit(row, start, end - start) };
         Ok(())
@@ -490,7 +506,8 @@ impl<T: WritableNativeElement> ListAppender<'_, T> {
         if index == self.reserved {
             self.grow(index + 1)?;
         }
-        // SAFETY: the element is reserved, flat and writable; zero bytes are a valid value.
+        // SAFETY: the element is reserved, flat and writable; on `Ok`, `write` has initialized the whole slot, as
+        // `WritableNativeElement` requires, and zero bytes are a valid value.
         unsafe {
             match value {
                 Some(value) => T::write(&mut self.elements, index, value.borrow()),
@@ -548,6 +565,22 @@ impl<T: NativeElement> std::fmt::Debug for ListAppender<'_, T> {
             .field("len", &self.len())
             .field("child_len", &self.used)
             .finish()
+    }
+}
+
+/// Re-marks the elements of a row that failed or panicked valid, as later rows expect of unused elements.
+struct Remark<'a, 'w, T: NativeElement> {
+    appender: &'a mut ListAppender<'w, T>,
+    start: usize,
+    /// The element being written.
+    end: usize,
+}
+
+impl<T: NativeElement> Drop for Remark<'_, '_, T> {
+    fn drop(&mut self) {
+        let end = (self.end + 1).min(self.appender.reserved);
+        // SAFETY: the elements are in bounds and unused, so `finish` cuts them off unless a row overwrites them.
+        unsafe { self.appender.elements.mark_valid_range(self.start, end) };
     }
 }
 
@@ -889,6 +922,136 @@ mod tests {
         assert!(error.message.contains("cannot append"), "{error}");
         let mut structs = chunk.get_vector_at_mut::<List<Struct>>(1)?;
         assert!(structs.list_appender(|_| Ok(())).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn list_appender_remarks_elements_of_a_row_that_panicked() -> Result<()> {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let conn = connection()?;
+        let mut chunk = DataChunk::create(&conn, &[List::<i64>::logical_type(&conn)?], true)?;
+        let mut vector = chunk.get_vector_at_mut::<List<i64>>(0)?;
+        vector.set_size(2)?;
+        vector.list_appender(|lists| {
+            let values = [None::<i64>, None]
+                .into_iter()
+                .chain(std::iter::once_with(|| panic!("in the iterator")));
+            assert!(catch_unwind(AssertUnwindSafe(|| lists.set_elements(0, values))).is_err());
+            lists.set_slice(1, &[1, 2])
+        })?;
+        assert_eq!(rows(&vector)?, [Some(List(vec![])), Some(List(vec![Some(1), Some(2)]))]);
+        Ok(())
+    }
+
+    #[test]
+    fn list_appender_rewrites_rows() -> Result<()> {
+        let conn = connection()?;
+        let mut chunk = DataChunk::create(&conn, &[List::<String>::logical_type(&conn)?], true)?;
+        let mut vector = chunk.get_vector_at_mut::<List<String>>(0)?;
+        vector.set_size(3)?;
+        vector.list_appender(|lists| {
+            lists.set_elements(0, [Some("a"), None])?;
+            lists.set_null(0)?;
+            lists.set_elements(1, [Some("b")])?;
+            lists.set_elements(1, [None, Some("c")])?;
+            // An iterator whose lower bound over-reports only reserves more.
+            struct Overstated(std::vec::IntoIter<Option<&'static str>>);
+            impl Iterator for Overstated {
+                type Item = Option<&'static str>;
+                fn next(&mut self) -> Option<Self::Item> {
+                    self.0.next()
+                }
+                fn size_hint(&self) -> (usize, Option<usize>) {
+                    (1000, None)
+                }
+            }
+            lists.set_elements(2, Overstated(vec![Some("d")].into_iter()))
+        })?;
+        assert_eq!(vector.child_len()?, 6);
+        assert_eq!(
+            rows(&vector)?,
+            [
+                None,
+                Some(List(vec![None, Some("c".to_owned())])),
+                Some(List(vec![Some("d".to_owned())])),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn list_appender_keeps_string_rows_finished_before_a_panic() -> Result<()> {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let conn = connection()?;
+        let mut chunk = DataChunk::create(&conn, &[List::<String>::logical_type(&conn)?], true)?;
+        let mut vector = chunk.get_vector_at_mut::<List<String>>(0)?;
+        vector.set_size(2)?;
+        let long = "a string longer than the inline storage";
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            vector.list_appender(|lists| {
+                lists.set_elements(0, [Some(long), None])?;
+                let values = (0..100).map(|index| {
+                    if index == 70 {
+                        panic!("in the iterator")
+                    } else {
+                        Some(long)
+                    }
+                });
+                lists.set_elements(1, values)
+            })
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(vector.child_len()?, 2);
+        assert_eq!(
+            rows(&vector)?,
+            [Some(List(vec![Some(long.to_owned()), None])), Some(List(vec![]))]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn child_lists_use_the_appender() -> Result<()> {
+        use crate::{logical_type::LogicalType, types::Struct};
+        let conn = connection()?;
+        let types = [
+            LogicalType::from_text(&conn, "STRUCT(l INTEGER[])")?,
+            List::<List<i32>>::logical_type(&conn)?,
+        ];
+        let mut chunk = DataChunk::create(&conn, &types, true)?;
+        let mut structs = chunk.get_vector_at_mut::<Struct>(0)?;
+        structs.set_size(2)?;
+        structs
+            .children_mut()
+            .unwrap()
+            .get_vector_at_mut::<List<i32>>(0)?
+            .list_appender(|lists| {
+                lists.set_slice(0, &[1, 2])?;
+                lists.set_null(1)
+            })?;
+        assert_eq!(structs.get_value_slow(0)?.dbg_string()?, "{'l': [1, 2]}");
+        assert_eq!(structs.get_value_slow(1)?.dbg_string()?, "{'l': NULL}");
+        let mut nested = chunk.get_vector_at_mut::<List<List<i32>>>(1)?;
+        nested.set_size(1)?;
+        nested.set_child_size(2)?;
+        nested
+            .children_mut()
+            .unwrap()
+            .get_vector_at_mut::<List<i32>>(0)?
+            .list_appender(|inner| {
+                inner.set_with(0, 3, |index| index as i32)?;
+                inner.set_elements(1, [None, Some(7)])
+            })?;
+        nested.list_writer()?.set_entry(0, ListIndex::new(0, 2))?;
+        assert_eq!(nested.get_value_slow(0)?.dbg_string()?, "[[0, 1, 2], [NULL, 7]]");
+        Ok(())
+    }
+
+    #[test]
+    fn child_len_fails_without_a_child() -> Result<()> {
+        let conn = connection()?;
+        let mut chunk = DataChunk::create(&conn, &[List::<i32>::logical_type(&conn)?], true)?;
+        let sequence = chunk.get_vector_at_mut::<List<i32>>(0)?.make_sequence(0, 1, 3)?;
+        assert!(sequence.child_len().is_err());
         Ok(())
     }
 }

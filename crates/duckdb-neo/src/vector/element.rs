@@ -186,6 +186,9 @@ pub unsafe trait HasDuckDBBytes: NativeElement {}
 /// `write` must only write valid values of the vector's logical type, since
 /// DuckDB and the readers trust what is stored. It may rely on the layout checked
 /// by [`NativeElement::validate`], but must enforce value-dependent constraints.
+///
+/// When `write` returns `Ok`, it must have initialized the row's whole slot: appending writers such as
+/// [`Vector::append`](crate::vector::Vector::append) call it on uninitialized rows.
 pub unsafe trait WritableNativeElement: NativeElement {
     /// The borrowed input for one row, such as `Self`, `str`, or `[u8]`.
     type Write: ?Sized;

@@ -409,7 +409,8 @@ impl<T: NativeElement> VectorWriter<'_, T> {
     /// Mark rows `start..end` valid, a whole word at a time where possible.
     ///
     /// # Safety
-    /// `end` must not exceed [`Self::len`], and the rows must hold initialized values.
+    /// `end` must not exceed [`Self::len`], and the rows must hold initialized values or be written before
+    /// anything reads them.
     pub(crate) unsafe fn mark_valid_range(&mut self, start: usize, end: usize) {
         if start >= end || self.validity.is_null() {
             return;

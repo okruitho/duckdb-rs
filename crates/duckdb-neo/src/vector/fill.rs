@@ -1,10 +1,14 @@
 //! Appending rows in order, so a vector is sized without initializing rows that are written anyway.
 
 use super::{
-    NativeElement, PlainNative, StorageKind, StrBuffer, Vector, VectorWriter, WritableNativeElement, not_flat,
-    not_writable,
+    BytesBuffer, NativeElement, PlainNative, StorageKind, StrBuffer, Vector, VectorWriter, WritableNativeElement,
+    not_flat, not_writable,
 };
-use crate::{Result, error::Error};
+use crate::{
+    Result,
+    error::Error,
+    types::{BlobValue, UncheckedString},
+};
 
 /// Pushes rows, in order, onto a vector borrowed by [`Vector::append`].
 ///
@@ -78,8 +82,11 @@ impl<T: NativeElement> Vector<'_, T> {
         let writer = match VectorWriter::new(self) {
             Ok(writer) => writer,
             Err(error) => {
-                let len = self.len();
-                self.init_rows(start, len)?;
+                // SAFETY: shrinking exposes no new rows.
+                if unsafe { self.set_size_uninit(start) }.is_err() {
+                    let len = self.len();
+                    self.init_rows(start, len)?;
+                }
                 return Err(error);
             }
         };
@@ -102,7 +109,8 @@ impl<T: WritableNativeElement> VectorAppender<'_, T> {
     #[inline(always)]
     pub fn push(&mut self, value: &T::Write) -> Result<()> {
         let row = self.claim()?;
-        // SAFETY: the row is in bounds of the sized, flat and writable vector; it is marked valid already.
+        // SAFETY: the row is in bounds of the sized, flat and writable vector, and marked valid already; on
+        // `Ok`, `write` has initialized the whole slot, as `WritableNativeElement` requires.
         unsafe { T::write(&mut self.writer, row, value)? };
         self.next = row + 1;
         Ok(())
@@ -159,7 +167,7 @@ impl<T: PlainNative> VectorAppender<'_, T> {
         let (data, start) = (self.writer.as_mut_ptr().cast::<T>(), self.next);
         for index in 0..count {
             // SAFETY: the rows are in bounds, `T` is the slot type, and the rows are marked valid already. If `f`
-            // panics, `next` has not moved, so `finish` zeroes the rows written so far again.
+            // panics, `next` has not moved, so `finish` cuts these rows off.
             unsafe { data.add(start + index).write(f(index)) };
         }
         self.next = start + count;
@@ -167,16 +175,23 @@ impl<T: PlainNative> VectorAppender<'_, T> {
     }
 }
 
-impl VectorAppender<'_, String> {
-    /// Push a row whose text `fill` builds in place, as with [`VectorWriter::<String>::set_with`].
-    #[inline(always)]
-    pub fn push_with(&mut self, capacity: usize, fill: impl FnOnce(&mut StrBuffer<'_>) -> Result<()>) -> Result<()> {
-        let row = self.claim()?;
-        self.writer.set_with(row, capacity, fill)?;
-        self.next = row + 1;
-        Ok(())
-    }
+macro_rules! push_with {
+    ($($type:ty => $buffer:ident),* $(,)?) => {$(
+        impl VectorAppender<'_, $type> {
+            /// Push a row whose bytes `fill` builds in place, as with [`VectorWriter::<String>::set_with`]; fails, pushing
+            /// nothing, when the vector is full or `fill` fails.
+            #[inline(always)]
+            pub fn push_with(&mut self, capacity: usize, fill: impl FnOnce(&mut $buffer<'_>) -> Result<()>) -> Result<()> {
+                let row = self.claim()?;
+                self.writer.set_with(row, capacity, fill)?;
+                self.next = row + 1;
+                Ok(())
+            }
+        }
+    )*};
 }
+
+push_with!(String => StrBuffer, UncheckedString => StrBuffer, BlobValue => BytesBuffer);
 
 impl<T: NativeElement> VectorAppender<'_, T> {
     /// Return how many more rows fit.
@@ -192,24 +207,27 @@ impl<T: NativeElement> VectorAppender<'_, T> {
         Ok(self.next)
     }
 
-    /// Zero the rows not pushed, then cut the vector to the rows pushed.
+    /// Cut the vector to the rows pushed, or zero the others if that fails.
     fn finish(&mut self) -> Result<()> {
-        if self.next == self.end {
+        let (next, end) = (self.next, self.end);
+        if next == end {
             return Ok(());
         }
-        // SAFETY: rows `next..end` are in bounds, and zero bytes are a valid value, so the vector is fully
-        // initialized even when the resize below fails.
-        unsafe {
-            self.writer
-                .as_mut_ptr()
-                .cast::<u8>()
-                .add(self.next * self.row_size)
-                .write_bytes(0, (self.end - self.next) * self.row_size);
-        }
-        let end = self.next;
-        self.end = end;
+        self.end = next;
         // SAFETY: shrinking exposes no new rows.
-        unsafe { self.writer.vector_mut().set_size_uninit(end) }
+        let result = unsafe { self.writer.vector_mut().set_size_uninit(next) };
+        if result.is_err() {
+            // SAFETY: rows `next..end` are in bounds of the buffer, which DuckDB only replaces when it grows, and
+            // zero bytes are a valid value.
+            unsafe {
+                self.writer
+                    .as_mut_ptr()
+                    .cast::<u8>()
+                    .add(next * self.row_size)
+                    .write_bytes(0, (end - next) * self.row_size);
+            }
+        }
+        result
     }
 }
 
@@ -389,6 +407,81 @@ mod tests {
             .get_vector_at_mut::<i32>(2)?
             .make_constant(42_i32.value(&conn)?, 1)?;
         assert!(constant.append(1, |rows| rows.push(&1)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn append_refuses_types_without_a_zeroed_value() -> Result<()> {
+        let conn = connection()?;
+        for name in ["VARIANT", "BIT", "BIGNUM"] {
+            let mut chunk = DataChunk::create(&conn, &[LogicalType::from_text(&conn, name)?], true)?;
+            let mut vector = chunk.get_vector_at_mut::<crate::vector::Unknown>(0)?;
+            let error = vector.append(1, |_| Ok(())).unwrap_err();
+            assert!(error.message.contains("cannot append"), "{name}: {error}");
+            assert_eq!(vector.len(), 0, "{name}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn append_allocates_the_mask_on_a_late_first_null() -> Result<()> {
+        let conn = connection()?;
+        let mut chunk = chunk::<i64>(&conn)?;
+        let mut vector = chunk.get_vector_at_mut::<i64>(0)?;
+        vector.append(5000, |rows| {
+            rows.extend_with(2100, |index| index as i64)?;
+            rows.push_null()?;
+            for index in 2101..4000 {
+                rows.push_option((index % 3 != 0).then_some(&(index as i64)))?;
+            }
+            Ok(())
+        })?;
+        let read = vector.reader()?.iter().map(|value| value.copied()).collect::<Vec<_>>();
+        assert_eq!(read.len(), 4000);
+        for (index, value) in read.into_iter().enumerate() {
+            let expected = (index < 2100 || (index > 2100 && index % 3 != 0)).then_some(index as i64);
+            assert_eq!(value, expected, "row {index}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn append_builds_strings_and_blobs_in_place() -> Result<()> {
+        use crate::types::{BlobValue, UncheckedString};
+        let conn = connection()?;
+        let types = [
+            UncheckedString::logical_type(&conn)?,
+            BlobValue::logical_type(&conn)?,
+            String::logical_type(&conn)?,
+        ];
+        let mut chunk = DataChunk::create(&conn, &types, true)?;
+        let mut texts = chunk.get_vector_at_mut::<UncheckedString>(0)?;
+        texts.append(2, |rows| {
+            rows.push_with(LONG.len(), |text| text.push_str(LONG))?;
+            rows.push_with(2, |text| text.push_str("ab"))
+        })?;
+        assert_eq!(texts.reader()?.iter().collect::<Vec<_>>(), [Some(LONG), Some("ab")]);
+        let mut blobs = chunk.get_vector_at_mut::<BlobValue>(1)?;
+        blobs.append(2, |rows| {
+            rows.push_with(3, |bytes| bytes.extend_from_slice(&[0, 1, 2]))?;
+            rows.push_null()
+        })?;
+        assert_eq!(
+            blobs.reader()?.iter().collect::<Vec<_>>(),
+            [Some(&[0_u8, 1, 2][..]), None]
+        );
+        let mut strings = chunk.get_vector_at_mut::<String>(2)?;
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            strings.append(3, |rows| {
+                rows.push_with(5, |text| text.push_str("first"))?;
+                rows.push_with(LONG.len(), |text| {
+                    text.push_str(LONG)?;
+                    panic!("in the fill")
+                })
+            })
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(strings.reader()?.iter().collect::<Vec<_>>(), [Some("first")]);
         Ok(())
     }
 }
