@@ -2,9 +2,10 @@ use std::{borrow::Borrow, ptr::NonNull};
 
 use super::{
     Elements, NativeElement, PlainFields, PlainNative, ReadableNativeElement, RowLayout, RowWriter, Unknown, Vector,
-    VectorReader, VectorWriter, WithWriter, WritableNativeElement, out_of_bounds, struct_fields::field_count_mismatch,
+    VectorReader, VectorWriter, WithWriter, WritableNativeElement, out_of_bounds,
+    struct_fields::{field_count_mismatch, is_struct},
 };
-use crate::{Result, error::Error, logical_type::LogicalTypeID, types::List, types::ListIndex};
+use crate::{Result, error::Error, types::List, types::ListIndex};
 
 /// Writes `LIST` rows into a writable flat vector whose element child is already sized.
 ///
@@ -407,6 +408,7 @@ impl<'w, T: NativeElement> ListAppender<'w, T> {
         Ok(start)
     }
 
+    /// Mirrors `StructListAppender::grow`; keep both in step.
     #[cold]
     #[inline(never)]
     fn grow(&mut self, end: usize) -> Result<()> {
@@ -449,6 +451,7 @@ impl<'w, T: NativeElement> ListAppender<'w, T> {
     }
 
     /// Cut the child to the elements in use, or zero the others if that fails.
+    /// Mirrors `StructListAppender::finish`; keep both in step.
     fn finish(&mut self) -> Result<()> {
         let (used, reserved) = (self.used, self.reserved);
         if used == reserved {
@@ -591,6 +594,18 @@ impl<T: PlainNative> ListAppender<'_, T> {
         elements: Elements<'_, VectorReader<'a, I>>,
         mut f: impl FnMut(I::Ref<'a>) -> T,
     ) -> Result<()> {
+        self.try_map_elements(row, elements, |value| Ok(f(value)))
+    }
+
+    /// As [`Self::map_elements`] with a fallible `f`, returning its first error and leaving the row and the child's
+    /// elements in use unchanged.
+    #[inline]
+    pub fn try_map_elements<'a, I: ReadableNativeElement + 'a>(
+        &mut self,
+        row: usize,
+        elements: Elements<'_, VectorReader<'a, I>>,
+        mut f: impl FnMut(I::Ref<'a>) -> Result<T>,
+    ) -> Result<()> {
         self.check_row(row)?;
         let (reader, rows) = elements.child_rows();
         let count = rows.len();
@@ -600,9 +615,9 @@ impl<T: PlainNative> ListAppender<'_, T> {
         if matches!(layout, RowLayout::Flat { validity } if validity.is_null()) {
             for (index, source) in rows.enumerate() {
                 // SAFETY: `source` is a valid flat row of the reader, its own slot; the element is reserved and
-                // marked valid, and `T` is the slot type. If `f` panics, `used` has not moved, so `finish` cuts
-                // these elements off.
-                unsafe { data.add(start + index).write(f(I::get(reader, source, source))) };
+                // marked valid, and `T` is the slot type. If `f` fails or panics, `used` has not moved, so `finish`
+                // cuts these elements off.
+                unsafe { data.add(start + index).write(f(I::get(reader, source, source))?) };
             }
         } else {
             let written = Remark {
@@ -612,11 +627,11 @@ impl<T: PlainNative> ListAppender<'_, T> {
             };
             for (index, source) in rows.enumerate() {
                 // SAFETY: `source` is a row of the reader, read only when valid at its physical slot; the element
-                // is reserved, and zero bytes are a valid `T`, as `PlainNative` requires. If `f` panics or the
-                // mask fails, `written` re-marks the elements valid and `finish` cuts them off.
+                // is reserved, and zero bytes are a valid `T`, as `PlainNative` requires. If `f` or the mask fails, or
+                // `f` panics, `written` re-marks the elements valid and `finish` cuts them off.
                 unsafe {
                     match layout.valid_physical(source) {
-                        Some(physical) => data.add(start + index).write(f(I::get(reader, physical, source))),
+                        Some(physical) => data.add(start + index).write(f(I::get(reader, physical, source))?),
                         None => {
                             data.add(start + index).write_bytes(0, 1);
                             written.appender.elements.mark_null_unchecked(start + index)?;
@@ -670,7 +685,9 @@ impl<T: NativeElement> Drop for FinishList<'_, T> {
 /// [`Vector::struct_list_appender`].
 ///
 /// Like a [`ListAppender`], it grows the element child as rows are written, without initializing elements first,
-/// and ends with exactly the elements of the rows written. Each element is a tuple of its non-NULL fields:
+/// and ends with exactly the elements of the rows written. Each element is a tuple of its non-NULL fields, which
+/// match by position and type, not by name. For NULL elements or fields, size the child with
+/// [`Vector::set_child_size`] and write through a [`ListWriter`] instead.
 ///
 /// ```
 /// # use duckdb_neo::{DuckDBType, Result, data_chunk::DataChunk, environment::{Environment, StorageLocation}, logical_type::LogicalType, types::{List, Struct}};
@@ -704,7 +721,7 @@ impl<T: NativeElement> Vector<'_, List<T>> {
     /// Write rows through a [`StructListAppender`] in `f`, appending their `STRUCT` elements after the child's.
     ///
     /// Size the rows first. The child ends with the elements of the rows written, also when `f` fails or
-    /// panics. Fails unless the elements are `STRUCT`s whose fields are exactly `F`'s types.
+    /// panics. Fails unless the elements are `STRUCT`s or `TUPLE`s whose fields are exactly `F`'s types, in order.
     pub fn struct_list_appender<F: PlainFields, R>(
         &mut self,
         f: impl FnOnce(&mut StructListAppender<'_, F>) -> Result<R>,
@@ -733,7 +750,7 @@ impl<'w, F: PlainFields> StructListAppender<'w, F> {
             .transpose()?
             .and_then(|mut children| children.next())
             .ok_or_else(|| Error::invalid_input("the LIST vector has no element child"))?;
-        if child.logical_type().id()? != LogicalTypeID::Struct {
+        if !is_struct(child.logical_type().id()?) {
             return Err(Error::invalid_input(format!(
                 "{} elements are not a STRUCT",
                 child.logical_type()
@@ -744,12 +761,12 @@ impl<'w, F: PlainFields> StructListAppender<'w, F> {
         // SAFETY: the appender keeps `vector` exclusively borrowed and only touches its child through `structs` and
         // the field writers, which `F::writers` checks; resizing the child keeps the parent's and fields' wrappers.
         let (parent, structs, mut fields) = unsafe {
+            let (parent, structs) = (VectorWriter::from_raw(vector)?, VectorWriter::from_raw(child)?);
             let fields = child
                 .as_mut()
                 .children_collection_mut()
-                .ok_or_else(|| field_count_mismatch(0))?;
-            let fields = F::writers(fields, len)?;
-            (VectorWriter::from_raw(vector)?, VectorWriter::from_raw(child)?, fields)
+                .ok_or_else(|| field_count_mismatch(F::FIELDS))?;
+            (parent, structs, F::writers(fields, len)?)
         };
         let used = structs.len();
         Ok(FinishStructList(Self {
@@ -846,6 +863,7 @@ impl<'w, F: PlainFields> StructListAppender<'w, F> {
         Ok(start)
     }
 
+    /// Mirrors `ListAppender::grow`; keep both in step.
     #[cold]
     #[inline(never)]
     fn grow(&mut self, end: usize) -> Result<()> {
@@ -898,6 +916,7 @@ impl<'w, F: PlainFields> StructListAppender<'w, F> {
     }
 
     /// Cut the child to the elements in use, or zero the others' fields if that fails.
+    /// Mirrors `ListAppender::finish`; keep both in step.
     fn finish(&mut self) -> Result<()> {
         let (used, reserved) = (self.used, self.reserved);
         if used == reserved {
@@ -1703,6 +1722,13 @@ mod tests {
         let mut chunk = DataChunk::create(&conn, &types.into_iter().collect::<Result<Vec<_>>>()?, true)?;
         let mut vector = chunk.get_vector_at_mut::<List<Struct>>(0)?;
         vector.set_size(1)?;
+        let too_many = vector
+            .struct_list_appender(|_: &mut super::StructListAppender<'_, (f64, i32, i32)>| Ok(()))
+            .unwrap_err();
+        assert!(
+            too_many.message.contains("does not have exactly 3 fields"),
+            "{too_many}"
+        );
         for error in [
             vector.struct_list_appender(|_: &mut super::StructListAppender<'_, (f64,)>| Ok(())),
             vector.struct_list_appender(|_: &mut super::StructListAppender<'_, (f64, i32, i32)>| Ok(())),
@@ -1725,6 +1751,107 @@ mod tests {
                 "{error}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn struct_list_appender_revives_stale_nulls_past_the_child() -> Result<()> {
+        use crate::types::Struct;
+        let conn = connection()?;
+        let mut chunk = struct_lists(&conn, "STRUCT(x DOUBLE, n INTEGER)[]")?;
+        let mut vector = chunk.get_vector_at_mut::<List<Struct>>(0)?;
+        vector.set_size(1)?;
+        vector.set_child_size(100)?;
+        vector
+            .children_mut()
+            .unwrap()
+            .get_vector_at_mut::<Struct>(0)?
+            .struct_fields_writer::<(f64, i32)>()?
+            .set_null(70)?;
+        vector.set_child_size(0)?;
+        vector.struct_list_appender(|lists| lists.set_with(0, 100, |index| (index as f64, 1)))?;
+        let elements = vector.children().unwrap().get_vector_at::<Struct>(0)?;
+        let fields = elements.children().unwrap();
+        assert!(!elements.reader()?.is_null(70)?);
+        assert_eq!(fields.get_vector_at::<f64>(0)?.reader()?.get(70)?, Some(&70.0));
+        assert_eq!(fields.get_vector_at::<i32>(1)?.reader()?.get(70)?, Some(&1));
+        Ok(())
+    }
+
+    #[test]
+    fn struct_list_appender_handles_zero_rows_and_tuples() -> Result<()> {
+        use crate::types::Struct;
+        let conn = connection()?;
+        let tuples = <(f64, i32) as DuckDBType>::logical_type(&conn)?;
+        let types = [
+            crate::logical_type::LogicalType::from_text(&conn, "STRUCT(x DOUBLE, n INTEGER)[]")?,
+            List::<(f64, i32)>::logical_type(&conn)?,
+        ];
+        assert_eq!(tuples.id()?, crate::logical_type::LogicalTypeID::Tuple);
+        let mut chunk = DataChunk::create(&conn, &types, true)?;
+        let mut empty = chunk.get_vector_at_mut::<List<Struct>>(0)?;
+        empty.struct_list_appender(|lists: &mut super::StructListAppender<'_, (f64, i32)>| {
+            assert!(lists.is_empty());
+            assert!(lists.set_with(0, 1, |_| (1.0, 1)).is_err());
+            assert!(lists.set_null(0).is_err());
+            lists.reserve(10)
+        })?;
+        assert_eq!(empty.child_len()?, 0);
+        let mut lists = chunk.get_vector_at_mut::<List<Struct>>(1)?;
+        lists.set_size(1)?;
+        lists.struct_list_appender(|lists| lists.set_elements(0, [(1.5, 2), (2.5, 3)]))?;
+        assert_eq!(
+            lists.get_value_slow(0)?.get::<List<(Option<f64>, Option<i32>)>>()?,
+            Some(List(vec![Some((Some(1.5), Some(2))), Some((Some(2.5), Some(3)))]))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn try_map_elements_leaves_the_row_unchanged_on_error() -> Result<()> {
+        let conn = connection()?;
+        let chunk = conn
+            .query(
+                "SELECT [1, NULL, 3, NULL, 5]::BIGINT[], [6, 7, 8]::BIGINT[]",
+                crate::Parameters::None,
+            )?
+            .next_chunk()?
+            .unwrap();
+        let (with_nulls, without_nulls) = (
+            chunk.get_vector_at::<List<i64>>(0)?,
+            chunk.get_vector_at::<List<i64>>(1)?,
+        );
+        let (with_nulls, without_nulls) = (with_nulls.list_reader()?, without_nulls.list_reader()?);
+        let (with_nulls, without_nulls) = (with_nulls.get(0)?.unwrap(), without_nulls.get(0)?.unwrap());
+        let mut output = DataChunk::create(&conn, &[List::<i64>::logical_type(&conn)?], true)?;
+        let mut vector = output.get_vector_at_mut::<List<i64>>(0)?;
+        vector.set_size(2)?;
+        let fail_above = |limit: i64| {
+            move |value: &i64| {
+                if *value > limit {
+                    Err(crate::Error::invalid_input("too large"))
+                } else {
+                    Ok(*value)
+                }
+            }
+        };
+        vector.list_appender(|lists| {
+            for list in [with_nulls, without_nulls] {
+                let error = lists.try_map_elements(0, list, fail_above(3)).unwrap_err();
+                assert!(error.message.contains("too large"), "{error}");
+                assert_eq!(lists.child_len(), 0);
+            }
+            lists.try_map_elements(0, without_nulls, fail_above(10))?;
+            // The failed rows' NULL elements do not leak into this one.
+            lists.set_slice(1, &[9, 9, 9, 9, 9])
+        })?;
+        assert_eq!(
+            rows(&vector)?,
+            [
+                Some(List(vec![Some(6), Some(7), Some(8)])),
+                Some(List(vec![Some(9); 5]))
+            ]
+        );
         Ok(())
     }
 

@@ -391,7 +391,7 @@ impl<T: NativeElement> VectorWriter<'_, T> {
     }
 
     #[inline(always)]
-    fn allocated_validity(&mut self) -> Result<*mut u64> {
+    pub(crate) fn allocated_validity(&mut self) -> Result<*mut u64> {
         if self.validity.is_null() {
             self.allocate_validity()
         } else {
@@ -833,7 +833,7 @@ impl<T: NativeElement> VectorWriter<'_, T> {
     /// # Safety
     /// The word must be within the mask, and rows marked valid must hold initialized values.
     #[inline(always)]
-    unsafe fn store_validity_word(&mut self, word: usize, bits: u64, rows: u64) -> Result<()> {
+    pub(crate) unsafe fn store_validity_word(&mut self, word: usize, bits: u64, rows: u64) -> Result<()> {
         if bits == rows && self.validity.is_null() {
             return Ok(());
         }

@@ -7,16 +7,24 @@ use crate::{Result, data_chunk::VectorCollection, error::Error, logical_type::Lo
 
 /// Plain field types of a `STRUCT`, in order, as a tuple such as `(f64, f64)`, for [`StructFieldsWriter`] and
 /// [`StructListAppender`](super::StructListAppender).
-pub trait PlainFields: sealed::Sealed + Copy {
+///
+/// Fields match by position and type, not by name.
+///
+/// # Safety
+/// The writers trust these methods: `writers` and `refresh` must check every field's type and row count, and
+/// `columns` must return each field's data as slots of its type. The trait is sealed to the tuples below.
+pub unsafe trait PlainFields: sealed::Sealed + Copy {
     #[doc(hidden)]
     type Writers<'w>;
     #[doc(hidden)]
     type Columns: Copy;
+    #[doc(hidden)]
+    const FIELDS: usize;
 
     /// Prepare one writer per field, failing unless the fields are exactly `Self`'s types, with `len` rows each.
     ///
     /// # Safety
-    /// `fields` must be the children of a flat, writable `STRUCT` vector, exclusively borrowed for `'w`.
+    /// `fields` must be the children of a `STRUCT` vector, exclusively borrowed for `'w`.
     #[doc(hidden)]
     unsafe fn writers<'w>(fields: &mut VectorCollection, len: usize) -> Result<Self::Writers<'w>>;
 
@@ -47,6 +55,15 @@ pub trait PlainFields: sealed::Sealed + Copy {
     #[doc(hidden)]
     unsafe fn mark_null(writers: &mut Self::Writers<'_>, index: usize) -> Result<()>;
 
+    /// Allocate every field's validity mask, so that stores to it cannot fail.
+    #[doc(hidden)]
+    fn allocate_validity(writers: &mut Self::Writers<'_>) -> Result<()>;
+
+    /// # Safety
+    /// As for [`VectorWriter::store_validity_word`], for every field.
+    #[doc(hidden)]
+    unsafe fn store_validity_word(writers: &mut Self::Writers<'_>, word: usize, bits: u64, rows: u64) -> Result<()>;
+
     /// # Safety
     /// `start..end` must be rows of every column.
     #[doc(hidden)]
@@ -61,21 +78,24 @@ macro_rules! plain_fields {
     ($($field:ident $index:tt),+) => {
         impl<$($field: PlainNative + 'static),+> sealed::Sealed for ($($field,)+) {}
 
-        impl<$($field: PlainNative + 'static),+> PlainFields for ($($field,)+) {
+        // SAFETY: `writers` validates each field as its type and checks the row counts, as `refresh` does again, and
+        // `columns` returns each writer's data.
+        unsafe impl<$($field: PlainNative + 'static),+> PlainFields for ($($field,)+) {
             type Writers<'w> = ($(VectorWriter<'w, $field>,)+);
             type Columns = ($(*mut $field,)+);
+            const FIELDS: usize = [$($index),+].len();
 
             unsafe fn writers<'w>(fields: &mut VectorCollection, len: usize) -> Result<Self::Writers<'w>> {
                 let mut children = fields.cached_iter_mut()?;
                 let writers = ($({
-                    let child = children.next().ok_or_else(|| field_count_mismatch($index))?;
+                    let child = children.next().ok_or_else(|| field_count_mismatch(Self::FIELDS))?;
                     child.validate_as::<$field>()?;
                     // SAFETY: the caller guarantees an exclusive borrow of the STRUCT, whose field wrappers outlive the
                     // writer; the child was just validated as the field's type.
                     unsafe { VectorWriter::from_raw(NonNull::from(child).cast::<Vector<'w, $field>>())? }
                 },)+);
                 if children.next().is_some() {
-                    return Err(field_count_mismatch([$($index),+].len()));
+                    return Err(field_count_mismatch(Self::FIELDS));
                 }
                 $(check_field_len(writers.$index.len(), len)?;)+
                 Ok(writers)
@@ -118,6 +138,23 @@ macro_rules! plain_fields {
                 Ok(())
             }
 
+            fn allocate_validity(writers: &mut Self::Writers<'_>) -> Result<()> {
+                $(writers.$index.allocated_validity()?;)+
+                Ok(())
+            }
+
+            #[inline(always)]
+            unsafe fn store_validity_word(
+                writers: &mut Self::Writers<'_>,
+                word: usize,
+                bits: u64,
+                rows: u64,
+            ) -> Result<()> {
+                // SAFETY: the caller upholds the contract for every field.
+                unsafe { $(writers.$index.store_validity_word(word, bits, rows)?;)+ }
+                Ok(())
+            }
+
             unsafe fn zero(columns: Self::Columns, start: usize, end: usize) {
                 // SAFETY: the caller guarantees the rows are in bounds; zero bytes are a valid `PlainNative` value.
                 unsafe { $(columns.$index.add(start).write_bytes(0, end - start);)+ }
@@ -144,11 +181,18 @@ pub(super) fn check_field_len(field: usize, len: usize) -> Result<()> {
 
 #[cold]
 pub(super) fn field_count_mismatch(fields: usize) -> Error {
-    Error::invalid_input(format!("the STRUCT elements do not have exactly {fields} fields"))
+    Error::invalid_input(format!("the STRUCT does not have exactly {fields} fields"))
+}
+
+/// Whether vectors of this type are `STRUCT`s of their child vectors; `TUPLE` shares the layout.
+pub(super) fn is_struct(id: LogicalTypeID) -> bool {
+    matches!(id, LogicalTypeID::Struct | LogicalTypeID::Tuple)
 }
 
 /// Writes the rows of a `STRUCT` vector whose fields are the plain types `F`, each row as one tuple, borrowed by
 /// [`Vector::struct_fields_writer`].
+///
+/// Fields match by position and type, not by name: `(f64, f64)` writes `STRUCT(y DOUBLE, x DOUBLE)` with `y` first.
 ///
 /// ```
 /// # use duckdb_neo::{Result, data_chunk::DataChunk, environment::{Environment, StorageLocation}, logical_type::LogicalType, types::Struct};
@@ -174,9 +218,10 @@ pub struct StructFieldsWriter<'w, F: PlainFields> {
 }
 
 impl<T: NativeElement> Vector<'_, T> {
-    /// Prepare a [`StructFieldsWriter`]; fails unless this is a `STRUCT` whose fields are exactly `F`'s types.
+    /// Prepare a [`StructFieldsWriter`]; fails unless this is a writable `STRUCT` or `TUPLE` whose fields are
+    /// exactly `F`'s types, in order.
     pub fn struct_fields_writer<F: PlainFields>(&mut self) -> Result<StructFieldsWriter<'_, F>> {
-        if self.logical_type().id()? != LogicalTypeID::Struct {
+        if !is_struct(self.logical_type().id()?) {
             return Err(Error::invalid_input(format!("{} is not a STRUCT", self.logical_type())));
         }
         let len = self.len();
@@ -184,12 +229,12 @@ impl<T: NativeElement> Vector<'_, T> {
         // SAFETY: the exclusive borrow covers the writer, which touches the fields only through their own writers;
         // `F::writers` checks their types and sizes.
         let (rows, mut fields) = unsafe {
+            let rows = VectorWriter::from_raw(vector)?;
             let fields = vector
                 .as_mut()
                 .children_collection_mut()
-                .ok_or_else(|| field_count_mismatch(0))?;
-            let fields = F::writers(fields, len)?;
-            (VectorWriter::from_raw(vector)?, fields)
+                .ok_or_else(|| field_count_mismatch(F::FIELDS))?;
+            (rows, F::writers(fields, len)?)
         };
         Ok(StructFieldsWriter {
             rows,
@@ -249,11 +294,14 @@ impl<F: PlainFields> StructFieldsWriter<'_, F> {
     }
 
     /// Write the first rows from `values`, in one loop; `None` writes SQL NULL. Fails if there are more values
-    /// than rows, after writing the rows that fit.
+    /// than rows: before writing any when the iterator's size hint says so, else after writing the rows that fit.
     #[inline]
     pub fn write_from(&mut self, values: impl IntoIterator<Item = Option<F>>) -> Result<()> {
         let (len, columns) = (self.len(), self.columns);
         let mut values = values.into_iter();
+        if values.size_hint().0 > len {
+            return Err(out_of_bounds(len, len));
+        }
         let mut start = 0;
         while start < len {
             let end = len.min(start + 64);
@@ -280,7 +328,8 @@ impl<F: PlainFields> StructFieldsWriter<'_, F> {
         }
     }
 
-    /// Mark rows `start..end`, at most 64, valid where `bits` has bit `row - start` set and NULL elsewhere.
+    /// Mark rows `start..end`, at most 64 from a multiple of 64, valid where `bits` has bit `row - start` set and
+    /// NULL elsewhere. If it fails, every row keeps its validity.
     ///
     /// # Safety
     /// The rows must be in bounds, and the valid ones written.
@@ -290,19 +339,17 @@ impl<F: PlainFields> StructFieldsWriter<'_, F> {
             return Ok(());
         }
         let rows = u64::MAX >> (64 - (end - start));
-        // SAFETY: the caller guarantees the rows are in bounds and the valid ones written.
-        unsafe {
-            self.rows.mark_valid_range(start, end);
-            F::mark_valid_range(&mut self.fields, start, end);
-            let mut nulls = !bits & rows;
-            while nulls != 0 {
-                let row = start + nulls.trailing_zeros() as usize;
-                nulls &= nulls - 1;
-                self.rows.mark_null_unchecked(row)?;
-                F::mark_null(&mut self.fields, row)?;
-            }
+        if bits != rows {
+            self.rows.allocated_validity()?;
+            F::allocate_validity(&mut self.fields)?;
         }
-        Ok(())
+        // SAFETY: the caller guarantees the rows are in bounds of the STRUCT and of every field, which `F::writers`
+        // checked has as many rows, and that the valid ones were written. Every mask a NULL row needs exists, so
+        // these stores allocate nothing and cannot fail part way.
+        unsafe {
+            self.rows.store_validity_word(start / 64, bits, rows)?;
+            F::store_validity_word(&mut self.fields, start / 64, bits, rows)
+        }
     }
 }
 
@@ -434,15 +481,121 @@ mod tests {
         .map(|name| LogicalType::from_text(&conn, name));
         let mut chunk = DataChunk::create(&conn, &types.into_iter().collect::<Result<Vec<_>>>()?, true)?;
         let mut vector = chunk.get_vector_at_mut::<Struct>(0)?;
-        assert!(vector.struct_fields_writer::<(f64,)>().is_err());
-        assert!(vector.struct_fields_writer::<(f64, i32, i32)>().is_err());
+        let message = |error: crate::Error| error.message;
+        let too_few = message(vector.struct_fields_writer::<(f64,)>().unwrap_err());
+        assert!(too_few.contains("does not have exactly 1 fields"), "{too_few}");
+        let too_many = message(vector.struct_fields_writer::<(f64, i32, i32)>().unwrap_err());
+        assert!(too_many.contains("does not have exactly 3 fields"), "{too_many}");
         assert!(vector.struct_fields_writer::<(f64, i64)>().is_err());
         assert!(vector.struct_fields_writer::<(f64, i32)>().is_ok());
+        // A constant vector is not writable.
+        vector.set_size(1)?;
+        let value = vector.get_value_slow(0)?;
+        let mut constant = vector.make_constant(&value, 1)?;
+        assert!(constant.struct_fields_writer::<(f64, i32)>().is_err());
         for column in 1..4 {
             let mut vector = chunk.get_vector_at_mut::<crate::vector::Unknown>(column)?;
             assert!(vector.struct_fields_writer::<(f64,)>().is_err(), "column {column}");
             assert!(vector.struct_fields_writer::<(f64, i32)>().is_err(), "column {column}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn write_from_stores_each_validity_word_exactly() -> Result<()> {
+        let conn = connection()?;
+        let mut chunk = pairs(&conn)?;
+        let mut vector = chunk.get_vector_at_mut::<Struct>(0)?;
+        vector.set_size(200)?;
+        vector
+            .struct_fields_writer()?
+            .write_from((0..200).map(|row| Some((row as f64, 1))))?;
+        // Without NULLs no mask is allocated, so readers keep their all-valid paths.
+        let masks = |vector: &Vector<'_, Struct>| -> Result<[bool; 3]> {
+            let fields = vector.children().unwrap();
+            Ok([
+                vector.reader()?.validity().is_some(),
+                fields.get_vector_at::<f64>(0)?.reader()?.validity().is_some(),
+                fields.get_vector_at::<i32>(1)?.reader()?.validity().is_some(),
+            ])
+        };
+        assert_eq!(masks(&vector)?, [false; 3]);
+        let first = |row: usize| row.is_multiple_of(5);
+        vector
+            .struct_fields_writer()?
+            .write_from((0..200).map(|row| (!first(row)).then_some((row as f64, 2))))?;
+        assert_eq!(masks(&vector)?, [true; 3]);
+        // Rows NULL before become valid, and valid rows become NULL, in the STRUCT and in every field.
+        vector
+            .struct_fields_writer()?
+            .write_from((0..200).map(|row| first(row).then_some((row as f64, 3))))?;
+        let fields = vector.children().unwrap();
+        let (rows, xs, ns) = (
+            vector.reader()?,
+            fields.get_vector_at::<f64>(0)?,
+            fields.get_vector_at::<i32>(1)?,
+        );
+        let (xs, ns) = (xs.reader()?, ns.reader()?);
+        for row in 0..200 {
+            let valid = first(row);
+            assert_eq!(!rows.is_null(row)?, valid, "row {row}");
+            assert_eq!(xs.get(row)?.copied(), valid.then_some(row as f64), "row {row}");
+            assert_eq!(ns.get(row)?.copied(), valid.then_some(3), "row {row}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn struct_fields_writer_handles_zero_rows_six_fields_and_tuples() -> Result<()> {
+        let conn = connection()?;
+        let six = LogicalType::from_text(
+            &conn,
+            "STRUCT(a TINYINT, b SMALLINT, c INTEGER, d BIGINT, e FLOAT, f DOUBLE)",
+        )?;
+        let tuple = <(f64, i32) as crate::DuckDBType>::logical_type(&conn)?;
+        assert_eq!(tuple.id()?, crate::logical_type::LogicalTypeID::Tuple);
+        let mut chunk = DataChunk::create(&conn, &[six, tuple], true)?;
+        let mut empty = chunk.get_vector_at_mut::<Struct>(0)?;
+        {
+            let mut writer = empty.struct_fields_writer::<(i8, i16, i32, i64, f32, f64)>()?;
+            assert!(writer.is_empty());
+            writer.write_from(std::iter::empty())?;
+            assert!(writer.set(0, (1, 2, 3, 4, 5.0, 6.0)).is_err());
+            assert!(writer.set_null(0).is_err());
+            assert!(writer.write_from([None]).is_err());
+        }
+        empty.set_size(2)?;
+        empty
+            .struct_fields_writer()?
+            .write_from([Some((1_i8, 2_i16, 3_i32, 4_i64, 5.5_f32, 6.5_f64)), None])?;
+        assert_eq!(
+            empty.get_value_slow(0)?.dbg_string()?,
+            "{'a': 1, 'b': 2, 'c': 3, 'd': 4, 'e': 5.5, 'f': 6.5}"
+        );
+        assert_eq!(empty.get_value_slow(1)?.dbg_string()?, "NULL");
+        let mut tuples = chunk.get_vector_at_mut::<Struct>(1)?;
+        tuples.set_size(2)?;
+        tuples.struct_fields_writer()?.write_from([None, Some((1.5, 7))])?;
+        assert_eq!(tuples.get_value_slow(0)?.get::<(Option<f64>, Option<i32>)>()?, None);
+        assert_eq!(
+            tuples.get_value_slow(1)?.get::<(Option<f64>, Option<i32>)>()?,
+            Some((Some(1.5), Some(7)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn write_from_fails_before_writing_when_the_size_hint_is_too_long() -> Result<()> {
+        let conn = connection()?;
+        let mut chunk = pairs(&conn)?;
+        let mut vector = chunk.get_vector_at_mut::<Struct>(0)?;
+        vector.set_size(2)?;
+        let error = vector
+            .struct_fields_writer()?
+            .write_from([Some((1.0, 1)), Some((2.0, 2)), None])
+            .unwrap_err();
+        assert!(error.message.contains('2'), "{error}");
+        assert_eq!(read(&vector)?, ["{'x': 0.0, 'n': 0}", "{'x': 0.0, 'n': 0}"]);
         Ok(())
     }
 
