@@ -4,7 +4,9 @@ use super::{
     Elements, NativeElement, PlainNative, ReadableNativeElement, RowLayout, RowWriter, Unknown, Vector, VectorReader,
     VectorWriter, WithWriter, WritableNativeElement, out_of_bounds,
 };
-use crate::{Result, error::Error, types::List, types::ListIndex};
+use crate::{
+    Result, data_chunk::VectorCollection, error::Error, logical_type::LogicalTypeID, types::List, types::ListIndex,
+};
 
 /// Writes `LIST` rows into a writable flat vector whose element child is already sized.
 ///
@@ -666,6 +668,391 @@ impl<T: NativeElement> Drop for FinishList<'_, T> {
     }
 }
 
+/// Plain field types of a `STRUCT`, in order, as a tuple such as `(f64, f64)`, for [`StructListAppender`].
+pub trait PlainFields: sealed::Sealed + Copy {
+    #[doc(hidden)]
+    type Writers<'w>;
+    #[doc(hidden)]
+    type Columns: Copy;
+
+    /// Prepare one writer per field, failing unless the fields are exactly `Self`'s types, with `len` rows each.
+    ///
+    /// # Safety
+    /// `fields` must be the children of a flat, writable `STRUCT` vector, exclusively borrowed for `'w`.
+    #[doc(hidden)]
+    unsafe fn writers<'w>(fields: &mut VectorCollection, len: usize) -> Result<Self::Writers<'w>>;
+
+    /// Reacquire every field's buffers, failing unless each has `len` rows.
+    #[doc(hidden)]
+    fn refresh(writers: &mut Self::Writers<'_>, len: usize) -> Result<()>;
+
+    #[doc(hidden)]
+    fn columns(writers: &mut Self::Writers<'_>) -> Self::Columns;
+
+    /// # Safety
+    /// `end` must not exceed any field's length, and the rows must be written before anything reads them.
+    #[doc(hidden)]
+    unsafe fn mark_valid_range(writers: &mut Self::Writers<'_>, start: usize, end: usize);
+
+    /// # Safety
+    /// `index` must be a row of every column.
+    #[doc(hidden)]
+    unsafe fn write(columns: Self::Columns, index: usize, value: Self);
+
+    /// # Safety
+    /// `start..end` must be rows of every column.
+    #[doc(hidden)]
+    unsafe fn zero(columns: Self::Columns, start: usize, end: usize);
+}
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+macro_rules! plain_fields {
+    ($($field:ident $index:tt),+) => {
+        impl<$($field: PlainNative + 'static),+> sealed::Sealed for ($($field,)+) {}
+
+        impl<$($field: PlainNative + 'static),+> PlainFields for ($($field,)+) {
+            type Writers<'w> = ($(VectorWriter<'w, $field>,)+);
+            type Columns = ($(*mut $field,)+);
+
+            unsafe fn writers<'w>(fields: &mut VectorCollection, len: usize) -> Result<Self::Writers<'w>> {
+                let mut children = fields.cached_iter_mut()?;
+                let writers = ($({
+                    let child = children.next().ok_or_else(|| field_count_mismatch($index))?;
+                    child.validate_as::<$field>()?;
+                    // SAFETY: the caller guarantees an exclusive borrow of the STRUCT, whose field wrappers outlive the
+                    // writer; the child was just validated as the field's type.
+                    unsafe { VectorWriter::from_raw(NonNull::from(child).cast::<Vector<'w, $field>>())? }
+                },)+);
+                if children.next().is_some() {
+                    return Err(field_count_mismatch([$($index),+].len()));
+                }
+                $(check_field_len(writers.$index.len(), len)?;)+
+                Ok(writers)
+            }
+
+            fn refresh(writers: &mut Self::Writers<'_>, len: usize) -> Result<()> {
+                $(
+                    writers.$index.refresh_all()?;
+                    check_field_len(writers.$index.len(), len)?;
+                )+
+                Ok(())
+            }
+
+            #[inline(always)]
+            fn columns(writers: &mut Self::Writers<'_>) -> Self::Columns {
+                ($(writers.$index.as_mut_ptr().cast::<$field>(),)+)
+            }
+
+            unsafe fn mark_valid_range(writers: &mut Self::Writers<'_>, start: usize, end: usize) {
+                // SAFETY: the caller guarantees the rows are in bounds and written before any read.
+                unsafe { $(writers.$index.mark_valid_range(start, end);)+ }
+            }
+
+            #[inline(always)]
+            unsafe fn write(columns: Self::Columns, index: usize, value: Self) {
+                // SAFETY: the caller guarantees the row is in bounds, and each column holds slots of its field's type.
+                unsafe { $(columns.$index.add(index).write(value.$index);)+ }
+            }
+
+            unsafe fn zero(columns: Self::Columns, start: usize, end: usize) {
+                // SAFETY: the caller guarantees the rows are in bounds; zero bytes are a valid `PlainNative` value.
+                unsafe { $(columns.$index.add(start).write_bytes(0, end - start);)+ }
+            }
+        }
+    };
+}
+
+plain_fields!(A 0);
+plain_fields!(A 0, B 1);
+plain_fields!(A 0, B 1, C 2);
+plain_fields!(A 0, B 1, C 2, D 3);
+plain_fields!(A 0, B 1, C 2, D 3, E 4);
+plain_fields!(A 0, B 1, C 2, D 3, E 4, G 5);
+
+fn check_field_len(field: usize, len: usize) -> Result<()> {
+    if field != len {
+        return Err(Error::invalid_input(format!(
+            "a STRUCT field has {field} rows, not the STRUCT's {len}"
+        )));
+    }
+    Ok(())
+}
+
+#[cold]
+fn field_count_mismatch(fields: usize) -> Error {
+    Error::invalid_input(format!("the STRUCT elements do not have exactly {fields} fields"))
+}
+
+/// Writes `LIST` rows of `STRUCT` elements whose fields are the plain types `F`, borrowed by
+/// [`Vector::struct_list_appender`].
+///
+/// Like a [`ListAppender`], it grows the element child as rows are written, without initializing elements first,
+/// and ends with exactly the elements of the rows written. Each element is a tuple of its non-NULL fields:
+///
+/// ```
+/// # use duckdb_neo::{DuckDBType, Result, data_chunk::DataChunk, environment::{Environment, StorageLocation}, logical_type::LogicalType, types::{List, Struct}};
+/// # fn main() -> Result<()> {
+/// # let conn = Environment::new()?.open(StorageLocation::InMemory)?.connect()?;
+/// let mut chunk = DataChunk::create(&conn, &[LogicalType::from_text(&conn, "STRUCT(x DOUBLE, n INTEGER)[]")?], true)?;
+/// let mut vector = chunk.get_vector_at_mut::<List<Struct>>(0)?;
+/// vector.set_size(2)?;
+/// vector.struct_list_appender(|lists| {
+///     lists.set_with(0, 2, |index| (index as f64 / 2.0, index as i32))?;
+///     lists.set_null(1)
+/// })?;
+/// assert_eq!(vector.get_value_slow(0)?.dbg_string()?, "[{'x': 0.0, 'n': 0}, {'x': 0.5, 'n': 1}]");
+/// assert_eq!(vector.child_len()?, 2);
+/// # Ok(())
+/// # }
+/// ```
+pub struct StructListAppender<'w, F: PlainFields> {
+    parent: VectorWriter<'w, List<Unknown>>,
+    structs: VectorWriter<'w, Unknown>,
+    fields: F::Writers<'w>,
+    /// The fields' data, current since the last resize.
+    columns: F::Columns,
+    /// The child elements in use: the earlier ones and those of every row written.
+    used: usize,
+    /// The child's size, of which elements from `used` are not initialized.
+    reserved: usize,
+}
+
+impl<T: NativeElement> Vector<'_, List<T>> {
+    /// Write rows through a [`StructListAppender`] in `f`, appending their `STRUCT` elements after the child's.
+    ///
+    /// Size the rows first. The child ends with the elements of the rows written, also when `f` fails or
+    /// panics. Fails unless the elements are `STRUCT`s whose fields are exactly `F`'s types.
+    pub fn struct_list_appender<F: PlainFields, R>(
+        &mut self,
+        f: impl FnOnce(&mut StructListAppender<'_, F>) -> Result<R>,
+    ) -> Result<R> {
+        // SAFETY: the exclusive borrow covers every writer, and `List<T>::validate` checked that there is one child.
+        let mut appender = unsafe { StructListAppender::from_raw(NonNull::from(self).cast())? };
+        let value = f(&mut appender.0)?;
+        appender.0.finish()?;
+        Ok(value)
+    }
+}
+
+impl<'w, F: PlainFields> StructListAppender<'w, F> {
+    /// # Safety
+    /// `vector` must be a validated `LIST`, exclusively borrowed for `'w`, and outlive the appender.
+    unsafe fn from_raw(mut vector: NonNull<Vector<'w, List<Unknown>>>) -> Result<FinishStructList<'w, F>> {
+        // SAFETY: the caller guarantees an exclusive borrow of a validated vector.
+        let borrowed = unsafe { vector.as_mut() };
+        if !borrowed.is_writable() {
+            return Err(super::not_writable());
+        }
+        let child = borrowed
+            .children
+            .as_mut()
+            .map(|children| children.cached_iter_mut())
+            .transpose()?
+            .and_then(|mut children| children.next())
+            .ok_or_else(|| Error::invalid_input("the LIST vector has no element child"))?;
+        if child.logical_type().id()? != LogicalTypeID::Struct {
+            return Err(Error::invalid_input(format!(
+                "{} elements are not a STRUCT",
+                child.logical_type()
+            )));
+        }
+        let len = child.len();
+        let mut child = NonNull::from(child);
+        // SAFETY: the appender keeps `vector` exclusively borrowed and only touches its child through `structs` and
+        // the field writers, which `F::writers` checks; resizing the child keeps the parent's and fields' wrappers.
+        let (parent, structs, mut fields) = unsafe {
+            let fields = child
+                .as_mut()
+                .children_collection_mut()
+                .ok_or_else(|| field_count_mismatch(0))?;
+            let fields = F::writers(fields, len)?;
+            (VectorWriter::from_raw(vector)?, VectorWriter::from_raw(child)?, fields)
+        };
+        let used = structs.len();
+        Ok(FinishStructList(Self {
+            parent,
+            structs,
+            columns: F::columns(&mut fields),
+            fields,
+            used,
+            reserved: used,
+        }))
+    }
+
+    /// Return the number of rows.
+    pub fn len(&self) -> usize {
+        self.parent.len()
+    }
+
+    /// Return whether the vector has no rows.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Return the number of child elements in use, where the next row's elements start.
+    pub fn child_len(&self) -> usize {
+        self.used
+    }
+
+    /// Make a row SQL NULL.
+    #[inline]
+    pub fn set_null(&mut self, row: usize) -> Result<()> {
+        self.check_row(row)?;
+        // SAFETY: the row is in bounds.
+        unsafe { self.parent.mark_null_unchecked(row) }
+    }
+
+    /// Make room for `additional` elements after those in use, so rows of known total length grow the child once.
+    pub fn reserve(&mut self, additional: usize) -> Result<()> {
+        self.claim(additional).map(|_| ())
+    }
+
+    /// Write a row of `count` elements, the `i`-th from `f(i)`, in one loop.
+    #[inline]
+    pub fn set_with(&mut self, row: usize, count: usize, mut f: impl FnMut(usize) -> F) -> Result<()> {
+        self.check_row(row)?;
+        let start = self.claim(count)?;
+        let columns = self.columns;
+        for index in 0..count {
+            // SAFETY: the elements are reserved, and their rows and fields marked valid. If `f` panics, `used` has
+            // not moved, so `finish` cuts these elements off.
+            unsafe { F::write(columns, start + index, f(index)) };
+        }
+        // SAFETY: the row is in bounds, and the elements were just written.
+        unsafe { self.commit(row, start, count) };
+        Ok(())
+    }
+
+    /// Write a row from its elements.
+    #[inline]
+    pub fn set_elements(&mut self, row: usize, values: impl IntoIterator<Item = F>) -> Result<()> {
+        self.check_row(row)?;
+        let values = values.into_iter();
+        let start = self.claim(values.size_hint().0)?;
+        let mut end = start;
+        for value in values {
+            if end == self.reserved {
+                self.grow(end + 1)?;
+            }
+            // SAFETY: as for `set_with`; `grow` refreshed the columns.
+            unsafe { F::write(self.columns, end, value) };
+            end += 1;
+        }
+        // SAFETY: the row is in bounds, and the elements were just written.
+        unsafe { self.commit(row, start, end - start) };
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn check_row(&self, row: usize) -> Result<()> {
+        if row >= self.len() {
+            return Err(out_of_bounds(row, self.len()));
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn claim(&mut self, count: usize) -> Result<usize> {
+        let start = self.used;
+        let end = start
+            .checked_add(count)
+            .ok_or_else(|| Error::invalid_input("LIST element count overflows"))?;
+        if end > self.reserved {
+            self.grow(end)?;
+        }
+        Ok(start)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, end: usize) -> Result<()> {
+        let reserved = end.max(self.reserved.saturating_mul(2)).max(64);
+        // SAFETY: elements from `used` are written before a row's entry covers them, and `finish` cuts the
+        // child to `used` before anything can read the vector.
+        let result = unsafe { self.structs.vector_mut().set_size_uninit(reserved) };
+        // As in `ListAppender::grow`, refresh either way, and move `reserved` only once the pointers are current.
+        if let Err(error) = self.refresh() {
+            self.reserved = self.used;
+            // SAFETY: shrinking exposes no new elements.
+            if unsafe { self.structs.vector_mut().set_size_uninit(self.used) }.is_err() {
+                std::process::abort();
+            }
+            return Err(error);
+        }
+        let old = self.reserved;
+        self.reserved = self.structs.len();
+        let start = old.min(self.reserved);
+        // SAFETY: the new elements are in bounds of the STRUCT and of every field, which `refresh` checked has as many
+        // rows, and are written before a row's entry covers them.
+        unsafe {
+            self.structs.mark_valid_range(start, self.reserved);
+            F::mark_valid_range(&mut self.fields, start, self.reserved);
+        }
+        result
+    }
+
+    fn refresh(&mut self) -> Result<()> {
+        self.structs.refresh_all()?;
+        F::refresh(&mut self.fields, self.structs.len())?;
+        self.columns = F::columns(&mut self.fields);
+        Ok(())
+    }
+
+    /// Point `row` at the `count` elements from `start`, which were just written, and take them into use.
+    ///
+    /// # Safety
+    /// `row` must be in bounds, and elements `start..start + count` initialized, with `start` the old `used`.
+    #[inline(always)]
+    unsafe fn commit(&mut self, row: usize, start: usize, count: usize) {
+        self.used = start + count;
+        // SAFETY: the caller guarantees the row's bounds and that the entry covers initialized elements.
+        unsafe {
+            let _ = self
+                .parent
+                .write_internal(row, Some(ListIndex::new(start as u64, count as u64)));
+            self.parent.mark_valid_unchecked(row);
+        }
+    }
+
+    /// Cut the child to the elements in use, or zero the others' fields if that fails.
+    fn finish(&mut self) -> Result<()> {
+        let (used, reserved) = (self.used, self.reserved);
+        if used == reserved {
+            return Ok(());
+        }
+        self.reserved = used;
+        // SAFETY: shrinking exposes no new elements.
+        let result = unsafe { self.structs.vector_mut().set_size_uninit(used) };
+        if result.is_err() {
+            // SAFETY: elements `used..reserved` are in bounds of the columns, current since the last `grow`, which
+            // DuckDB only replaces when they grow; the STRUCT rows themselves hold no data.
+            unsafe { F::zero(self.columns, used, reserved) };
+        }
+        result
+    }
+}
+
+impl<F: PlainFields> std::fmt::Debug for StructListAppender<'_, F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StructListAppender")
+            .field("len", &self.len())
+            .field("child_len", &self.used)
+            .finish()
+    }
+}
+
+/// Finishes the appender when its closure fails or panics.
+struct FinishStructList<'w, F: PlainFields>(StructListAppender<'w, F>);
+
+impl<F: PlainFields> Drop for FinishStructList<'_, F> {
+    fn drop(&mut self) {
+        let _ = self.0.finish();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -1123,8 +1510,13 @@ mod tests {
     fn child_len_fails_without_a_child() -> Result<()> {
         let conn = connection()?;
         let mut chunk = DataChunk::create(&conn, &[List::<i32>::logical_type(&conn)?], true)?;
-        let sequence = chunk.get_vector_at_mut::<List<i32>>(0)?.make_sequence(0, 1, 3)?;
+        let mut sequence = chunk.get_vector_at_mut::<List<i32>>(0)?.make_sequence(0, 1, 3)?;
         assert!(sequence.child_len().is_err());
+        assert!(
+            sequence
+                .struct_list_appender(|_: &mut super::StructListAppender<'_, (i32,)>| Ok(()))
+                .is_err()
+        );
         Ok(())
     }
 
@@ -1271,6 +1663,208 @@ mod tests {
                 Some(List(vec![Some(7), Some(8), Some(9)])),
             ]
         );
+        Ok(())
+    }
+
+    fn struct_lists(conn: &Connection, sql: &str) -> Result<DataChunk<'static>> {
+        DataChunk::create(conn, &[crate::logical_type::LogicalType::from_text(conn, sql)?], true)
+    }
+
+    #[test]
+    fn struct_list_appender_grows_every_field() -> Result<()> {
+        use crate::types::Struct;
+        let conn = connection()?;
+        let mut chunk = struct_lists(&conn, "STRUCT(x DOUBLE, n INTEGER)[]")?;
+        let mut vector = chunk.get_vector_at_mut::<List<Struct>>(0)?;
+        vector.set_size(300)?;
+        vector.struct_list_appender(|lists| {
+            assert_eq!((lists.len(), lists.child_len()), (300, 0));
+            for row in 0..300 {
+                match row % 3 {
+                    0 => lists.set_null(row)?,
+                    1 => lists.set_with(row, row, |index| (index as f64, row as i32))?,
+                    // An iterator without a size hint grows the child as it goes.
+                    _ => lists.set_elements(row, (0..row).filter(|_| true).map(|index| (-(index as f64), 7)))?,
+                }
+            }
+            assert!(lists.set_null(300).is_err());
+            assert!(lists.set_with(300, 1, |_| (0.0, 0)).is_err());
+            assert!(lists.set_elements(300, []).is_err());
+            Ok(())
+        })?;
+        assert_eq!(vector.child_len()?, (0..300).filter(|row| row % 3 != 0).sum::<usize>());
+        for row in 0..300 {
+            let expected = match row % 3 {
+                0 => "NULL".to_owned(),
+                1 => format!(
+                    "[{}]",
+                    (0..row)
+                        .map(|index| format!("{{'x': {index}.0, 'n': {row}}}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                _ => format!(
+                    "[{}]",
+                    (0..row)
+                        .map(|index| format!(
+                            "{{'x': {}, 'n': 7}}",
+                            if index == 0 {
+                                "-0.0".to_owned()
+                            } else {
+                                format!("-{index}.0")
+                            }
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            };
+            assert_eq!(vector.get_value_slow(row)?.dbg_string()?, expected, "row {row}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn struct_list_appender_appends_after_existing_elements() -> Result<()> {
+        #[derive(crate::AsDuckDB)]
+        #[duckdb(writer)]
+        struct Point {
+            x: f64,
+            y: f64,
+        }
+        let conn = connection()?;
+        let mut chunk = DataChunk::create(&conn, &[List::<Point>::logical_type(&conn)?], true)?;
+        let mut vector = chunk.get_vector_at_mut::<List<Point>>(0)?;
+        vector.set_size(3)?;
+        vector.set_child_size(1)?;
+        vector
+            .list_writer()?
+            .set_elements(0, [Some(&Point { x: 1.0, y: 2.0 })])?;
+        vector.struct_list_appender(|lists| {
+            assert_eq!(lists.child_len(), 1);
+            lists.reserve(1000)?;
+            lists.set_with(1, 2, |index| (index as f64, 10.0))?;
+            lists.set_with(2, 0, |_| unreachable!())
+        })?;
+        assert_eq!(vector.child_len()?, 3);
+        let read = (0..3)
+            .map(|row| vector.get_value_slow(row)?.dbg_string())
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(
+            read,
+            [
+                "[{'x': 1.0, 'y': 2.0}]",
+                "[{'x': 0.0, 'y': 10.0}, {'x': 1.0, 'y': 10.0}]",
+                "[]"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn struct_list_appender_keeps_only_finished_rows_after_a_panic_or_error() -> Result<()> {
+        use crate::types::Struct;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let conn = connection()?;
+        let mut chunk = struct_lists(&conn, "STRUCT(a BIGINT)[]")?;
+        let mut vector = chunk.get_vector_at_mut::<List<Struct>>(0)?;
+        vector.set_size(3)?;
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            vector.struct_list_appender(|lists| {
+                lists.set_with(0, 2, |index| (index as i64,))?;
+                lists.set_with(
+                    1,
+                    100,
+                    |index| if index == 50 { panic!("in set_with") } else { (7_i64,) },
+                )
+            })
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(vector.child_len()?, 2);
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            vector.struct_list_appender(|lists| {
+                let values = (0..200_i64).map(|index| {
+                    if index == 150 {
+                        panic!("in the iterator")
+                    } else {
+                        (index,)
+                    }
+                });
+                lists.set_elements(1, values)
+            })
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(vector.child_len()?, 2);
+        let error = vector
+            .struct_list_appender(|lists| {
+                lists.set_elements(1, [(3_i64,)])?;
+                Err::<(), _>(crate::Error::invalid_input("stop"))
+            })
+            .unwrap_err();
+        assert!(error.message.contains("stop"), "{error}");
+        assert_eq!(vector.child_len()?, 3);
+        let read = (0..3)
+            .map(|row| vector.get_value_slow(row)?.dbg_string())
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(read, ["[{'a': 0}, {'a': 1}]", "[{'a': 3}]", "[]"]);
+        Ok(())
+    }
+
+    #[test]
+    fn struct_list_appender_rejects_other_elements() -> Result<()> {
+        use crate::{logical_type::LogicalType, types::Struct, vector::Unknown};
+        let conn = connection()?;
+        let types = [
+            "STRUCT(x DOUBLE, n INTEGER)[]",
+            "DOUBLE[][]",
+            "UNION(x DOUBLE)[]",
+            "STRUCT(x DOUBLE[])[]",
+        ]
+        .map(|name| LogicalType::from_text(&conn, name));
+        let mut chunk = DataChunk::create(&conn, &types.into_iter().collect::<Result<Vec<_>>>()?, true)?;
+        let mut vector = chunk.get_vector_at_mut::<List<Struct>>(0)?;
+        vector.set_size(1)?;
+        for error in [
+            vector.struct_list_appender(|_: &mut super::StructListAppender<'_, (f64,)>| Ok(())),
+            vector.struct_list_appender(|_: &mut super::StructListAppender<'_, (f64, i32, i32)>| Ok(())),
+            vector.struct_list_appender(|_: &mut super::StructListAppender<'_, (f64, i64)>| Ok(())),
+            vector.struct_list_appender(|_: &mut super::StructListAppender<'_, (i32, f64)>| Ok(())),
+        ] {
+            assert!(error.is_err());
+        }
+        assert_eq!(vector.child_len()?, 0);
+        for column in 1..4 {
+            let mut vector = chunk.get_vector_at_mut::<List<Unknown>>(column)?;
+            vector.set_size(1)?;
+            let error = vector
+                .struct_list_appender(|lists: &mut super::StructListAppender<'_, (f64,)>| {
+                    lists.set_with(0, 1, |_| (1.0,))
+                })
+                .unwrap_err();
+            assert!(
+                error.message.contains("not a STRUCT") || error.message.contains("DOUBLE"),
+                "{error}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn child_struct_lists_use_the_appender() -> Result<()> {
+        use crate::types::Struct;
+        let conn = connection()?;
+        let mut chunk = struct_lists(&conn, "STRUCT(l STRUCT(v INTEGER)[])")?;
+        let mut structs = chunk.get_vector_at_mut::<Struct>(0)?;
+        structs.set_size(2)?;
+        structs
+            .children_mut()
+            .unwrap()
+            .get_vector_at_mut::<List<Struct>>(0)?
+            .struct_list_appender(|lists| {
+                lists.set_with(0, 2, |index| (index as i32 + 1,))?;
+                lists.set_null(1)
+            })?;
+        assert_eq!(structs.get_value_slow(0)?.dbg_string()?, "{'l': [{'v': 1}, {'v': 2}]}");
+        assert_eq!(structs.get_value_slow(1)?.dbg_string()?, "{'l': NULL}");
         Ok(())
     }
 }

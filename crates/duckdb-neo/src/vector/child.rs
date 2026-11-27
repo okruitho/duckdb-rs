@@ -1,8 +1,8 @@
 use std::ops::Deref;
 
 use super::{
-    ArrayWriter, ListAppender, ListWriter, MapWriter, NativeElement, UnionWriter, UnionWriters, Unknown, Vector,
-    VectorWriter, WithWriter,
+    ArrayWriter, ListAppender, ListWriter, MapWriter, NativeElement, PlainFields, StructListAppender, UnionWriter,
+    UnionWriters, Unknown, Vector, VectorWriter, WithWriter,
 };
 use crate::{
     Result,
@@ -141,6 +141,14 @@ impl<T: NativeElement> ChildVector<'_, List<T>> {
     /// See [`Vector::list_appender`]; it keeps every row of this vector.
     pub fn list_appender<R>(&mut self, f: impl FnOnce(&mut ListAppender<'_, T>) -> Result<R>) -> Result<R> {
         self.0.list_appender(f)
+    }
+
+    /// See [`Vector::struct_list_appender`]; it keeps every row of this vector.
+    pub fn struct_list_appender<F: PlainFields, R>(
+        &mut self,
+        f: impl FnOnce(&mut StructListAppender<'_, F>) -> Result<R>,
+    ) -> Result<R> {
+        self.0.struct_list_appender(f)
     }
 }
 

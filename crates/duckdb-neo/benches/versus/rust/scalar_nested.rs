@@ -16,7 +16,7 @@ use duckdb_neo::{
     connection::Connection,
     scalar::MicroScalar,
     signature::{FunctionParameter, SignatureBuilder},
-    types::{Array, List, ListIndex, Map, Struct, UncheckedString},
+    types::{Array, List, Map, Struct, UncheckedString},
     vector::{CombinedVectorIterator, RowReader, RowWriter, Vector},
 };
 
@@ -295,26 +295,19 @@ fn register_list_of_points(conn: &Connection) -> Result<()> {
         |_context, input: Vector<'_, i32>, mut output: Vector<'_, List<Point>>| {
             let counts = input.reader()?;
             let elements = counts.iter().map(|n| n.map_or(0, |&n| n.max(0) as usize)).sum();
-            output.set_child_size(elements)?;
-            let mut writer = output.list_writer()?;
-            for (row, n) in counts.iter().enumerate() {
-                let Some(&n) = n else {
-                    writer.set_null(row)?;
-                    continue;
-                };
-                let start = writer.child_offset();
-                let len = n.max(0);
-                // The sized elements start valid, so writing the fields is enough.
-                let points = writer.elements();
-                for index in 0..len {
-                    let x = f64::from(index);
-                    let element = start + index as usize;
-                    points.x.set(element, &x)?;
-                    points.y.set(element, &(x * x))?;
+            output.struct_list_appender(|points| {
+                points.reserve(elements)?;
+                for (row, n) in counts.iter().enumerate() {
+                    match n {
+                        Some(&n) => points.set_with(row, n.max(0) as usize, |index| {
+                            let x = index as f64;
+                            (x, x * x)
+                        })?,
+                        None => points.set_null(row)?,
+                    }
                 }
-                writer.set_entry(row, ListIndex::new(start as u64, len as u64))?;
-            }
-            Ok(())
+                Ok(())
+            })
         },
     )
     .register(conn)
