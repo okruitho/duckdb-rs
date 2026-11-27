@@ -1,6 +1,6 @@
 //! `VARCHAR`, `BLOB`, and `BIT` byte-oriented logical types.
 //!
-//! [`str`], [`String`], and [`UncheckedString`] represent `VARCHAR`;
+//! [`str`], [`String`], [`UncheckedString`], and [`VarcharBytes`] represent `VARCHAR`;
 //! [`BlobValue`] and [`BitValue`] wrap `BLOB` and `BIT` payloads.
 //! All share DuckDB's [`crate::bytes::DuckDBBytes`] wire representation.
 
@@ -84,6 +84,60 @@ impl DuckDBType for UncheckedString {
 impl ToValue for UncheckedString {
     fn value<C: FFILink + ?Sized>(&self, link: &C) -> Result<Value> {
         link.create_value(ValueInput::Varchar(&self.0))
+    }
+}
+
+/// A `VARCHAR` vector marker that reads rows as bytes, without validating or trusting UTF-8.
+///
+/// Prefer it over [`String`] for functions that only need the bytes, and over [`UncheckedString`],
+/// whose reads rely on DuckDB's contract that VARCHAR data is valid UTF-8. Read-only.
+///
+/// ```
+/// use duckdb_neo::{Result, types::VarcharBytes, vector::Vector};
+///
+/// fn total_len(vector: &Vector<'_, VarcharBytes>) -> Result<usize> {
+///     Ok(vector.reader()?.iter().flatten().map(<[u8]>::len).sum())
+/// }
+/// ```
+#[repr(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VarcharBytes(pub Vec<u8>);
+
+impl DuckDBType for VarcharBytes {
+    fn logical_type<C: FFILink + ?Sized>(link: &C) -> Result<LogicalType> {
+        str::logical_type(link)
+    }
+}
+
+impl FromValue for VarcharBytes {
+    fn _get_inner(value: &Value) -> Result<Self> {
+        let raw = check_api_call!(ffi::duckdb_v2_value_get_varchar, value.raw(), RET)?;
+        Ok(Self(owned_bytes(raw)?))
+    }
+}
+
+// SAFETY: `DuckDBBytes` matches DuckDB's string storage.
+unsafe impl NativeElement for VarcharBytes {
+    const TYPE_ID: LogicalTypeID = LogicalTypeID::Varchar;
+
+    type Native<'a> = DuckDBBytes<'a>;
+}
+
+// SAFETY: `get` reads the validated physical slot, and any bytes form a valid `&[u8]`.
+unsafe impl ReadableNativeElement for VarcharBytes {
+    type Ref<'a> = &'a [u8];
+
+    #[inline]
+    unsafe fn get<'a, U: NativeElement>(
+        vector: &crate::vector::VectorReader<'a, U>,
+        physical: usize,
+        _logical: usize,
+    ) -> Self::Ref<'a>
+    where
+        Self: 'a,
+    {
+        let data_ptr = vector.as_ptr() as *const DuckDBBytes<'a>;
+        unsafe { &*data_ptr.add(physical) }.get_data()
     }
 }
 
@@ -443,6 +497,71 @@ mod tests {
         let checked = chunk.get_vector_at::<String>(0)?;
         assert_eq!(checked.reader()?.iter().collect::<Vec<_>>(), values);
         assert!(chunk.get_vector_at::<BlobValue>(0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn varchar_bytes_read_rows_without_validating() -> Result<()> {
+        let env = Environment::new()?;
+        let conn = env.open(StorageLocation::InMemory)?.connect()?;
+        let mut chunk = DataChunk::create(&conn, &[String::logical_type(&conn)?], true)?;
+        let mut vector = chunk.get_vector_at_mut::<String>(0)?;
+        vector.set_size(4)?;
+        let mut writer = vector.writer()?;
+        writer.set(0, "héllo")?;
+        // SAFETY: This writable byte vector is flat and has four rows.
+        unsafe { writer.write_bytes(1, Some(&[0xff, 0xfe, b'a', 0xc3, 0x28, 0, 1, 2, 3, 4, 5, 6, 7]))? };
+        writer.set_null(2)?;
+        writer.set(3, "")?;
+        let bytes = chunk.get_vector_at::<VarcharBytes>(0)?;
+        assert_eq!(
+            bytes.reader()?.iter().collect::<Vec<_>>(),
+            [
+                Some("héllo".as_bytes()),
+                Some(&[0xff, 0xfe, b'a', 0xc3, 0x28, 0, 1, 2, 3, 4, 5, 6, 7][..]),
+                None,
+                Some(&[][..]),
+            ]
+        );
+        assert!(chunk.get_vector_at::<VarcharBytes>(0)?.reader()?.get(4).is_err());
+        let blob = DataChunk::create(&conn, &[BlobValue::logical_type(&conn)?], true)?;
+        assert!(blob.get_vector_at::<VarcharBytes>(0).is_err());
+        assert_eq!(
+            "a value".value(&conn)?.get::<VarcharBytes>()?,
+            Some(VarcharBytes(b"a value".to_vec()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn varchar_bytes_scalar_input_over_flat_constant_and_dictionary_vectors() -> Result<()> {
+        let env = Environment::new()?;
+        let conn = env.open(StorageLocation::InMemory)?.connect()?;
+        crate::scalar::MicroScalar::create(
+            "byte_len",
+            |_ctx, input: crate::vector::Vector<'_, VarcharBytes>, mut output: crate::vector::Vector<'_, i64>| {
+                let mut writer = output.writer()?;
+                for (row, value) in input.reader()?.iter().enumerate() {
+                    writer.set_option(row, value.map(|value| value.len() as i64).as_ref())?;
+                }
+                Ok(())
+            },
+        )
+        .register(&conn)?;
+        for query in [
+            "SELECT count(*) FILTER (WHERE byte_len(s) IS DISTINCT FROM strlen(s))::VARCHAR FROM \
+             (SELECT CASE WHEN i % 7 = 0 THEN NULL ELSE repeat('é', i % 23) END AS s FROM range(5000) t(i))",
+            "SELECT count(*) FILTER (WHERE byte_len('a constant 🦆') <> 15)::VARCHAR FROM range(3000)",
+            "SELECT count(*) FILTER (WHERE byte_len(s) IS DISTINCT FROM strlen(s))::VARCHAR FROM \
+             (SELECT (['short', NULL, 'a much longer value'])[1 + i % 3] AS s FROM range(5000) t(i)) WHERE s <> 'short'",
+        ] {
+            let chunk = conn.query(query, crate::Parameters::None)?.next_chunk()?.unwrap();
+            assert_eq!(
+                chunk.get_vector_at::<String>(0)?.reader()?.get(0)?,
+                Some("0"),
+                "{query}"
+            );
+        }
         Ok(())
     }
 
