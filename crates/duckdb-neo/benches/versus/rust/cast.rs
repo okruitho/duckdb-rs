@@ -16,6 +16,7 @@ use duckdb_neo::{
     connection::{Connection, Context},
     custom_type::CustomType,
     logical_type::LogicalType,
+    types::UncheckedString,
     vector::Vector,
 };
 
@@ -191,17 +192,18 @@ impl CastFunctionCallbacks for CentsToDouble {
     }
 }
 
+// DuckDB guarantees valid UTF-8 in VARCHAR and the parsers only look at bytes, so the input is not re-validated.
 struct VarcharToCents;
 
 impl CastFunctionCallbacks for VarcharToCents {
-    type InputType = String;
+    type InputType = UncheckedString;
     type OutputType = i64;
 
     fn exec(
         &self,
         _context: &Context,
         mode: CastMode,
-        input: Vector<'_, String>,
+        input: Vector<'_, UncheckedString>,
         mut output: Vector<'_, i64>,
     ) -> Result<()> {
         let mut writer = output.writer()?;
@@ -278,14 +280,14 @@ impl CastFunctionCallbacks for IntegerToHex {
 struct HexToBigint;
 
 impl CastFunctionCallbacks for HexToBigint {
-    type InputType = String;
+    type InputType = UncheckedString;
     type OutputType = i64;
 
     fn exec(
         &self,
         _context: &Context,
         mode: CastMode,
-        input: Vector<'_, String>,
+        input: Vector<'_, UncheckedString>,
         mut output: Vector<'_, i64>,
     ) -> Result<()> {
         let mut writer = output.writer()?;

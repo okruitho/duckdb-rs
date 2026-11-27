@@ -155,15 +155,17 @@ void DoubleToCentsExec(CastFunction::ExecInput &input) {
 	const auto mode = input.GetMode();
 	const auto source = input.GetInput();
 	const auto view = source.GetView();
+	const auto *values = view.Data<double>();
 	auto output = input.GetOutput();
 	auto validity = output.GetValidityMutable();
 	auto *result = output.GetDataMutable<int64_t>();
-	for (idx_t row = 0; row < input.GetRowCount(); row++) {
+	const auto count = input.GetRowCount();
+	for (idx_t row = 0; row < count; row++) {
 		if (!view.IsValid(row)) {
 			validity.SetInvalid(row);
 			continue;
 		}
-		const auto cents = DoubleToCents(view.Data<double>()[view.SelAt(row)]);
+		const auto cents = DoubleToCents(values[view.SelAt(row)]);
 		if (cents) {
 			result[row] = *cents;
 		} else if (mode == CastMode::TRY) {
@@ -177,15 +179,17 @@ void DoubleToCentsExec(CastFunction::ExecInput &input) {
 void CentsToDoubleExec(CastFunction::ExecInput &input) {
 	const auto source = input.GetInput();
 	const auto view = source.GetView();
+	const auto *values = view.Data<int64_t>();
 	auto output = input.GetOutput();
 	auto validity = output.GetValidityMutable();
 	auto *result = output.GetDataMutable<double>();
-	for (idx_t row = 0; row < input.GetRowCount(); row++) {
+	const auto count = input.GetRowCount();
+	for (idx_t row = 0; row < count; row++) {
 		if (!view.IsValid(row)) {
 			validity.SetInvalid(row);
 			continue;
 		}
-		result[row] = static_cast<double>(view.Data<int64_t>()[view.SelAt(row)]) / 100.0;
+		result[row] = static_cast<double>(values[view.SelAt(row)]) / 100.0;
 	}
 }
 
@@ -193,15 +197,17 @@ void VarcharToCentsExec(CastFunction::ExecInput &input) {
 	const auto mode = input.GetMode();
 	const auto source = input.GetInput();
 	const auto view = source.GetView();
+	const auto *texts = view.Data<varchar_t>();
 	auto output = input.GetOutput();
 	auto validity = output.GetValidityMutable();
 	auto *result = output.GetDataMutable<int64_t>();
-	for (idx_t row = 0; row < input.GetRowCount(); row++) {
+	const auto count = input.GetRowCount();
+	for (idx_t row = 0; row < count; row++) {
 		if (!view.IsValid(row)) {
 			validity.SetInvalid(row);
 			continue;
 		}
-		const auto text = view.Data<varchar_t>()[view.SelAt(row)].view();
+		const auto text = texts[view.SelAt(row)].view();
 		const auto cents = ParseCents(text);
 		if (cents) {
 			result[row] = *cents;
@@ -216,16 +222,21 @@ void VarcharToCentsExec(CastFunction::ExecInput &input) {
 void CentsToVarcharExec(CastFunction::ExecInput &input) {
 	const auto source = input.GetInput();
 	const auto view = source.GetView();
+	const auto *values = view.Data<int64_t>();
 	auto output = input.GetOutput();
 	auto validity = output.GetValidityMutable();
+	auto heap = output.GetHeap();
+	auto *result = output.GetDataMutable<varchar_t>();
 	std::string text;
-	for (idx_t row = 0; row < input.GetRowCount(); row++) {
+	const auto count = input.GetRowCount();
+	for (idx_t row = 0; row < count; row++) {
 		if (!view.IsValid(row)) {
 			validity.SetInvalid(row);
 			continue;
 		}
-		FormatCents(view.Data<int64_t>()[view.SelAt(row)], text);
-		output.AssignString(row, text);
+		FormatCents(values[view.SelAt(row)], text);
+		// The text is ASCII, so it skips the UTF-8 validation of `AddString`.
+		result[row] = heap.AddStringUnsafe(text);
 	}
 }
 
@@ -233,16 +244,20 @@ void CentsToVarcharExec(CastFunction::ExecInput &input) {
 void IntegerToHexExec(CastFunction::ExecInput &input) {
 	const auto source = input.GetInput();
 	const auto view = source.GetView();
+	const auto *values = view.Data<int64_t>();
 	auto output = input.GetOutput();
 	auto validity = output.GetValidityMutable();
+	auto heap = output.GetHeap();
+	auto *result = output.GetDataMutable<varchar_t>();
 	std::string text;
-	for (idx_t row = 0; row < input.GetRowCount(); row++) {
+	const auto count = input.GetRowCount();
+	for (idx_t row = 0; row < count; row++) {
 		if (!view.IsValid(row)) {
 			validity.SetInvalid(row);
 			continue;
 		}
-		FormatHex(view.Data<int64_t>()[view.SelAt(row)], text);
-		output.AssignString(row, text);
+		FormatHex(values[view.SelAt(row)], text);
+		result[row] = heap.AddStringUnsafe(text);
 	}
 }
 
@@ -250,15 +265,17 @@ void HexToBigintExec(CastFunction::ExecInput &input) {
 	const auto mode = input.GetMode();
 	const auto source = input.GetInput();
 	const auto view = source.GetView();
+	const auto *texts = view.Data<varchar_t>();
 	auto output = input.GetOutput();
 	auto validity = output.GetValidityMutable();
 	auto *result = output.GetDataMutable<int64_t>();
-	for (idx_t row = 0; row < input.GetRowCount(); row++) {
+	const auto count = input.GetRowCount();
+	for (idx_t row = 0; row < count; row++) {
 		if (!view.IsValid(row)) {
 			validity.SetInvalid(row);
 			continue;
 		}
-		const auto text = view.Data<varchar_t>()[view.SelAt(row)].view();
+		const auto text = texts[view.SelAt(row)].view();
 		const auto value = ParseHex(text);
 		if (value) {
 			result[row] = *value;
