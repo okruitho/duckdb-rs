@@ -75,6 +75,15 @@ impl<'r, R: RowReader> Iterator for RowIter<'r, R> {
     }
 }
 
+impl<'r, R: RowReader> RowIter<'r, R> {
+    /// # Safety
+    /// Every row of `rows` must be less than the reader's length.
+    #[inline(always)]
+    pub(crate) unsafe fn new_unchecked(reader: &'r R, rows: std::ops::Range<usize>) -> Self {
+        Self { reader, rows }
+    }
+}
+
 impl<R: RowReader> ExactSizeIterator for RowIter<'_, R> {}
 
 impl<R: RowReader> std::iter::FusedIterator for RowIter<'_, R> {}

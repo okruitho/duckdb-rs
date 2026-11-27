@@ -1,4 +1,4 @@
-use super::{RowReader, Vector, VectorReader, WithReader};
+use super::{RowIter, RowReader, Vector, VectorReader, WithReader};
 use crate::{
     Result,
     types::{Array, List, ListIndex, Map, Union},
@@ -120,10 +120,10 @@ impl<'r, R: RowReader> Elements<'r, R> {
     }
 
     /// Iterate over the elements.
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = Option<R::Item<'r>>> + 'r {
-        let reader = self.reader;
+    #[inline]
+    pub fn iter(&self) -> RowIter<'r, R> {
         // SAFETY: DuckDB keeps every entry within its child.
-        (self.offset..self.offset + self.len).map(move |index| unsafe { reader.get_unchecked(index) })
+        unsafe { RowIter::new_unchecked(self.reader, self.offset..self.offset + self.len) }
     }
 }
 
@@ -269,9 +269,11 @@ impl<'r, K: RowReader, V: RowReader> Entries<'r, K, V> {
         self.iter().map(|(key, _)| key)
     }
 
-    /// Iterate over the values; `None` values are SQL NULL.
-    pub fn values(&self) -> impl ExactSizeIterator<Item = Option<V::Item<'r>>> + 'r {
-        self.iter().map(|(_, value)| value)
+    /// Iterate over the values, without reading the keys; `None` values are SQL NULL.
+    #[inline]
+    pub fn values(&self) -> RowIter<'r, V> {
+        // SAFETY: DuckDB keeps every entry within its child.
+        unsafe { RowIter::new_unchecked(self.values, self.offset..self.offset + self.len) }
     }
 
     /// Return the value of the first entry whose key equals `key`.
@@ -494,9 +496,74 @@ mod tests {
                     read,
                     maps.get_value_slow(row)?.get::<Map<String, i32>>()?.map(|map| map.0)
                 );
+                let values = reader.get(row)?.map(|entries| {
+                    entries.values().fold(Vec::new(), |mut values, value| {
+                        values.push(value.copied());
+                        values
+                    })
+                });
+                assert_eq!(
+                    values,
+                    read.map(|entries| entries.into_iter().map(|(_, value)| value).collect())
+                );
             }
         }
         assert!(rows > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn element_iterators_match_indexed_reads() -> Result<()> {
+        let conn = Environment::new()?.open(StorageLocation::InMemory)?.connect()?;
+        let mut result = conn.query(
+            "SELECT * FROM test_vector_types(NULL::BIGINT[], all_flat := false)",
+            Parameters::None,
+        )?;
+        let mut checked = 0;
+        while let Some(chunk) = result.next_chunk()? {
+            let lists = chunk.get_vector_at::<List<i64>>(0)?;
+            let reader = lists.list_reader()?;
+            for elements in reader.iter().flatten() {
+                let stepped = (0..elements.len())
+                    .map(|index| elements.get(index).unwrap().copied())
+                    .collect::<Vec<_>>();
+                let folded = elements.iter().fold(Vec::new(), |mut folded, value| {
+                    folded.push(value.copied());
+                    folded
+                });
+                assert_eq!(folded, stepped);
+                // A partly consumed iterator folds only the rest.
+                let mut rest = elements.iter();
+                rest.next();
+                assert_eq!(
+                    rest.map(|value| value.copied()).collect::<Vec<_>>(),
+                    stepped[stepped.len().min(1)..]
+                );
+                checked += 1;
+            }
+        }
+        let mut result = conn.query(
+            "SELECT a FROM (SELECT CASE WHEN i % 5 = 0 THEN NULL
+                 ELSE [i, CASE WHEN i % 3 = 0 THEN NULL ELSE i END, 2 * i]::DOUBLE[3] END AS a FROM range(3000) r(i))
+             WHERE a IS NULL OR a[1] % 2 = 0",
+            Parameters::None,
+        )?;
+        while let Some(chunk) = result.next_chunk()? {
+            let arrays = chunk.get_vector_at::<Array<f64, 3>>(0)?;
+            let reader = arrays.array_reader()?;
+            for elements in reader.iter().flatten() {
+                let folded = elements.iter().fold(Vec::new(), |mut folded, value| {
+                    folded.push(value.copied());
+                    folded
+                });
+                let indexed = (0..3)
+                    .map(|index| elements.get(index).unwrap().copied())
+                    .collect::<Vec<_>>();
+                assert_eq!(folded, indexed);
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
         Ok(())
     }
 }

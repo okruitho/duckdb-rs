@@ -276,22 +276,15 @@ fn register_map_sum(conn: &Connection) -> Result<()> {
         "vs_map_sum",
         |_context, input: Vector<'_, Map<UncheckedString, i32>>, mut output: Vector<'_, i64>| {
             let maps = input.map_reader()?;
-            // Reading the values column directly skips the key that `Entries::values` reads per entry.
-            let values = maps.values();
             let mut writer = output.writer()?;
             for (row, entries) in maps.iter().enumerate() {
-                let Some(entries) = entries else {
-                    writer.set_null(row)?;
-                    continue;
-                };
-                let entry = entries.entry();
-                let mut sum = 0_i64;
-                for index in entry.offset()..entry.offset() + entry.length() {
-                    if let Some(value) = values.get(index as usize)? {
-                        sum = sum.wrapping_add(i64::from(*value));
-                    }
-                }
-                writer.set(row, &sum)?;
+                let sum = entries.map(|entries| {
+                    entries.values().fold(0_i64, |sum, value| match value {
+                        Some(value) => sum.wrapping_add(i64::from(*value)),
+                        None => sum,
+                    })
+                });
+                writer.set_option(row, sum.as_ref())?;
             }
             Ok(())
         },
