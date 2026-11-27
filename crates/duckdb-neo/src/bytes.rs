@@ -215,6 +215,29 @@ impl<'arena> DuckDBBytes<'arena> {
         Ok(())
     }
 
+    /// Copy `value` into `slot`: an inline value as it is, a longer one into the arena `arena` returns.
+    ///
+    /// # Safety
+    /// `slot` must be valid for writes of one `DuckDBBytes`.
+    #[inline(always)]
+    pub(crate) unsafe fn write_copy(
+        slot: *mut Self,
+        value: &DuckDBBytes<'_>,
+        arena: impl FnOnce() -> Result<&'arena Arena>,
+    ) -> Result<()> {
+        if value.size() <= ffi::DUCKDB_V2_BYTES_INLINE_LENGTH as usize {
+            // SAFETY: the caller guarantees the slot; an inline value refers to no other storage.
+            unsafe {
+                slot.cast::<[u64; 2]>()
+                    .write(std::ptr::from_ref(value).cast::<[u64; 2]>().read())
+            };
+            Ok(())
+        } else {
+            // SAFETY: the caller guarantees the slot; the bytes are copied into this slot's arena.
+            unsafe { Self::write_parts(slot, &[value.get_data()], arena) }
+        }
+    }
+
     /// Return the payload length in bytes.
     pub fn size(&self) -> usize {
         unsafe { self.data.value.inlined.length as usize }
@@ -549,8 +572,12 @@ mod tests {
         data_chunk::DataChunk,
         environment::{Environment, StorageLocation},
         scalar::MicroScalar,
-        types::{BlobValue, UncheckedString},
-        vector::Vector,
+        types::{BlobValue, UncheckedString, VarcharBytes},
+        vector::{StorageKind, Vector},
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
     };
 
     fn with_arena(test: impl FnOnce(&Arena) -> Result<()>) -> Result<()> {
@@ -846,6 +873,127 @@ mod tests {
                 Some("0"),
                 "{query}"
             );
+        }
+        Ok(())
+    }
+
+    fn long_slot_pointer(vector: &Vector<'_, String>, row: usize) -> Result<*const u8> {
+        let reader = vector.reader()?;
+        // SAFETY: the row is in bounds and holds a non-inlined value.
+        Ok(unsafe { (*reader.as_ptr().add(row)).data.value.pointer.ptr.cast_const().cast() })
+    }
+
+    #[test]
+    fn copy_bytes_from_copies_long_values_into_the_destination_arena() -> Result<()> {
+        let env = Environment::new()?;
+        let conn = env.open(StorageLocation::InMemory)?.connect()?;
+        let values = [
+            Some("short"),
+            None,
+            Some("a value longer than inline"),
+            Some(""),
+            Some("123456789012"),
+        ];
+        let mut target = DataChunk::create(&conn, &[String::logical_type(&conn)?], true)?;
+        let mut copied = target.get_vector_at_mut::<String>(0)?;
+        copied.set_size(2 * values.len())?;
+        let source_pointer = {
+            let mut source = DataChunk::create(&conn, &[String::logical_type(&conn)?], true)?;
+            let mut vector = source.get_vector_at_mut::<String>(0)?;
+            vector.set_size(values.len())?;
+            let mut writer = vector.writer()?;
+            for (row, value) in values.iter().enumerate() {
+                writer.set_option(row, *value)?;
+            }
+            let mut writer = copied.writer()?;
+            writer.set(1, "overwritten by a NULL")?;
+            writer.copy_bytes_from(&source.get_vector_at::<UncheckedString>(0)?.reader()?)?;
+            let bytes = source.get_vector_at::<VarcharBytes>(0)?;
+            for row in 0..values.len() {
+                writer.copy_row(values.len() + row, &bytes.reader()?, values.len() - 1 - row)?;
+            }
+            long_slot_pointer(source.get_vector_at::<String>(0)?, 2)?
+        };
+        let mut expected = values.to_vec();
+        expected.extend(values.iter().rev());
+        assert_eq!(copied.reader()?.iter().collect::<Vec<_>>(), expected);
+        for row in [2, 7] {
+            assert_ne!(long_slot_pointer(&copied, row)?, source_pointer);
+        }
+        for row in [0, 3, 4] {
+            assert_eq!(raw_slot(&copied, row)?, raw_slot(&copied, 9 - row)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn copies_check_types_and_bounds() -> Result<()> {
+        let env = Environment::new()?;
+        let conn = env.open(StorageLocation::InMemory)?.connect()?;
+        let mut blob = DataChunk::create(&conn, &[BlobValue::logical_type(&conn)?], true)?;
+        blob.get_vector_at_mut::<BlobValue>(0)?.set_size(3)?;
+        let blobs = blob.get_vector_at::<BlobValue>(0)?;
+        with_string_vector(2, |vector| {
+            let mut writer = vector.writer()?;
+            assert!(writer.copy_bytes_from(&blobs.reader()?).is_err());
+            assert!(writer.copy_row(0, &blobs.reader()?, 0).is_err());
+            let mut strings = DataChunk::create(&conn, &[String::logical_type(&conn)?], true)?;
+            strings.get_vector_at_mut::<String>(0)?.set_size(3)?;
+            let source = strings.get_vector_at::<UncheckedString>(0)?;
+            assert!(writer.copy_bytes_from(&source.reader()?).is_err());
+            assert!(writer.copy_row(2, &source.reader()?, 0).is_err());
+            assert!(writer.copy_row(0, &source.reader()?, 3).is_err());
+            writer.copy_row(1, &source.reader()?, 2)?;
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn copies_read_flat_constant_and_dictionary_sources() -> Result<()> {
+        let env = Environment::new()?;
+        let conn = env.open(StorageLocation::InMemory)?.connect()?;
+        let kinds = Arc::new(AtomicU8::new(0));
+        for (name, by_row) in [("copy_vector", false), ("copy_rows", true)] {
+            let kinds = kinds.clone();
+            MicroScalar::create(
+                name,
+                move |_ctx, mut input: Vector<'_, UncheckedString>, mut output: Vector<'_, String>| {
+                    if input.storage_kind() == StorageKind::Other {
+                        input.flatten()?;
+                    }
+                    kinds.fetch_or(1 << input.storage_kind() as u8, Ordering::Relaxed);
+                    let reader = input.reader()?;
+                    let mut writer = output.writer()?;
+                    if by_row {
+                        for row in 0..reader.len() {
+                            writer.copy_row(row, &reader, row)?;
+                        }
+                        Ok(())
+                    } else {
+                        writer.copy_bytes_from(&reader)
+                    }
+                },
+            )
+            .register(&conn)?;
+        }
+        for query in [
+            "SELECT count(*) FILTER (WHERE copy_vector(x) IS DISTINCT FROM x OR copy_rows(x) IS DISTINCT FROM x)::VARCHAR \
+             FROM test_vector_types(NULL::VARCHAR, all_flat := false) t(x)",
+            "SELECT count(*) FILTER (WHERE copy_vector('a constant longer than inline') <> 'a constant longer than inline' \
+             OR copy_rows(NULL) IS NOT NULL)::VARCHAR FROM range(3000)",
+            "SELECT count(*) FILTER (WHERE copy_vector(s) IS DISTINCT FROM s OR copy_rows(s) IS DISTINCT FROM s)::VARCHAR \
+             FROM (SELECT CASE WHEN i % 7 = 0 THEN NULL ELSE repeat('é', i % 23) END AS s FROM range(5000) t(i))",
+        ] {
+            let chunk = conn.query(query, Parameters::None)?.next_chunk()?.unwrap();
+            assert_eq!(
+                chunk.get_vector_at::<String>(0)?.reader()?.get(0)?,
+                Some("0"),
+                "{query}"
+            );
+        }
+        let seen = kinds.load(Ordering::Relaxed);
+        for kind in [StorageKind::Flat, StorageKind::Constant, StorageKind::Dictionary] {
+            assert_ne!(seen & (1 << kind as u8), 0, "{kind:?}");
         }
         Ok(())
     }

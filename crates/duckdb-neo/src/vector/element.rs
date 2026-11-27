@@ -138,7 +138,7 @@ pub unsafe trait ReadableNativeElement: NativeElement {
 /// Marks vector elements backed by DuckDB's byte storage and arena.
 ///
 /// Implemented for [`String`], [`UncheckedString`](crate::types::UncheckedString),
-/// [`BlobValue`](crate::types::BlobValue), [`BitValue`](crate::types::BitValue),
+/// [`VarcharBytes`](crate::types::VarcharBytes), [`BlobValue`](crate::types::BlobValue), [`BitValue`](crate::types::BitValue),
 /// [`BigNum`](crate::types::BigNum), and [`BigNumValue`](crate::types::BigNumValue).
 ///
 /// Non-byte vectors do not expose an arena:

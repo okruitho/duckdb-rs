@@ -227,6 +227,7 @@ impl HasDuckDBBytes for String {}
 impl HasDuckDBBytes for UncheckedString {}
 impl HasDuckDBBytes for BlobValue {}
 impl HasDuckDBBytes for BitValue {}
+impl HasDuckDBBytes for VarcharBytes {}
 
 // SAFETY: `DuckDBBytes` matches DuckDB's string storage.
 unsafe impl NativeElement for BlobValue {
