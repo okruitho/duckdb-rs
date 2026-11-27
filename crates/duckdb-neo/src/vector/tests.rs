@@ -105,6 +105,67 @@ fn storage_kind_maps_unknown_kinds_to_other() {
     );
 }
 
+#[test]
+fn vector_make_constant_reuses_borrowed_values_and_refreshes_children() -> crate::Result<()> {
+    let env = Environment::new()?;
+    let conn = env.open(StorageLocation::InMemory)?.connect()?;
+    let source = conn
+        .query(
+            "SELECT [1, 2, 3]::INTEGER[], NULL::INTEGER[], 'a long string, not inlined'",
+            Parameters::None,
+        )?
+        .next_chunk()?
+        .expect("one result chunk");
+    let values = (0..3)
+        .map(|index| source.get_vector_at::<crate::vector::Unknown>(index)?.get_value_slow(0))
+        .collect::<crate::Result<Vec<_>>>()?;
+
+    let types = [
+        List::<i32>::logical_type(&conn)?,
+        List::<i32>::logical_type(&conn)?,
+        String::logical_type(&conn)?,
+    ];
+    let mut chunk = DataChunk::create(&conn, &types, true)?;
+    {
+        // Written rows and their child elements are replaced by the constant.
+        let mut lists = chunk.get_vector_at_mut::<List<i32>>(0)?;
+        lists.set_size(2)?;
+        lists.set_child_size(1)?;
+        lists.list_writer()?.set(1, &List(vec![Some(9)]))?;
+        let lists = lists.make_constant(&values[0], 4)?;
+        assert_eq!(
+            (lists.storage_kind(), lists.len(), lists.is_writable()),
+            (StorageKind::Constant, 4, false)
+        );
+        assert_eq!(lists.list_child_len()?, 3);
+        let reader = lists.list_reader()?;
+        for row in 0..4 {
+            let items = RowReader::get(&reader, row)?.map(|items| items.iter().map(|x| x.copied()).collect::<Vec<_>>());
+            assert_eq!(items, Some(vec![Some(1), Some(2), Some(3)]));
+        }
+    }
+    // The same borrowed values build more constants, including a NULL one.
+    let lists = chunk.get_vector_at_mut::<List<i32>>(1)?.make_constant(&values[1], 2)?;
+    assert_eq!(lists.reader()?.get(1)?, None);
+    let lists = chunk.get_vector_at_mut::<List<i32>>(1)?;
+    assert!(
+        lists.make_constant(&values[0], 1).is_err(),
+        "constants are not writable"
+    );
+    let mut text = chunk.get_vector_at_mut::<String>(2)?;
+    text.set_size(1)?;
+    text.writer()?.set(0, "written before the constant")?;
+    let text = text.make_constant(&values[2], 3)?;
+    assert_eq!(text.reader()?.get(2)?, Some("a long string, not inlined"));
+    assert_eq!(values[2].to_string(), "a long string, not inlined");
+
+    // A value of another type is rejected and leaves the vector writable.
+    let mut other = DataChunk::create(&conn, &[i64::logical_type(&conn)?], true)?;
+    assert!(other.get_vector_at_mut::<i64>(0)?.make_constant(&values[2], 1).is_err());
+    assert!(other.get_vector_at_mut::<i64>(0)?.is_writable());
+    Ok(())
+}
+
 #[derive(Debug, AsDuckDB)]
 #[duckdb(reader, writer)]
 struct DynamicStruct {

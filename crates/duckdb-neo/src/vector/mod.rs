@@ -44,7 +44,7 @@
 //! [`WithReader`] and [`WithWriter`], whose readers and writers, such as [`ListReader`] and
 //! [`ListWriter`], prepare their children once and compose for nested types.
 
-use std::{cell::OnceCell, marker::PhantomData};
+use std::{borrow::Borrow, cell::OnceCell, marker::PhantomData};
 
 use crate::builder_helpers::ffi_enum_redeclaration;
 use crate::error::DuckDBError;
@@ -197,17 +197,7 @@ impl<'a, T: NativeElement> Vector<'a, T> {
         let len = check_api_call!(ffi::duckdb_v2_vector_get_size, *handle, RET).map(|x| x as usize)?;
         let access = access.for_kind(kind);
 
-        // DuckDB derives the child count from the type id alone.
-        let children = if type_id.is_none_or(has_children) {
-            let child_count = check_api_call!(ffi::duckdb_v2_vector_get_child_count, *handle, RET)?;
-            let mut child_handles = Vec::with_capacity(child_count as usize);
-            for index in 0..child_count {
-                child_handles.push(check_api_call!(ffi::duckdb_v2_vector_get_child, *handle, index, RET)?);
-            }
-            (!child_handles.is_empty()).then(|| Box::new(VectorCollection::children(child_handles, access)))
-        } else {
-            None
-        };
+        let children = children(*handle, type_id, access)?;
 
         let vector = Self {
             handle: *handle,
@@ -226,6 +216,25 @@ impl<'a, T: NativeElement> Vector<'a, T> {
         vector.validate_as::<T>()?;
         Ok(vector)
     }
+}
+
+/// Fetch the child vectors of a vector, skipping the C API calls for types without children.
+#[inline]
+fn children(
+    handle: ffi::duckdb_v2_vector_handle,
+    type_id: Option<LogicalTypeID>,
+    access: Access,
+) -> Result<Option<Box<VectorCollection>>> {
+    // DuckDB derives the child count from the type id alone.
+    if !type_id.is_none_or(has_children) {
+        return Ok(None);
+    }
+    let child_count = check_api_call!(ffi::duckdb_v2_vector_get_child_count, handle, RET)?;
+    let mut child_handles = Vec::with_capacity(child_count as usize);
+    for index in 0..child_count {
+        child_handles.push(check_api_call!(ffi::duckdb_v2_vector_get_child, handle, index, RET)?);
+    }
+    Ok((!child_handles.is_empty()).then(|| Box::new(VectorCollection::children(child_handles, access))))
 }
 
 /// Whether DuckDB exposes child vectors for vectors of this type.
@@ -677,11 +686,13 @@ impl<'a, T: NativeElement> Vector<'a, T> {
     /// Turn writable output into a constant vector, returning the rebuilt vector.
     ///
     /// `value` must have the vector's logical type. Every logical row contains
-    /// `value`, or is `NULL` when `value` is `NULL`.
+    /// `value`, or is `NULL` when `value` is `NULL`. DuckDB copies `value`, so a
+    /// borrowed value can be reused for later vectors.
     ///
     /// The returned vector is not writable: a constant holds a single
     /// slot, so per-row writes would go past its buffer.
-    pub fn make_constant(self, value: Value, count: usize) -> Result<Self> {
+    pub fn make_constant(mut self, value: impl Borrow<Value>, count: usize) -> Result<Self> {
+        let value = value.borrow();
         if !self.is_writable() {
             return Err(not_writable());
         }
@@ -694,10 +705,16 @@ impl<'a, T: NativeElement> Vector<'a, T> {
 
         check_api_call!(ffi::duckdb_v2_vector_constant_set_valid, self.handle, !value.is_null()?)?;
 
-        // The constant brings its own buffer and child vectors, so rebuild from the handle.
-        let mut vector = Self::from_handle(&self.handle, Access::Exclusive)?;
-        vector.len = count;
-        Ok(vector)
+        // The constant keeps the logical type but replaces the buffer that owned any child vectors.
+        let had_children = self.children.take().is_some();
+        self.kind = StorageKind::Constant;
+        self.len = count;
+        self.set_not_writable();
+        self.refresh_buffers()?;
+        if had_children {
+            self.children = children(self.handle, self.type_id, self.access)?;
+        }
+        Ok(self)
     }
 
     /// Turn writable output into an arithmetic sequence, returning the rebuilt vector.

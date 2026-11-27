@@ -29,6 +29,7 @@ use duckdb_neo::{
         BindFunctionHandle, ExecColumnInfo, InitColumnData, OrderPreservation, PushdownData,
         TableFilterPushdownCallbacks, TableFunctionBuilder, TableFunctionCallbacks,
     },
+    value::Value,
     vector::{NativeElement, WritableNativeElement},
 };
 
@@ -337,8 +338,8 @@ impl TableFunctionCallbacks for Words {
 }
 
 pub struct RepeatBind {
-    s: Option<String>,
-    k: Option<i64>,
+    s: Value,
+    k: Value,
     count: i64,
 }
 
@@ -361,7 +362,11 @@ impl TableFunctionCallbacks for RepeatRow {
         bind_handle.add_result_column("s", &String::logical_type(context)?)?;
         bind_handle.add_result_column("k", &i64::logical_type(context)?)?;
         bind_handle.set_cardinality(count as usize, true)?;
-        Ok(RepeatBind { s, k, count })
+        Ok(RepeatBind {
+            s: s.value(context)?,
+            k: k.value(context)?,
+            count,
+        })
     }
 
     fn init_local_state(
@@ -376,7 +381,7 @@ impl TableFunctionCallbacks for RepeatRow {
 
     fn exec(
         &self,
-        context: &Context,
+        _context: &Context,
         bind_data: &Self::BindData,
         local_state: Option<&mut Self::LocalState>,
         _global_state: Option<&Self::GlobalState>,
@@ -388,18 +393,17 @@ impl TableFunctionCallbacks for RepeatRow {
         if rows == 0 {
             return Ok(());
         }
-        // `make_constant` consumes its value, so every chunk builds its own.
         for position in 0..column_info.count()? {
             match column_info.get_column_index(position)? {
                 0 => {
-                    let value = bind_data.s.value(context)?;
                     output
                         .get_vector_at_mut::<String>(position)?
-                        .make_constant(value, rows)?;
+                        .make_constant(&bind_data.s, rows)?;
                 }
                 1 => {
-                    let value = bind_data.k.value(context)?;
-                    output.get_vector_at_mut::<i64>(position)?.make_constant(value, rows)?;
+                    output
+                        .get_vector_at_mut::<i64>(position)?
+                        .make_constant(&bind_data.k, rows)?;
                 }
                 column => return Err(Error::invalid_input(format!("vs_repeat_row has no column {column}"))),
             }
