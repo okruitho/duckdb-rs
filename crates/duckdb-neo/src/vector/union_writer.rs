@@ -56,9 +56,9 @@ pub unsafe trait UnionWriters: UnionMembers {
     where
         Self: 'w;
 
-    /// NULL `row` of member `member`.
+    /// NULL `row` of every member but `active`; an `active` of at least [`UnionMembers::COUNT`] nulls all.
     #[doc(hidden)]
-    fn set_null(writers: &mut Self::Writers<'_>, member: usize, row: usize) -> Result<()>;
+    fn set_null_except(writers: &mut Self::Writers<'_>, row: usize, active: usize) -> Result<()>;
 
     #[doc(hidden)]
     fn refresh(writers: &mut Self::Writers<'_>) -> Result<()>;
@@ -137,11 +137,14 @@ macro_rules! union_members {
                 Ok(($(unsafe { $name::row_writer(members[$index].cast()) }?,)+))
             }
 
-            fn set_null(writers: &mut Self::Writers<'_>, member: usize, row: usize) -> Result<()> {
-                match member {
-                    $($index => writers.$index.set_null(row),)+
-                    _ => Ok(()),
-                }
+            #[inline(always)]
+            fn set_null_except(writers: &mut Self::Writers<'_>, row: usize, active: usize) -> Result<()> {
+                $(
+                    if active != $index {
+                        writers.$index.set_null(row)?;
+                    }
+                )+
+                Ok(())
             }
 
             fn refresh(writers: &mut Self::Writers<'_>) -> Result<()> {
@@ -389,13 +392,12 @@ impl<'w, M: UnionWriters + 'w> UnionWriter<'w, M> {
     }
 
     /// Make a row SQL NULL, along with its tag and every member.
+    #[inline(always)]
     pub fn set_null(&mut self, row: usize) -> Result<()> {
         if row >= self.len() {
             return Err(out_of_bounds(row, self.len()));
         }
-        for member in 0..M::COUNT {
-            M::set_null(&mut self.members, member, row)?;
-        }
+        M::set_null_except(&mut self.members, row, M::COUNT)?;
         // SAFETY: the row is in bounds of the parent and its tags, which share its rows.
         unsafe {
             self.parent.mark_null_unchecked(row)?;
@@ -416,9 +418,7 @@ impl<'w, M: UnionWriters + 'w> UnionWriter<'w, M> {
         if row >= self.len() {
             return Err(out_of_bounds(row, self.len()));
         }
-        for member in (0..M::COUNT).filter(|member| *member != I) {
-            M::set_null(&mut self.members, member, row)?;
-        }
+        M::set_null_except(&mut self.members, row, I)?;
         // SAFETY: the row is in bounds of every child.
         unsafe {
             self.tags.as_mut_ptr().add(row).write(I as u8);
@@ -574,6 +574,33 @@ mod tests {
         );
         assert_eq!(nulls::<i32>(&vector, 1)?, [false, true, true, true, false]);
         assert_eq!(nulls::<String>(&vector, 2)?, [true, true, true, false, true]);
+        Ok(())
+    }
+
+    #[test]
+    fn union_writer_nulls_every_member_but_the_active_one() -> Result<()> {
+        let conn = connection()?;
+        let union_type = LogicalType::from_text(&conn, "UNION(a INTEGER, b VARCHAR, c DOUBLE)")?;
+        let mut chunk = DataChunk::create(&conn, &[union_type], true)?;
+        let mut vector = chunk.get_vector_at_mut::<Union>(0)?;
+        vector.set_size(3)?;
+        {
+            let mut writer = vector.union_writer::<(i32, String, f64)>()?;
+            writer.set::<1>(0, "b")?;
+            writer.set::<2>(1, &1.5)?;
+            writer.set::<1>(1, "b")?;
+            writer.set::<0>(1, &3)?;
+            writer.set::<2>(2, &2.5)?;
+            writer.set_null(2)?;
+        }
+        assert_eq!(nulls::<i32>(&vector, 1)?, [true, false, true]);
+        assert_eq!(nulls::<String>(&vector, 2)?, [false, true, true]);
+        assert_eq!(nulls::<f64>(&vector, 3)?, [true, true, true]);
+        assert_eq!(nulls::<u8>(&vector, 0)?, [false, false, true]);
+        let values = (0..3)
+            .map(|row| vector.get_value_slow(row)?.dbg_string())
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(values, ["b", "3", "NULL"]);
         Ok(())
     }
 
