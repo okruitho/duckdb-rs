@@ -2,11 +2,13 @@ use std::marker::PhantomData;
 
 use super::{ScalarCallbacks, ScalarFunctionBuilder};
 use crate::{
-    DuckDBType, Result,
+    DuckDBType, Error, Result,
     connection::Context,
     data_chunk::VectorCollection,
     signature::{FunctionParameter, SignatureBuilder, TypeDeclaration},
-    vector::{NativeElement, Unknown, Vector, WritableNativeElement},
+    vector::{
+        NativeElement, PlainNative, RowLayout, StorageKind, Unknown, Vector, VectorReader, WritableNativeElement,
+    },
 };
 
 /// Creates scalar functions from vector closures.
@@ -14,6 +16,8 @@ use crate::{
 /// [`Self::create`] infers a unary signature from the input and output element
 /// types. [`Self::with_signature`] accepts an explicit signature and an input
 /// collection for multiple arguments, varargs, or runtime logical types.
+/// [`Self::unary`] through [`Self::quaternary`] take a function of one row
+/// instead, for plain argument and result types.
 /// The output vector is already sized to the batch's row count; the closure
 /// must write every output row. DuckDB's default NULL handling applies unless
 /// overridden with [`ScalarFunctionBuilder::set_property`].
@@ -88,7 +92,430 @@ impl MicroScalar {
             },
         )
     }
+
+    /// Infer the signature from the argument and result types, and call `function` once per row.
+    ///
+    /// The peer of DuckDB's `ScalarExecutor`: storage and validity are resolved once per batch, a NULL in a
+    /// [`PlainNative`] argument makes the row NULL without a call, and batches without NULLs run a loop that
+    /// LLVM can vectorize. [`RowArgument`] and [`RowResult`] describe the `Option` forms. The parameter is named
+    /// `input`, and `SEQUENCE` arguments are flattened first.
+    ///
+    /// ```
+    /// use duckdb_neo::{Parameters, environment::{Environment, StorageLocation}, scalar::MicroScalar};
+    ///
+    /// # fn main() -> duckdb_neo::Result<()> {
+    /// let conn = Environment::new()?.open(StorageLocation::InMemory)?.connect()?;
+    /// MicroScalar::unary("halve", |value: i64| (value % 2 == 0).then_some(value / 2)).register(&conn)?;
+    ///
+    /// let chunk = conn.query("SELECT halve(i) FROM range(4) t(i)", Parameters::None)?.next_chunk()?.unwrap();
+    /// let rows = chunk.get_vector_at::<i64>(0)?.reader()?.iter().map(|v| v.copied()).collect::<Vec<_>>();
+    /// assert_eq!(rows, [Some(0), None, Some(1), None]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn unary<A, R, F>(name: impl Into<String>, function: F) -> ScalarFunctionBuilder<impl ScalarCallbacks>
+    where
+        A: RowArgument,
+        R: RowResult,
+        F: Fn(A) -> R + Send + Sync + 'static,
+    {
+        Self::rows::<(A,), R, F>(name, &["input"], function)
+    }
+
+    /// As [`Self::unary`], for two arguments named `arg0` and `arg1`.
+    ///
+    /// ```
+    /// use duckdb_neo::{Parameters, environment::{Environment, StorageLocation}, scalar::MicroScalar};
+    ///
+    /// # fn main() -> duckdb_neo::Result<()> {
+    /// let conn = Environment::new()?.open(StorageLocation::InMemory)?.connect()?;
+    /// MicroScalar::binary("checked_div", |a: i64, b: i64| a.checked_div(b)).register(&conn)?;
+    ///
+    /// let chunk = conn.query("SELECT checked_div(7, 2), checked_div(7, 0)", Parameters::None)?.next_chunk()?.unwrap();
+    /// assert_eq!(chunk.get_vector_at::<i64>(0)?.reader()?.get(0)?, Some(&3));
+    /// assert_eq!(chunk.get_vector_at::<i64>(1)?.reader()?.get(0)?, None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn binary<A, B, R, F>(name: impl Into<String>, function: F) -> ScalarFunctionBuilder<impl ScalarCallbacks>
+    where
+        A: RowArgument,
+        B: RowArgument,
+        R: RowResult,
+        F: Fn(A, B) -> R + Send + Sync + 'static,
+    {
+        Self::rows::<(A, B), R, F>(name, &["arg0", "arg1"], function)
+    }
+
+    /// As [`Self::unary`], for three arguments named `arg0` to `arg2`.
+    pub fn ternary<A, B, C, R, F>(name: impl Into<String>, function: F) -> ScalarFunctionBuilder<impl ScalarCallbacks>
+    where
+        A: RowArgument,
+        B: RowArgument,
+        C: RowArgument,
+        R: RowResult,
+        F: Fn(A, B, C) -> R + Send + Sync + 'static,
+    {
+        Self::rows::<(A, B, C), R, F>(name, &["arg0", "arg1", "arg2"], function)
+    }
+
+    /// As [`Self::unary`], for four arguments named `arg0` to `arg3`.
+    pub fn quaternary<A, B, C, D, R, F>(
+        name: impl Into<String>,
+        function: F,
+    ) -> ScalarFunctionBuilder<impl ScalarCallbacks>
+    where
+        A: RowArgument,
+        B: RowArgument,
+        C: RowArgument,
+        D: RowArgument,
+        R: RowResult,
+        F: Fn(A, B, C, D) -> R + Send + Sync + 'static,
+    {
+        Self::rows::<(A, B, C, D), R, F>(name, &["arg0", "arg1", "arg2", "arg3"], function)
+    }
+
+    fn rows<Args: RowArguments, R: RowResult, F>(
+        name: impl Into<String>,
+        names: &[&str],
+        function: F,
+    ) -> ScalarFunctionBuilder<RowCallback<Args, R, F>>
+    where
+        RowCallback<Args, R, F>: ScalarCallbacks,
+    {
+        let mut signature = Args::parameters(names);
+        signature.return_type = Some(TypeDeclaration::rust_type::<R::Element>());
+        ScalarFunctionBuilder::new(
+            name,
+            signature,
+            RowCallback {
+                function,
+                types: PhantomData,
+            },
+        )
+    }
 }
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// An argument of the row functions of [`MicroScalar::unary`] to [`MicroScalar::quaternary`].
+///
+/// A [`PlainNative`] type gets the value of each row where it is not NULL; a NULL in it makes the result
+/// NULL without calling the function, DuckDB's default. `Option<T>` gets NULL as `None`, for functions
+/// registered with [`FunctionProperty::HasSpecialNullHandling`](crate::enums::FunctionProperty::HasSpecialNullHandling);
+/// without it, DuckDB may already fold constant NULL arguments to a NULL result.
+pub trait RowArgument: sealed::Sealed + 'static {
+    /// The element type of the SQL parameter.
+    type Element: PlainNative + DuckDBType + 'static;
+    #[doc(hidden)]
+    const NULLABLE: bool;
+    #[doc(hidden)]
+    fn from_row(value: Option<Self::Element>) -> Self;
+}
+
+/// The result of a row function of [`MicroScalar::unary`] to [`MicroScalar::quaternary`]: a [`PlainNative`]
+/// value, or `Option` of one, whose `None` makes the row NULL.
+pub trait RowResult: sealed::Sealed + 'static {
+    /// The element type of the SQL result.
+    type Element: PlainNative + DuckDBType + 'static;
+    #[doc(hidden)]
+    fn into_row(self) -> Option<Self::Element>;
+}
+
+impl<T: PlainNative + DuckDBType + 'static> sealed::Sealed for T {}
+
+impl<T: PlainNative + DuckDBType + 'static> sealed::Sealed for Option<T> {}
+
+impl<T: PlainNative + DuckDBType + 'static> RowArgument for T {
+    type Element = T;
+    const NULLABLE: bool = false;
+
+    #[inline(always)]
+    fn from_row(value: Option<T>) -> T {
+        value.expect("NULL rows of plain arguments do not reach the row function")
+    }
+}
+
+impl<T: PlainNative + DuckDBType + 'static> RowArgument for Option<T> {
+    type Element = T;
+    const NULLABLE: bool = true;
+
+    #[inline(always)]
+    fn from_row(value: Option<T>) -> Self {
+        value
+    }
+}
+
+impl<T: PlainNative + DuckDBType + 'static> RowResult for T {
+    type Element = T;
+
+    #[inline(always)]
+    fn into_row(self) -> Option<T> {
+        Some(self)
+    }
+}
+
+impl<T: PlainNative + DuckDBType + 'static> RowResult for Option<T> {
+    type Element = T;
+
+    #[inline(always)]
+    fn into_row(self) -> Option<T> {
+        self
+    }
+}
+
+/// Tuples of row arguments, which declare their parameters.
+trait RowArguments {
+    fn parameters(names: &[&str]) -> SignatureBuilder;
+}
+
+struct RowCallback<Args, R, F> {
+    function: F,
+    types: PhantomData<fn() -> (Args, R)>,
+}
+
+/// One argument's rows, read with the storage resolved once per batch.
+struct Column<'v, A: RowArgument> {
+    data: *const A::Element,
+    layout: RowLayout,
+    len: usize,
+    _reader: PhantomData<&'v A::Element>,
+}
+
+impl<'v, A: RowArgument> Column<'v, A> {
+    fn new(reader: &VectorReader<'v, A::Element>, rows: usize) -> Result<Self> {
+        if reader.len() < rows {
+            return Err(Error::invalid_input(format!(
+                "argument has {} rows, expected {rows}",
+                reader.len()
+            )));
+        }
+        Ok(Self {
+            data: reader.as_ptr().cast(),
+            layout: reader.layout(),
+            len: reader.len(),
+            _reader: PhantomData,
+        })
+    }
+
+    /// Return a lane without per-row storage or validity tests, if every row is valid in flat or constant storage.
+    #[inline(always)]
+    fn dense(&self) -> Option<Dense<A>> {
+        match self.layout {
+            RowLayout::Flat { validity } if validity.is_null() => Some(Dense::Flat(FlatLane(self.data))),
+            // SAFETY: a valid constant with rows holds an initialized value in slot zero.
+            RowLayout::Constant { is_null: false } if self.len != 0 => {
+                Some(Dense::Constant(ConstantLane(unsafe { *self.data })))
+            }
+            _ => None,
+        }
+    }
+
+    /// Return the validity of rows `start..end` for NULL propagation: `Option` arguments are never NULL.
+    ///
+    /// # Safety
+    /// As for [`RowLayout::validity_word`].
+    #[inline(always)]
+    unsafe fn validity_word(&self, start: usize, end: usize) -> u64 {
+        // SAFETY: the caller guarantees the rows.
+        if A::NULLABLE {
+            u64::MAX
+        } else {
+            unsafe { self.layout.validity_word(start, end) }
+        }
+    }
+}
+
+/// An argument's value per row.
+trait Lane {
+    type Argument;
+
+    /// # Safety
+    /// `row` must be a row of the lane; for a plain argument, one where it is valid.
+    unsafe fn get(&self, row: usize) -> Self::Argument;
+}
+
+impl<A: RowArgument> Lane for Column<'_, A> {
+    type Argument = A;
+
+    #[inline(always)]
+    unsafe fn get(&self, row: usize) -> A {
+        // SAFETY: the caller guarantees the row; slots of valid rows hold initialized values of the slot type.
+        unsafe {
+            if A::NULLABLE {
+                A::from_row(self.layout.valid_physical(row).map(|physical| *self.data.add(physical)))
+            } else {
+                A::from_row(Some(*self.data.add(self.layout.physical(row))))
+            }
+        }
+    }
+}
+
+enum Dense<A: RowArgument> {
+    Flat(FlatLane<A>),
+    Constant(ConstantLane<A>),
+}
+
+struct FlatLane<A: RowArgument>(*const A::Element);
+
+impl<A: RowArgument> Lane for FlatLane<A> {
+    type Argument = A;
+
+    #[inline(always)]
+    unsafe fn get(&self, row: usize) -> A {
+        // SAFETY: the caller guarantees the row, and every row of a flat vector without a mask is valid.
+        A::from_row(Some(unsafe { *self.0.add(row) }))
+    }
+}
+
+struct ConstantLane<A: RowArgument>(A::Element);
+
+impl<A: RowArgument> Lane for ConstantLane<A> {
+    type Argument = A;
+
+    #[inline(always)]
+    unsafe fn get(&self, _row: usize) -> A {
+        A::from_row(Some(self.0))
+    }
+}
+
+/// Flatten `SEQUENCE` and other arguments the readers cannot read.
+fn flatten_unreadable(input: &mut VectorCollection) -> Result<()> {
+    for index in 0..input.col_count() {
+        if input.get_untyped_vector_at(index)?.storage_kind() == StorageKind::Other {
+            input.get_untyped_vector_at_mut(index)?.flatten()?;
+        }
+    }
+    Ok(())
+}
+
+impl<A: RowArgument> RowArguments for (A,) {
+    fn parameters(names: &[&str]) -> SignatureBuilder {
+        SignatureBuilder::new().param(FunctionParameter::new::<A::Element>(names[0]))
+    }
+}
+
+impl<A, R, F> ScalarCallbacks for RowCallback<(A,), R, F>
+where
+    A: RowArgument,
+    R: RowResult,
+    F: Fn(A) -> R + Send + Sync + 'static,
+{
+    type BindData = ();
+    type InitData = ();
+
+    fn exec(
+        &self,
+        _context: &Context,
+        _bind_data: Option<&Self::BindData>,
+        _init_data: Option<&mut Self::InitData>,
+        input: &mut VectorCollection,
+        output: Vector<'_, Unknown>,
+    ) -> Result<()> {
+        let rows = input.row_count()?;
+        flatten_unreadable(input)?;
+        let reader = input.get_vector_at::<A::Element>(0)?.reader()?;
+        let column = Column::<A>::new(&reader, rows)?;
+        let mut output = output.cast::<R::Element>()?;
+        let mut writer = output.writer()?;
+        let (function, data, layout) = (&self.function, column.data, column.layout);
+        // SAFETY: `map_layout` writes or NULLs each of the `rows` rows, all of which the column holds; `read`
+        // gets the slot of a valid row, which holds an initialized value of the slot type.
+        unsafe {
+            writer.resize_and_write(rows, move |writer| {
+                writer.map_layout(
+                    rows,
+                    layout,
+                    !A::NULLABLE,
+                    |physical, _| *data.add(physical),
+                    |value| Ok(function(A::from_row(value)).into_row()),
+                )
+            })
+        }
+    }
+}
+
+/// Expand `body` once per combination of flat and constant lanes, rebinding each column to its lane.
+macro_rules! dense_lanes {
+    ([] => $body:expr) => {
+        $body
+    };
+    ([$column:ident $($rest:ident)*] => $body:expr) => {
+        match $column {
+            Dense::Flat(lane) => {
+                let $column = lane;
+                dense_lanes!([$($rest)*] => $body)
+            }
+            Dense::Constant(lane) => {
+                let $column = lane;
+                dense_lanes!([$($rest)*] => $body)
+            }
+        }
+    };
+}
+
+macro_rules! row_callback {
+    ($(($argument:ident, $column:ident, $index:tt)),+) => {
+        impl<$($argument: RowArgument),+> RowArguments for ($($argument,)+) {
+            fn parameters(names: &[&str]) -> SignatureBuilder {
+                SignatureBuilder::new()
+                    $(.param(FunctionParameter::new::<$argument::Element>(names[$index])))+
+            }
+        }
+
+        impl<$($argument,)+ R, F> ScalarCallbacks for RowCallback<($($argument,)+), R, F>
+        where
+            $($argument: RowArgument,)+
+            R: RowResult,
+            F: Fn($($argument),+) -> R + Send + Sync + 'static,
+        {
+            type BindData = ();
+            type InitData = ();
+
+            fn exec(
+                &self,
+                _context: &Context,
+                _bind_data: Option<&Self::BindData>,
+                _init_data: Option<&mut Self::InitData>,
+                input: &mut VectorCollection,
+                output: Vector<'_, Unknown>,
+            ) -> Result<()> {
+                let rows = input.row_count()?;
+                flatten_unreadable(input)?;
+                $(let $column = input.get_vector_at::<$argument::Element>($index)?.reader()?;)+
+                $(let $column = Column::<$argument>::new(&$column, rows)?;)+
+                let mut output = output.cast::<R::Element>()?;
+                let mut writer = output.writer()?;
+                let function = &self.function;
+                let propagate_nulls = !(true $(&& $argument::NULLABLE)+);
+                // SAFETY: `write_rows` writes or NULLs each of the `rows` rows, all of which every column holds. It
+                // only reads rows whose plain arguments are all valid, and dense lanes have no NULL rows.
+                unsafe {
+                    writer.resize_and_write(rows, move |writer| match ($($column.dense(),)+) {
+                        ($(Some($column),)+) => dense_lanes!([$($column)+] => writer.write_rows(
+                            rows,
+                            propagate_nulls,
+                            |_, _| u64::MAX,
+                            |row, _| Ok(function($($column.get(row)),+).into_row()),
+                        )),
+                        _ => writer.write_rows(
+                            rows,
+                            propagate_nulls,
+                            |start, end| u64::MAX $(& $column.validity_word(start, end))+,
+                            |row, _| Ok(function($($column.get(row)),+).into_row()),
+                        ),
+                    })
+                }
+            }
+        }
+    };
+}
+
+row_callback!((A, a, 0), (B, b, 1));
+row_callback!((A, a, 0), (B, b, 1), (C, c, 2));
+row_callback!((A, a, 0), (B, b, 1), (C, c, 2), (D, d, 3));
 
 struct TypedCallback<O, F> {
     function: F,

@@ -686,7 +686,7 @@ impl<T: PlainNative> VectorWriter<'_, T> {
     /// `len` must not exceed [`Self::len`], `layout` must describe at least `len` rows, and `read` must be sound for
     /// each valid row and its slot.
     #[inline(always)]
-    unsafe fn map_layout<V>(
+    pub(crate) unsafe fn map_layout<V>(
         &mut self,
         len: usize,
         layout: RowLayout,
@@ -734,7 +734,7 @@ impl<T: PlainNative> VectorWriter<'_, T> {
     /// # Safety
     /// `len` must not exceed [`Self::len`], and both closures must be sound for every row below `len`.
     #[inline(always)]
-    unsafe fn write_rows(
+    pub(crate) unsafe fn write_rows(
         &mut self,
         len: usize,
         propagate_nulls: bool,
@@ -783,6 +783,51 @@ impl<T: PlainNative> VectorWriter<'_, T> {
             start = end;
         }
         Ok(())
+    }
+
+    /// Resize to `len` rows without zeroing them, then run `write`; if it fails or panics, zero every row.
+    ///
+    /// # Safety
+    /// When `write` succeeds, it must have written or marked NULL each of the `len` rows.
+    #[inline(always)]
+    pub(crate) unsafe fn resize_and_write(
+        &mut self,
+        len: usize,
+        write: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
+        let old = self.len();
+        // SAFETY: the new rows are written by `write`, or zeroed, before this returns.
+        let resized = unsafe { self.vector_mut().set_size_uninit(len) };
+        self.len = self.vector().len();
+        if let Err(error) = resized.and_then(|()| self.refresh_buffers()) {
+            let len = self.len;
+            self.vector_mut().init_rows(old, len)?;
+            self.refresh_buffers()?;
+            return Err(error);
+        }
+        let zero = ZeroRowsOnDrop {
+            data: self.data.cast::<T>(),
+            len: self.len,
+        };
+        write(self)?;
+        std::mem::forget(zero);
+        Ok(())
+    }
+}
+
+/// Zeroes `len` plain slots when dropped, so that a failed write leaves no row uninitialized.
+struct ZeroRowsOnDrop<T> {
+    data: *mut T,
+    len: usize,
+}
+
+impl<T> Drop for ZeroRowsOnDrop<T> {
+    fn drop(&mut self) {
+        if self.len != 0 && !self.data.is_null() {
+            // SAFETY: the slots are the writer's flat rows, and zero bytes are a valid value of every plain slot type,
+            // as `init_rows` relies on too.
+            unsafe { self.data.write_bytes(0, self.len) };
+        }
     }
 }
 

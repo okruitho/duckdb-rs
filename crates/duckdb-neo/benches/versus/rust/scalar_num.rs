@@ -17,22 +17,11 @@ use duckdb_neo::{
     enums::FunctionProperty,
     scalar::{MicroScalar, ScalarBindCallbacks, ScalarCallbacks, ScalarFunctionBuilder},
     signature::{FunctionParameter, SignatureBuilder},
-    vector::{CombinedVectorIterator, Unknown, Vector},
+    vector::{Unknown, Vector},
 };
 
-#[expect(clippy::manual_try_fold, reason = "the readers specialize `fold` but not `try_fold`")]
 fn register_add_one(conn: &Connection) -> Result<()> {
-    MicroScalar::create(
-        "vs_add_one",
-        |_context, input: Vector<'_, i64>, mut output: Vector<'_, i64>| {
-            let mut writer = output.writer()?;
-            // `fold` resolves the reader's storage kind once per batch; `for` dispatches per row through `next`.
-            input.reader()?.iter().enumerate().fold(Ok(()), |result, (row, value)| {
-                result.and_then(|()| writer.set_option(row, value.map(|value| value.wrapping_add(1)).as_ref()))
-            })
-        },
-    )
-    .register(conn)
+    MicroScalar::unary("vs_add_one", |value: i64| value.wrapping_add(1)).register(conn)
 }
 
 // Spelled like C++'s `std::min(std::max(v, lo), hi)`, which differs from `f64::max`/`f64::min` on NaN.
@@ -42,109 +31,26 @@ fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
 }
 
 fn register_clamp(conn: &Connection) -> Result<()> {
-    let signature = SignatureBuilder::new()
-        .param(FunctionParameter::new::<f64>("v"))
-        .param(FunctionParameter::new::<f64>("lo"))
-        .param(FunctionParameter::new::<f64>("hi"))
-        .return_type(f64::logical_type(conn)?);
-    MicroScalar::with_signature("vs_clamp", signature, |_context, input, mut output: Vector<'_, f64>| {
-        let rows = CombinedVectorIterator::new((
-            input.get_vector_at::<f64>(0)?.reader()?,
-            input.get_vector_at::<f64>(1)?.reader()?,
-            input.get_vector_at::<f64>(2)?.reader()?,
-        ))?;
-        let mut writer = output.writer()?;
-        for (row, values) in rows.enumerate() {
-            let result = match values {
-                (Some(v), Some(lo), Some(hi)) => Some(clamp(*v, *lo, *hi)),
-                _ => None,
-            };
-            writer.set_option(row, result.as_ref())?;
-        }
-        Ok(())
-    })
-    .register(conn)
+    MicroScalar::ternary("vs_clamp", |v: f64, lo: f64, hi: f64| clamp(v, lo, hi)).register(conn)
 }
 
 fn register_is_even(conn: &Connection) -> Result<()> {
-    MicroScalar::create(
-        "vs_is_even",
-        |_context, input: Vector<'_, i64>, mut output: Vector<'_, bool>| {
-            let mut writer = output.writer()?;
-            for (row, value) in input.reader()?.iter().enumerate() {
-                writer.set_option(row, value.map(|value| value % 2 == 0).as_ref())?;
-            }
-            Ok(())
-        },
-    )
-    .register(conn)
+    MicroScalar::unary("vs_is_even", |value: i64| value % 2 == 0).register(conn)
 }
 
 fn register_coalesce_zero(conn: &Connection) -> Result<()> {
-    MicroScalar::create(
-        "vs_coalesce_zero",
-        |_context, input: Vector<'_, i64>, mut output: Vector<'_, i64>| {
-            let mut writer = output.writer()?;
-            for (row, value) in input.reader()?.iter().enumerate() {
-                writer.set(row, &value.copied().unwrap_or(0))?;
-            }
-            Ok(())
-        },
-    )
-    .set_property(FunctionProperty::HasSpecialNullHandling(true))
-    .register(conn)
+    MicroScalar::unary("vs_coalesce_zero", |value: Option<i64>| value.unwrap_or(0))
+        .set_property(FunctionProperty::HasSpecialNullHandling(true))
+        .register(conn)
 }
 
 fn register_checked_div(conn: &Connection) -> Result<()> {
-    let signature = SignatureBuilder::new()
-        .param(FunctionParameter::new::<i64>("a"))
-        .param(FunctionParameter::new::<i64>("b"))
-        .return_type(i64::logical_type(conn)?);
-    MicroScalar::with_signature(
-        "vs_checked_div",
-        signature,
-        |_context, input, mut output: Vector<'_, i64>| {
-            let rows = CombinedVectorIterator::new((
-                input.get_vector_at::<i64>(0)?.reader()?,
-                input.get_vector_at::<i64>(1)?.reader()?,
-            ))?;
-            let mut writer = output.writer()?;
-            for (row, values) in rows.enumerate() {
-                let result = match values {
-                    (Some(a), Some(b)) => a.checked_div(*b),
-                    _ => None,
-                };
-                writer.set_option(row, result.as_ref())?;
-            }
-            Ok(())
-        },
-    )
-    .register(conn)
+    MicroScalar::binary("vs_checked_div", |a: i64, b: i64| a.checked_div(b)).register(conn)
 }
 
 fn register_mix(conn: &Connection) -> Result<()> {
-    let signature = SignatureBuilder::new()
-        .param(FunctionParameter::new::<i32>("a"))
-        .param(FunctionParameter::new::<i64>("b"))
-        .param(FunctionParameter::new::<f64>("c"))
-        .param(FunctionParameter::new::<i16>("d"))
-        .return_type(f64::logical_type(conn)?);
-    MicroScalar::with_signature("vs_mix", signature, |_context, input, mut output: Vector<'_, f64>| {
-        let rows = CombinedVectorIterator::new((
-            input.get_vector_at::<i32>(0)?.reader()?,
-            input.get_vector_at::<i64>(1)?.reader()?,
-            input.get_vector_at::<f64>(2)?.reader()?,
-            input.get_vector_at::<i16>(3)?.reader()?,
-        ))?;
-        let mut writer = output.writer()?;
-        for (row, values) in rows.enumerate() {
-            let result = match values {
-                (Some(a), Some(b), Some(c), Some(d)) => Some(f64::from(*a) * c + *b as f64 - f64::from(*d)),
-                _ => None,
-            };
-            writer.set_option(row, result.as_ref())?;
-        }
-        Ok(())
+    MicroScalar::quaternary("vs_mix", |a: i32, b: i64, c: f64, d: i16| {
+        f64::from(a) * c + b as f64 - f64::from(d)
     })
     .register(conn)
 }
@@ -153,17 +59,12 @@ fn register_strict_sqrt(conn: &Connection) -> Result<()> {
     MicroScalar::create(
         "vs_strict_sqrt",
         |_context, input: Vector<'_, f64>, mut output: Vector<'_, f64>| {
-            let mut writer = output.writer()?;
-            for (row, value) in input.reader()?.iter().enumerate() {
-                match value {
-                    Some(value) if *value < 0.0 => {
-                        return Err(Error::invalid_input("vs_strict_sqrt: negative input"));
-                    }
-                    Some(value) => writer.set(row, &value.sqrt())?,
-                    None => writer.set_null(row)?,
+            output.writer()?.try_map_from(&input.reader()?, |value| {
+                if *value < 0.0 {
+                    return Err(Error::invalid_input("vs_strict_sqrt: negative input"));
                 }
-            }
-            Ok(())
+                Ok(value.sqrt())
+            })
         },
     )
     .register(conn)
@@ -196,15 +97,14 @@ impl ScalarCallbacks for Scale {
         let factor = *bind_data.ok_or_else(|| Error::invalid_input("vs_scale: missing bind data"))?;
         let mut output = output.cast::<i64>()?;
         output.set_size(vectors.row_count()?)?;
-        let mut writer = output.writer()?;
-        for (row, value) in vectors.get_vector_at::<i64>(0)?.reader()?.iter().enumerate() {
-            let result = match (value, factor) {
-                (Some(value), Some(factor)) => Some(value.wrapping_mul(factor)),
-                _ => None,
-            };
-            writer.set_option(row, result.as_ref())?;
-        }
-        Ok(())
+        output
+            .writer()?
+            .map_option_from(&vectors.get_vector_at::<i64>(0)?.reader()?, |value| {
+                match (value, factor) {
+                    (Some(value), Some(factor)) => Some(value.wrapping_mul(factor)),
+                    _ => None,
+                }
+            })
     }
 }
 

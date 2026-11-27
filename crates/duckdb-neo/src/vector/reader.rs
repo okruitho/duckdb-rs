@@ -409,6 +409,37 @@ pub(crate) enum RowLayout {
 }
 
 impl RowLayout {
+    /// Return row `row`'s slot.
+    ///
+    /// # Safety
+    /// `row` must be a row of the layout's reader.
+    #[inline(always)]
+    pub(crate) unsafe fn physical(&self, row: usize) -> usize {
+        match *self {
+            Self::Flat { .. } => row,
+            Self::Constant { .. } => 0,
+            // SAFETY: the caller guarantees the selection holds the row.
+            Self::Dictionary { selection, .. } => (unsafe { *selection.add(row) }) as usize,
+        }
+    }
+
+    /// Return row `row`'s slot, or `None` for a NULL row.
+    ///
+    /// # Safety
+    /// `row` must be a row of the layout's reader.
+    #[inline(always)]
+    pub(crate) unsafe fn valid_physical(&self, row: usize) -> Option<usize> {
+        match *self {
+            // SAFETY: the caller guarantees bounds; the mask covers every slot.
+            Self::Flat { validity } => unsafe { FlatReader::is_valid_unchecked(validity, row) }.then_some(row),
+            Self::Constant { is_null } => (!is_null).then_some(0),
+            // SAFETY: as above, and the selection holds the row.
+            Self::Dictionary { selection, validity } => unsafe {
+                DictionaryReader::physical_index_unchecked(validity, selection, row)
+            },
+        }
+    }
+
     /// Return the validity of rows `start..end`, at most 64, as bit `i` for row `start + i`.
     ///
     /// # Safety
