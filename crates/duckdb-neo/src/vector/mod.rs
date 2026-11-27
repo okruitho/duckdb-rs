@@ -57,7 +57,7 @@ use crate::{
     data_chunk::{ChildrenMut, VectorCollection},
     error::Error,
     ffi,
-    logical_type::LogicalType,
+    logical_type::{LogicalType, LogicalTypeID},
     value::Value,
 };
 
@@ -170,6 +170,8 @@ pub struct Vector<'a, T: NativeElement> {
     pub(crate) handle: ffi::duckdb_v2_vector_handle,
     pub(crate) access: Access,
     kind: StorageKind,
+    /// `None` for an id this crate does not know.
+    type_id: Option<LogicalTypeID>,
     logical_type: LogicalType,
     len: usize,
     /// Prepared read metadata, dropped by every operation that may replace storage.
@@ -188,28 +190,29 @@ impl<'a, T: NativeElement> Vector<'a, T> {
     pub(crate) fn from_handle(handle: &ffi::duckdb_v2_vector_handle, access: Access) -> Result<Self> {
         let logical_type = check_api_call!(ffi::duckdb_v2_vector_get_logical_type, *handle, RET)
             .map(|handle| LogicalType { handle })?;
+        let type_id = check_api_call!(ffi::duckdb_v2_logical_type_get_id, logical_type.handle, RET)?;
+        let type_id = LogicalTypeID::try_from(type_id).ok();
 
-        let kind =
-            check_api_call!(ffi::duckdb_v2_vector_get_vector_type, *handle, RET).map(StorageKind::try_from)??;
+        let kind = check_api_call!(ffi::duckdb_v2_vector_get_vector_type, *handle, RET).map(StorageKind::from_ffi)?;
         let len = check_api_call!(ffi::duckdb_v2_vector_get_size, *handle, RET).map(|x| x as usize)?;
         let access = access.for_kind(kind);
 
-        let child_count = check_api_call!(ffi::duckdb_v2_vector_get_child_count, *handle, RET).map(|x| x as usize)?;
-        let mut child_handles = Vec::with_capacity(child_count as usize);
-        for index in 0..child_count {
-            child_handles.push(check_api_call!(
-                ffi::duckdb_v2_vector_get_child,
-                *handle,
-                index as u64,
-                RET
-            )?);
-        }
-
-        let children = (!child_handles.is_empty()).then(|| Box::new(VectorCollection::children(child_handles, access)));
+        // DuckDB derives the child count from the type id alone.
+        let children = if type_id.is_none_or(has_children) {
+            let child_count = check_api_call!(ffi::duckdb_v2_vector_get_child_count, *handle, RET)?;
+            let mut child_handles = Vec::with_capacity(child_count as usize);
+            for index in 0..child_count {
+                child_handles.push(check_api_call!(ffi::duckdb_v2_vector_get_child, *handle, index, RET)?);
+            }
+            (!child_handles.is_empty()).then(|| Box::new(VectorCollection::children(child_handles, access)))
+        } else {
+            None
+        };
 
         let vector = Self {
             handle: *handle,
             logical_type,
+            type_id,
             kind,
             len,
             access,
@@ -222,6 +225,33 @@ impl<'a, T: NativeElement> Vector<'a, T> {
         };
         vector.validate_as::<T>()?;
         Ok(vector)
+    }
+}
+
+/// Whether DuckDB exposes child vectors for vectors of this type.
+#[inline]
+fn has_children(id: LogicalTypeID) -> bool {
+    matches!(
+        id,
+        LogicalTypeID::List
+            | LogicalTypeID::Map
+            | LogicalTypeID::Array
+            | LogicalTypeID::Struct
+            | LogicalTypeID::Tuple
+            | LogicalTypeID::Union
+    )
+}
+
+impl StorageKind {
+    /// Convert without failing: a kind this crate does not know must be flattened like `OTHER`.
+    #[inline(always)]
+    fn from_ffi(kind: ffi::DUCKDB_V2_VECTOR_TYPE) -> Self {
+        match kind {
+            ffi::DUCKDB_V2_VECTOR_TYPE::DUCKDB_V2_VECTOR_TYPE_FLAT => Self::Flat,
+            ffi::DUCKDB_V2_VECTOR_TYPE::DUCKDB_V2_VECTOR_TYPE_CONSTANT => Self::Constant,
+            ffi::DUCKDB_V2_VECTOR_TYPE::DUCKDB_V2_VECTOR_TYPE_DICTIONARY => Self::Dictionary,
+            _ => Self::Other,
+        }
     }
 }
 
@@ -308,6 +338,7 @@ impl<'a, T: NativeElement> Vector<'a, T> {
         Vector {
             handle: self.handle,
             logical_type: self.logical_type,
+            type_id: self.type_id,
             kind: self.kind,
             len: self.len,
             access: self.access,
@@ -504,7 +535,15 @@ impl<'a, T: NativeElement> Vector<'a, T> {
         Ok(())
     }
 
+    #[inline]
     pub(crate) fn validate_as<U: NativeElement>(&self) -> Result<()> {
+        if U::VALIDATES_BY_ID && self.type_id == Some(U::TYPE_ID) {
+            return Ok(());
+        }
+        self.validate_slow::<U>()
+    }
+
+    fn validate_slow<U: NativeElement>(&self) -> Result<()> {
         match U::validate(self.logical_type(), self.children.as_deref()) {
             Ok(true) => Ok(()),
             Ok(false) => Err(Error::invalid_input(format!(

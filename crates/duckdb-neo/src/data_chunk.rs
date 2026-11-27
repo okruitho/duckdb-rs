@@ -30,11 +30,13 @@ fn check_distinct(indices: &[usize]) -> Result<()> {
 }
 
 fn collect_array<V, const N: usize>(results: [Result<V>; N]) -> Result<[V; N]> {
-    let vectors = results.into_iter().collect::<Result<Vec<_>>>()?;
-    match vectors.try_into() {
-        Ok(array) => Ok(array),
-        Err(_) => unreachable!("collected exactly N vectors"),
+    if results.iter().any(Result::is_err) {
+        return Err(results
+            .into_iter()
+            .find_map(Result::err)
+            .expect("one result is an error"));
     }
+    Ok(results.map(|result| result.unwrap_or_else(|_| unreachable!("every result is Ok"))))
 }
 
 /// Input vectors and their row count for scalar and aggregate callbacks, and
@@ -826,6 +828,7 @@ mod tests {
         let mut failing = unsafe { VectorCollection::arguments(info, 2, fail, Access::Exclusive, RowCount::Fixed(1)) };
         assert!(failing.get_vector_at::<i64>(0).is_err());
         assert!(failing.get_vector_at_mut::<i64>(1).is_err());
+        assert!(failing.get_vector_array_mut([0, 1]).is_err());
         Ok(())
     }
 

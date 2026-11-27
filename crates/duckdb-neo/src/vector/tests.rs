@@ -49,6 +49,62 @@ fn vector_from_handle_rejects_type_mismatches() -> crate::Result<()> {
     Ok(())
 }
 
+#[test]
+fn vector_from_handle_fetches_children_only_for_nested_types() -> crate::Result<()> {
+    let env = Environment::new()?;
+    let conn = env.open(StorageLocation::InMemory)?.connect()?;
+    let mut result = conn.query(
+        "SELECT 42::INTEGER, 'text', [1, 2]::INTEGER[], {'a': 1, 'b': 'x'}, union_value(n := 1), [1, 2]::INTEGER[2], MAP {1: 2}",
+        Parameters::None,
+    )?;
+    let mut chunk = result.next_chunk()?.expect("one result chunk");
+    let child_counts = (0..chunk.col_count())
+        .map(|index| {
+            let vector = Vector::<crate::vector::Unknown>::from_handle(
+                &chunk.get_vector_handle_at(index),
+                super::Access::Shared,
+            )?;
+            Ok(vector.children().map(|children| children.col_count()))
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert_eq!(child_counts, [None, None, Some(1), Some(2), Some(2), Some(1), Some(1)]);
+
+    // Types that validate by id still reject other ids, also through a later cast.
+    assert!(chunk.get_vector_at::<i32>(0).is_ok());
+    assert!(chunk.get_vector_at::<i64>(0).is_err());
+    assert!(chunk.get_vector_at::<BlobValue>(1).is_err());
+    assert!(chunk.get_vector_at::<String>(2).is_err());
+    let [integer, text] = chunk.get_vector_array_mut([0, 1])?;
+    assert!(integer.cast::<u32>().is_err());
+    assert_eq!(text.cast::<String>()?.reader()?.get(0)?, Some("text"));
+    Ok(())
+}
+
+#[test]
+fn storage_kind_maps_unknown_kinds_to_other() {
+    use crate::ffi::DUCKDB_V2_VECTOR_TYPE as Kind;
+    assert_eq!(
+        StorageKind::from_ffi(Kind::DUCKDB_V2_VECTOR_TYPE_FLAT),
+        StorageKind::Flat
+    );
+    assert_eq!(
+        StorageKind::from_ffi(Kind::DUCKDB_V2_VECTOR_TYPE_CONSTANT),
+        StorageKind::Constant
+    );
+    assert_eq!(
+        StorageKind::from_ffi(Kind::DUCKDB_V2_VECTOR_TYPE_DICTIONARY),
+        StorageKind::Dictionary
+    );
+    assert_eq!(
+        StorageKind::from_ffi(Kind::DUCKDB_V2_VECTOR_TYPE_OTHER),
+        StorageKind::Other
+    );
+    assert_eq!(
+        StorageKind::from_ffi(Kind::DUCKDB_V2_VECTOR_TYPE_MAX_ENUM),
+        StorageKind::Other
+    );
+}
+
 #[derive(Debug, AsDuckDB)]
 #[duckdb(reader, writer)]
 struct DynamicStruct {

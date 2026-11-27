@@ -71,7 +71,8 @@ use crate::{
 ///
 /// Vector accessors trust the implementation: `Native<'a>` must match DuckDB's physical layout for
 /// every lifetime and logical type `validate` accepts, and `validate` must establish the layout every
-/// reader and writer of the type relies on, including child types and field order.
+/// reader and writer of the type relies on, including child types and field order. `VALIDATES_BY_ID`
+/// may only be `true` when that layout follows from the type id alone.
 ///
 /// A safe implementation is rejected:
 ///
@@ -92,6 +93,10 @@ pub unsafe trait NativeElement: Sized {
     /// Use `()` when the element does not expose a physical representation.
     /// The lifetime bounds any storage referenced by an entry.
     type Native<'a>;
+
+    /// Whether [`Self::validate`] accepts exactly the logical types whose id is [`Self::TYPE_ID`],
+    /// so a vector validates by its type id alone.
+    const VALIDATES_BY_ID: bool = false;
 
     /// Check the logical type and nested children when attaching this element type to a vector.
     /// A successful check must establish the layout for both reading and writing.
