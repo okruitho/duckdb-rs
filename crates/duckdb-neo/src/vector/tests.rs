@@ -54,7 +54,8 @@ fn vector_from_handle_fetches_children_only_for_nested_types() -> crate::Result<
     let env = Environment::new()?;
     let conn = env.open(StorageLocation::InMemory)?.connect()?;
     let mut result = conn.query(
-        "SELECT 42::INTEGER, 'text', [1, 2]::INTEGER[], {'a': 1, 'b': 'x'}, union_value(n := 1), [1, 2]::INTEGER[2], MAP {1: 2}",
+        "SELECT 42::INTEGER, 'text', [1, 2]::INTEGER[], {'a': 1, 'b': 'x'}, union_value(n := 1), \
+         [1, 2]::INTEGER[2], MAP {1: 2}",
         Parameters::None,
     )?;
     let mut chunk = result.next_chunk()?.expect("one result chunk");

@@ -795,9 +795,8 @@ impl<T: NativeElement> Vector<'_, T> {
     }
 }
 
-/// Fetch a vector's view, reading the fields one at a time.
-///
-/// DuckDB stores the fields separately, so copying the struct as a whole would reload them as one, stalling store forwarding.
+/// Fetch a vector's view, reading the fields one at a time: DuckDB stores them separately, so copying
+/// the struct as a whole would reload them as one, stalling store forwarding.
 #[inline(always)]
 fn vector_view(handle: ffi::duckdb_v2_vector_handle) -> Result<ffi::duckdb_v2_vector_view> {
     let mut view = std::mem::MaybeUninit::<ffi::duckdb_v2_vector_view>::uninit();
