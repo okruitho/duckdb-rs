@@ -62,29 +62,21 @@ fn register_list_scale(conn: &Connection) -> Result<()> {
             let [lists, factors] = input.get_vector_array_mut([0, 1])?;
             let (lists, factors) = (lists.cast::<List<i64>>()?, factors.cast::<i64>()?);
             let (lists, factors) = (lists.list_reader()?, factors.reader()?);
-            let elements = lists
-                .iter()
-                .zip(factors.iter())
-                .map(|row| match row {
-                    (Some(list), Some(_)) => list.len(),
-                    _ => 0,
-                })
-                .sum();
-            output.set_child_size(elements)?;
-            let mut writer = output.list_writer()?;
-            for (row, (list, factor)) in lists.iter().zip(factors.iter()).enumerate() {
-                let (Some(list), Some(&factor)) = (list, factor) else {
-                    writer.set_null(row)?;
-                    continue;
-                };
-                let start = writer.child_offset();
-                for (index, value) in list.iter().enumerate() {
-                    let scaled = value.map(|value| value.wrapping_mul(factor));
-                    writer.elements().set_option(start + index, scaled.as_ref())?;
+            let elements = lists.elements().len();
+            output.list_appender(|scaled| {
+                scaled.reserve(elements)?;
+                for (row, (list, factor)) in lists.iter().zip(factors.iter()).enumerate() {
+                    let (Some(list), Some(&factor)) = (list, factor) else {
+                        scaled.set_null(row)?;
+                        continue;
+                    };
+                    scaled.set_elements(
+                        row,
+                        list.iter().map(|value| value.map(|value| value.wrapping_mul(factor))),
+                    )?;
                 }
-                writer.set_entry(row, ListIndex::new(start as u64, list.len() as u64))?;
-            }
-            Ok(())
+                Ok(())
+            })
         },
     )
     .register(conn)
@@ -96,21 +88,16 @@ fn register_range_list(conn: &Connection) -> Result<()> {
         |_context, input: Vector<'_, i32>, mut output: Vector<'_, List<i32>>| {
             let counts = input.reader()?;
             let elements = counts.iter().map(|n| n.map_or(0, |&n| n.max(0) as usize)).sum();
-            output.set_child_size(elements)?;
-            let mut writer = output.list_writer()?;
-            for (row, n) in counts.iter().enumerate() {
-                let Some(&n) = n else {
-                    writer.set_null(row)?;
-                    continue;
-                };
-                let start = writer.child_offset();
-                let len = n.max(0);
-                for value in 0..len {
-                    writer.elements().set(start + value as usize, &value)?;
+            output.list_appender(|lists| {
+                lists.reserve(elements)?;
+                for (row, n) in counts.iter().enumerate() {
+                    match n {
+                        Some(&n) => lists.set_with(row, n.max(0) as usize, |value| value as i32)?,
+                        None => lists.set_null(row)?,
+                    }
                 }
-                writer.set_entry(row, ListIndex::new(start as u64, len as u64))?;
-            }
-            Ok(())
+                Ok(())
+            })
         },
     )
     .register(conn)
@@ -138,37 +125,32 @@ fn register_split(conn: &Connection) -> Result<()> {
                 separators.cast::<UncheckedString>()?,
             );
             let (strings, separators) = (strings.reader()?, separators.reader()?);
-            let mut elements = 0;
-            for (string, separator) in strings.iter().zip(separators.iter()) {
-                if let (Some(string), Some(separator)) = (string, separator) {
+            output.list_appender(|lists| {
+                for (row, (string, separator)) in strings.iter().zip(separators.iter()).enumerate() {
+                    let (Some(string), Some(separator)) = (string, separator) else {
+                        lists.set_null(row)?;
+                        continue;
+                    };
                     let separator = separator_byte(separator)?;
-                    elements += string.bytes().filter(|&byte| byte == separator).count() + 1;
-                }
-            }
-            output.set_child_size(elements)?;
-            let mut writer = output.list_writer()?;
-            for (row, (string, separator)) in strings.iter().zip(separators.iter()).enumerate() {
-                let (Some(string), Some(separator)) = (string, separator) else {
-                    writer.set_null(row)?;
-                    continue;
-                };
-                let separator = separator_byte(separator)?;
-                let offset = writer.child_offset();
-                let (mut len, mut start) = (0, 0);
-                loop {
+                    let mut rest = Some(string);
                     // `str::split(char)` calls `memcmp` per match; cutting at an ASCII byte keeps char boundaries.
-                    let end = string[start..].bytes().position(|byte| byte == separator);
-                    let part_end = end.map_or(string.len(), |end| start + end);
-                    writer.elements().set(offset + len, &string[start..part_end])?;
-                    len += 1;
-                    match end {
-                        Some(_) => start = part_end + 1,
-                        None => break,
-                    }
+                    let parts = std::iter::from_fn(|| {
+                        let text = rest?;
+                        Some(Some(match text.bytes().position(|byte| byte == separator) {
+                            Some(end) => {
+                                rest = Some(&text[end + 1..]);
+                                &text[..end]
+                            }
+                            None => {
+                                rest = None;
+                                text
+                            }
+                        }))
+                    });
+                    lists.set_elements(row, parts)?;
                 }
-                writer.set_entry(row, ListIndex::new(offset as u64, len as u64))?;
-            }
-            Ok(())
+                Ok(())
+            })
         },
     )
     .register(conn)

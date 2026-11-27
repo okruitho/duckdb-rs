@@ -96,7 +96,7 @@ mod writer;
 pub use array_writer::ArrayWriter;
 pub use child::ChildVector;
 pub use fill::VectorAppender;
-pub use list_writer::ListWriter;
+pub use list_writer::{ListAppender, ListWriter};
 pub use map_writer::MapWriter;
 pub use nested_reader::{ArrayReader, Elements, Entries, ListReader, MapReader};
 pub use union_writer::{

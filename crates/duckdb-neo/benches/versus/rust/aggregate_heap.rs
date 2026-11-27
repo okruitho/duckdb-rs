@@ -21,7 +21,7 @@ use duckdb_neo::{
     enums::AggregateFunctionProperty,
     logical_type::LogicalType,
     signature::{FunctionParameter, SignatureBuilder},
-    types::{List, ListIndex, UncheckedString},
+    types::{List, UncheckedString},
     vector::{NativeElement, StorageKind, Unknown, Vector},
 };
 
@@ -31,14 +31,6 @@ fn argument<T: NativeElement>(data: &mut VectorCollection) -> Result<Vector<'_, 
         vector.flatten()?;
     }
     Ok(vector)
-}
-
-fn list_child_len(result: &Vector<'_, List<i64>>) -> Result<usize> {
-    Ok(result
-        .children()
-        .expect("a LIST vector has a child")
-        .get_untyped_vector_at(0)?
-        .len())
 }
 
 fn register_aggregate<T: AggregateCallbacks<BindData = ()>>(
@@ -326,26 +318,21 @@ impl AggregateCallbacks for SortedList {
         result: Vector<'_, Unknown>,
         result_offset: usize,
     ) -> Result<()> {
-        let mut result = result.cast::<List<i64>>()?;
-        let mut offset = list_child_len(&result)?;
-        let elements: usize = states.iter().map(|state| state.values.len()).sum();
-        result.set_child_size(offset + elements)?;
-        let mut writer = result.list_writer()?;
         let mut sorted = Vec::new();
-        for (index, state) in states.iter().enumerate() {
-            let row = result_offset + index;
-            if state.values.is_empty() {
-                writer.set_null(row)?;
-                continue;
+        result.cast::<List<i64>>()?.list_appender(|lists| {
+            for (index, state) in states.iter().enumerate() {
+                let row = result_offset + index;
+                if state.values.is_empty() {
+                    lists.set_null(row)?;
+                    continue;
+                }
+                sorted.clear();
+                sorted.extend_from_slice(&state.values);
+                sorted.sort_unstable();
+                lists.set_slice(row, &sorted)?;
             }
-            sorted.clear();
-            sorted.extend_from_slice(&state.values);
-            sorted.sort_unstable();
-            writer.elements().write_slice(offset, &sorted)?;
-            writer.set_entry(row, ListIndex::new(offset as u64, sorted.len() as u64))?;
-            offset += sorted.len();
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -427,22 +414,17 @@ impl AggregateCallbacks for Top3 {
         result: Vector<'_, Unknown>,
         result_offset: usize,
     ) -> Result<()> {
-        let mut result = result.cast::<List<i64>>()?;
-        let mut offset = list_child_len(&result)?;
-        let elements: usize = states.iter().map(|state| state.len).sum();
-        result.set_child_size(offset + elements)?;
-        let mut writer = result.list_writer()?;
-        for (index, state) in states.iter().enumerate() {
-            let row = result_offset + index;
-            if state.len == 0 {
-                writer.set_null(row)?;
-                continue;
+        result.cast::<List<i64>>()?.list_appender(|lists| {
+            for (index, state) in states.iter().enumerate() {
+                let row = result_offset + index;
+                if state.len == 0 {
+                    lists.set_null(row)?;
+                    continue;
+                }
+                lists.set_slice(row, &state.values[..state.len])?;
             }
-            writer.elements().write_slice(offset, &state.values[..state.len])?;
-            writer.set_entry(row, ListIndex::new(offset as u64, state.len as u64))?;
-            offset += state.len;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 

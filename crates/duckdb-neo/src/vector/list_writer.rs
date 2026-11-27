@@ -1,6 +1,9 @@
 use std::{borrow::Borrow, ptr::NonNull};
 
-use super::{RowWriter, Unknown, Vector, VectorWriter, WithWriter, out_of_bounds};
+use super::{
+    NativeElement, PlainNative, RowWriter, Unknown, Vector, VectorWriter, WithWriter, WritableNativeElement,
+    out_of_bounds,
+};
 use crate::{Result, error::Error, types::List, types::ListIndex};
 
 /// Writes `LIST` rows into a writable flat vector whose element child is already sized.
@@ -86,6 +89,7 @@ impl<'w, T: WithWriter + 'w> ListWriter<'w, T> {
         })
     }
 
+    #[inline]
     fn child_len(&self) -> usize {
         // SAFETY: the child wrapper lives as long as the borrowed vector.
         unsafe { self.child.as_ref() }.len()
@@ -112,22 +116,15 @@ impl<'w, T: WithWriter + 'w> ListWriter<'w, T> {
     }
 
     /// Point a row at elements of the child, checked against the child's size.
+    #[inline]
     pub fn set_entry(&mut self, row: usize, entry: ListIndex) -> Result<()> {
         if row >= self.len() {
             return Err(out_of_bounds(row, self.len()));
         }
-        let end = entry
-            .offset
-            .checked_add(entry.length)
-            .filter(|end| *end <= self.child_len() as u64)
-            .ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "LIST entry {}..+{} is past the {} child elements",
-                    entry.offset,
-                    entry.length,
-                    self.child_len()
-                ))
-            })?;
+        let child_len = self.child_len();
+        let Some(end) = entry.end().filter(|end| *end <= child_len as u64) else {
+            return Err(entry_past_child(entry, child_len));
+        };
         self.offset = self.offset.max(end as usize);
         // SAFETY: the row is in bounds, and the entry covers initialized child elements.
         unsafe { self.write_entry(row, entry) };
@@ -180,6 +177,14 @@ impl<'w, T: WithWriter + 'w> ListWriter<'w, T> {
             self.parent.mark_valid_unchecked(row);
         }
     }
+}
+
+#[cold]
+fn entry_past_child(entry: ListIndex, child_len: usize) -> Error {
+    Error::invalid_input(format!(
+        "LIST entry {}..+{} is past the {child_len} child elements",
+        entry.offset, entry.length
+    ))
 }
 
 impl<'w, T> RowWriter for ListWriter<'w, T>
@@ -243,6 +248,315 @@ impl<T: WithWriter> Vector<'_, List<T>> {
     pub fn list_writer(&mut self) -> Result<ListWriter<'_, T>> {
         // SAFETY: the exclusive borrow covers the writer, and validation checked the type.
         unsafe { ListWriter::from_raw(NonNull::from(self).cast()) }
+    }
+}
+
+/// Writes `LIST` rows whose elements it appends to the element child, borrowed by [`Vector::list_appender`].
+///
+/// The child grows as rows are written, without initializing elements first, and ends with exactly the
+/// elements of the rows written, after the ones it held before:
+///
+/// ```
+/// # use duckdb_neo::{DuckDBType, Result, data_chunk::DataChunk, environment::{Environment, StorageLocation}, types::List};
+/// # fn main() -> Result<()> {
+/// # let conn = Environment::new()?.open(StorageLocation::InMemory)?.connect()?;
+/// let mut chunk = DataChunk::create(&conn, &[List::<String>::logical_type(&conn)?], true)?;
+/// let mut vector = chunk.get_vector_at_mut::<List<String>>(0)?;
+/// vector.set_size(3)?;
+/// vector.list_appender(|lists| {
+///     lists.set_elements(0, "a,b".split(',').map(Some))?;
+///     lists.set_null(1)?;
+///     lists.set_elements(2, [Some("c"), None])
+/// })?;
+/// assert_eq!(vector.child_len()?, 4);
+/// assert_eq!(vector.get_value_slow(2)?.get::<List<String>>()?, Some(List(vec![Some("c".into()), None])));
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Plain elements are copied from a slice or computed in one loop per row:
+///
+/// ```
+/// # use duckdb_neo::{DuckDBType, Result, data_chunk::DataChunk, environment::{Environment, StorageLocation}, types::List};
+/// # fn main() -> Result<()> {
+/// # let conn = Environment::new()?.open(StorageLocation::InMemory)?.connect()?;
+/// # let mut chunk = DataChunk::create(&conn, &[List::<i32>::logical_type(&conn)?], true)?;
+/// # let mut vector = chunk.get_vector_at_mut::<List<i32>>(0)?;
+/// vector.set_size(2)?;
+/// vector.list_appender(|lists| {
+///     lists.set_slice(0, &[7, 8])?;
+///     lists.set_with(1, 3, |index| index as i32)
+/// })?;
+/// assert_eq!(vector.get_value_slow(1)?.get::<List<i32>>()?, Some(List(vec![Some(0), Some(1), Some(2)])));
+/// # Ok(())
+/// # }
+/// ```
+pub struct ListAppender<'w, T: NativeElement> {
+    parent: VectorWriter<'w, List<T>>,
+    elements: VectorWriter<'w, T>,
+    /// The child elements in use: the earlier ones and those of every row written.
+    used: usize,
+    /// The child's size, of which elements from `used` are not initialized.
+    reserved: usize,
+    /// Bytes per element; zero bytes are a valid value.
+    element_size: usize,
+}
+
+impl<T: NativeElement> Vector<'_, List<T>> {
+    /// Write rows through a [`ListAppender`] in `f`, appending their elements after the child's.
+    ///
+    /// Size the rows first. The child ends with the elements of the rows written, also when `f` fails or
+    /// panics. Fails for element types that [`Vector::append`] rejects, e.g. nested ones.
+    pub fn list_appender<R>(&mut self, f: impl FnOnce(&mut ListAppender<'_, T>) -> Result<R>) -> Result<R> {
+        // SAFETY: the exclusive borrow covers both writers, and `List<T>::validate` checked the child as `T`.
+        let mut appender = unsafe { ListAppender::from_raw(NonNull::from(self).cast())? };
+        let value = f(&mut appender.0)?;
+        appender.0.finish()?;
+        Ok(value)
+    }
+
+    /// Return the number of elements in the child.
+    pub fn child_len(&self) -> Result<usize> {
+        self.list_child_len()
+    }
+}
+
+impl<'w, T: NativeElement> ListAppender<'w, T> {
+    /// # Safety
+    /// `vector` must be validated, exclusively borrowed for `'w` and outlive the appender.
+    unsafe fn from_raw(mut vector: NonNull<Vector<'w, List<T>>>) -> Result<FinishList<'w, T>> {
+        // SAFETY: the caller guarantees an exclusive borrow of a validated vector.
+        let borrowed = unsafe { vector.as_mut() };
+        if !borrowed.is_writable() {
+            return Err(super::not_writable());
+        }
+        let child = borrowed
+            .children
+            .as_mut()
+            .expect("validated LIST vector has a child")
+            .cached_iter_mut()?
+            .next()
+            .expect("validated LIST vector has a child");
+        let element_size = child
+            .zeroed_row_size()?
+            .ok_or_else(|| Error::invalid_input(format!("cannot append {} elements in place", child.logical_type())))?;
+        let child = NonNull::from(child).cast::<Vector<'w, T>>();
+        // SAFETY: the appender keeps `vector` exclusively borrowed and only touches its child through
+        // `elements`; the child was validated as `T`, and resizing it keeps the parent's buffers.
+        let (parent, elements) = unsafe { (VectorWriter::from_raw(vector)?, VectorWriter::from_raw(child)?) };
+        let used = elements.len();
+        Ok(FinishList(Self {
+            parent,
+            elements,
+            used,
+            reserved: used,
+            element_size,
+        }))
+    }
+
+    /// Return the number of rows.
+    pub fn len(&self) -> usize {
+        self.parent.len()
+    }
+
+    /// Return whether the vector has no rows.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Return the number of child elements in use, where the next row's elements start.
+    pub fn child_len(&self) -> usize {
+        self.used
+    }
+
+    /// Make a row SQL NULL.
+    #[inline]
+    pub fn set_null(&mut self, row: usize) -> Result<()> {
+        self.check_row(row)?;
+        // SAFETY: the row is in bounds.
+        unsafe { self.parent.mark_null_unchecked(row) }
+    }
+
+    #[inline(always)]
+    fn check_row(&self, row: usize) -> Result<()> {
+        if row >= self.len() {
+            return Err(out_of_bounds(row, self.len()));
+        }
+        Ok(())
+    }
+
+    /// Make room for `additional` elements after those in use, so rows of known total length grow the child once.
+    ///
+    /// The child still ends with only the elements in use.
+    pub fn reserve(&mut self, additional: usize) -> Result<()> {
+        self.claim(additional).map(|_| ())
+    }
+
+    /// Make room for `count` more elements, returning where they start.
+    #[inline(always)]
+    fn claim(&mut self, count: usize) -> Result<usize> {
+        let start = self.used;
+        let end = start
+            .checked_add(count)
+            .ok_or_else(|| Error::invalid_input("LIST element count overflows"))?;
+        if end > self.reserved {
+            self.grow(end)?;
+        }
+        Ok(start)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, end: usize) -> Result<()> {
+        let reserved = end.max(self.reserved.saturating_mul(2)).max(64);
+        // SAFETY: elements from `used` are written before a row's entry covers them, and `finish` cuts the
+        // child to `used` before anything can read the vector.
+        let result = unsafe { self.elements.vector_mut().set_size_uninit(reserved) };
+        let old = self.reserved;
+        self.reserved = self.elements.vector().len();
+        self.elements.refresh_all()?;
+        // SAFETY: the new elements are in bounds; written ones hold values and NULL ones clear their bits.
+        unsafe { self.elements.mark_valid_range(old.min(self.reserved), self.reserved) };
+        result
+    }
+
+    /// Point `row` at the `count` elements from `start`, which were just written, and take them into use.
+    ///
+    /// # Safety
+    /// `row` must be in bounds, and elements `start..start + count` initialized, with `start` the old `used`.
+    #[inline(always)]
+    unsafe fn commit(&mut self, row: usize, start: usize, count: usize) {
+        self.used = start + count;
+        // SAFETY: the caller guarantees the row's bounds and that the entry covers initialized elements.
+        unsafe {
+            let _ = self
+                .parent
+                .write_internal(row, Some(ListIndex::new(start as u64, count as u64)));
+            self.parent.mark_valid_unchecked(row);
+        }
+    }
+
+    /// Cut the child to the elements in use, or zero the others if that fails.
+    fn finish(&mut self) -> Result<()> {
+        if self.used == self.reserved {
+            return Ok(());
+        }
+        let used = self.used;
+        self.reserved = used;
+        // SAFETY: shrinking exposes no new elements.
+        let result = unsafe { self.elements.vector_mut().set_size_uninit(used) };
+        if result.is_err() {
+            let child = self.elements.vector_mut();
+            let len = child.len();
+            if child.init_rows(used, len).is_err() {
+                // Elements past `used` would stay uninitialized.
+                std::process::abort();
+            }
+        }
+        result
+    }
+}
+
+impl<T: WritableNativeElement> ListAppender<'_, T> {
+    /// Write a row from its elements; `None` elements are SQL NULL.
+    ///
+    /// Fails, leaving the row and the child's elements in use unchanged, if an element is invalid.
+    #[inline]
+    pub fn set_elements<V, I>(&mut self, row: usize, values: I) -> Result<()>
+    where
+        V: Borrow<T::Write>,
+        I: IntoIterator<Item = Option<V>>,
+    {
+        self.check_row(row)?;
+        let values = values.into_iter();
+        let start = self.claim(values.size_hint().0)?;
+        let mut end = start;
+        for value in values {
+            if let Err(error) = self.set_element(end, value) {
+                // Later rows expect unused elements to be marked valid.
+                // SAFETY: the elements are in bounds, and `finish` cuts them off unless a row overwrites them.
+                unsafe { self.elements.mark_valid_range(start, (end + 1).min(self.reserved)) };
+                return Err(error);
+            }
+            end += 1;
+        }
+        // SAFETY: the row is in bounds, and the elements were just written.
+        unsafe { self.commit(row, start, end - start) };
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn set_element<V: Borrow<T::Write>>(&mut self, index: usize, value: Option<V>) -> Result<()> {
+        if index == self.reserved {
+            self.grow(index + 1)?;
+        }
+        // SAFETY: the element is reserved, flat and writable; zero bytes are a valid value.
+        unsafe {
+            match value {
+                Some(value) => T::write(&mut self.elements, index, value.borrow()),
+                None => {
+                    self.elements
+                        .as_mut_ptr()
+                        .cast::<u8>()
+                        .add(index * self.element_size)
+                        .write_bytes(0, self.element_size);
+                    self.elements.mark_null_unchecked(index)
+                }
+            }
+        }
+    }
+}
+
+impl<T: PlainNative> ListAppender<'_, T> {
+    /// Write a row from a slice of non-NULL elements.
+    #[inline]
+    pub fn set_slice(&mut self, row: usize, values: &[T]) -> Result<()> {
+        self.check_row(row)?;
+        let start = self.claim(values.len())?;
+        // SAFETY: the elements are reserved and marked valid, and `T` is the slot type.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                values.as_ptr(),
+                self.elements.as_mut_ptr().cast::<T>().add(start),
+                values.len(),
+            );
+            self.commit(row, start, values.len());
+        }
+        Ok(())
+    }
+
+    /// Write a row of `count` non-NULL elements, the `i`-th from `f(i)`, in one loop.
+    #[inline]
+    pub fn set_with(&mut self, row: usize, count: usize, mut f: impl FnMut(usize) -> T) -> Result<()> {
+        self.check_row(row)?;
+        let start = self.claim(count)?;
+        let data = self.elements.as_mut_ptr().cast::<T>();
+        for index in 0..count {
+            // SAFETY: the elements are reserved and marked valid, and `T` is the slot type. If `f` panics,
+            // `used` has not moved, so `finish` cuts these elements off.
+            unsafe { data.add(start + index).write(f(index)) };
+        }
+        // SAFETY: the row is in bounds, and the elements were just written.
+        unsafe { self.commit(row, start, count) };
+        Ok(())
+    }
+}
+
+impl<T: NativeElement> std::fmt::Debug for ListAppender<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ListAppender")
+            .field("len", &self.len())
+            .field("child_len", &self.used)
+            .finish()
+    }
+}
+
+/// Finishes the appender when its closure fails or panics.
+struct FinishList<'w, T: NativeElement>(ListAppender<'w, T>);
+
+impl<T: NativeElement> Drop for FinishList<'_, T> {
+    fn drop(&mut self) {
+        let _ = self.0.finish();
     }
 }
 
@@ -418,6 +732,163 @@ mod tests {
         unions.set_size(1)?;
         let reader = unions.list_reader()?;
         assert_eq!(reader.get(0)?.unwrap().len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn list_appender_grows_the_child_as_rows_are_written() -> Result<()> {
+        let conn = connection()?;
+        let mut chunk = DataChunk::create(&conn, &[List::<String>::logical_type(&conn)?], true)?;
+        let mut vector = chunk.get_vector_at_mut::<List<String>>(0)?;
+        vector.set_size(300)?;
+        let long = "a string longer than the inline storage";
+        vector.list_appender(|lists| {
+            assert_eq!((lists.len(), lists.child_len()), (300, 0));
+            for row in 0..300 {
+                match row % 3 {
+                    0 => lists.set_null(row)?,
+                    1 => lists.set_elements(row, (0..row).map(|index| (index % 2 == 0).then_some(long)))?,
+                    _ => lists.set_elements(row, std::iter::empty::<Option<&str>>())?,
+                }
+            }
+            assert!(lists.set_null(300).is_err());
+            assert!(lists.set_elements(300, [Some("x")]).is_err());
+            Ok(())
+        })?;
+        let expected = (1..300).step_by(3).sum::<usize>();
+        assert_eq!(vector.child_len()?, expected);
+        let read = rows(&vector)?;
+        for (row, list) in read.into_iter().enumerate() {
+            match row % 3 {
+                0 => assert_eq!(list, None),
+                1 => assert_eq!(
+                    list,
+                    Some(
+                        (0..row)
+                            .map(|index| (index % 2 == 0).then(|| long.to_owned()))
+                            .collect()
+                    )
+                ),
+                _ => assert_eq!(list, Some(List(vec![]))),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn list_appender_appends_after_existing_elements() -> Result<()> {
+        let conn = connection()?;
+        let mut chunk = DataChunk::create(&conn, &[List::<i64>::logical_type(&conn)?], true)?;
+        let mut vector = chunk.get_vector_at_mut::<List<i64>>(0)?;
+        vector.set_size(4)?;
+        vector.set_child_size(2)?;
+        vector.list_writer()?.set_elements(0, [Some(&1), None])?;
+        vector.list_appender(|lists| {
+            assert_eq!(lists.child_len(), 2);
+            lists.reserve(1000)?;
+            lists.set_slice(1, &[2, 3])?;
+            lists.set_with(2, 3, |index| 10 * index as i64)?;
+            assert_eq!(lists.child_len(), 7);
+            Ok(())
+        })?;
+        assert_eq!(vector.child_len()?, 7);
+        vector.list_appender(|lists| lists.set_elements(3, [None, Some(4_i64)]))?;
+        assert_eq!(
+            rows(&vector)?,
+            [
+                Some(List(vec![Some(1), None])),
+                Some(List(vec![Some(2), Some(3)])),
+                Some(List(vec![Some(0), Some(10), Some(20)])),
+                Some(List(vec![None, Some(4)])),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn list_appender_keeps_only_finished_rows_after_a_panic_or_error() -> Result<()> {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let conn = connection()?;
+        let mut chunk = DataChunk::create(&conn, &[List::<i64>::logical_type(&conn)?], true)?;
+        let mut vector = chunk.get_vector_at_mut::<List<i64>>(0)?;
+        vector.set_size(3)?;
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            vector.list_appender(|lists| {
+                lists.set_slice(0, &[1, 2])?;
+                lists.set_with(1, 100, |index| if index == 50 { panic!("in set_with") } else { 7 })
+            })
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(vector.child_len()?, 2);
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            vector.list_appender(|lists| {
+                let values = (0..100).map(|index| {
+                    if index == 70 {
+                        panic!("in the iterator")
+                    } else {
+                        Some(index)
+                    }
+                });
+                lists.set_elements(1, values)
+            })
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(vector.child_len()?, 2);
+        let error = vector
+            .list_appender(|lists| {
+                lists.set_slice(1, &[3])?;
+                Err::<(), _>(crate::Error::invalid_input("stop"))
+            })
+            .unwrap_err();
+        assert!(error.message.contains("stop"), "{error}");
+        assert_eq!(vector.child_len()?, 3);
+        assert_eq!(
+            rows(&vector)?,
+            [
+                Some(List(vec![Some(1), Some(2)])),
+                Some(List(vec![Some(3)])),
+                Some(List(vec![]))
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn list_appender_leaves_rows_unchanged_when_an_element_fails() -> Result<()> {
+        use crate::{logical_type::LogicalType, types::EnumIndex};
+        let conn = connection()?;
+        let types = [LogicalType::from_text(&conn, "ENUM('a', 'b')[]")?];
+        let mut chunk = DataChunk::create(&conn, &types, true)?;
+        let mut vector = chunk.get_vector_at_mut::<List<EnumIndex<u8>>>(0)?;
+        vector.set_size(2)?;
+        vector.list_appender(|lists| {
+            let error = lists
+                .set_elements(0, [None, Some(EnumIndex(1)), Some(EnumIndex(2))])
+                .unwrap_err();
+            assert!(error.message.contains('2'), "{error}");
+            assert_eq!(lists.child_len(), 0);
+            // The failed row's NULL element does not leak into the next row.
+            lists.set_elements(1, [Some(EnumIndex(0)), Some(EnumIndex(1))])
+        })?;
+        assert_eq!(vector.get_value_slow(0)?.dbg_string()?, "[]");
+        assert_eq!(vector.get_value_slow(1)?.dbg_string()?, "[a, b]");
+        Ok(())
+    }
+
+    #[test]
+    fn list_appender_rejects_nested_elements() -> Result<()> {
+        use crate::{logical_type::LogicalType, types::Struct};
+        let conn = connection()?;
+        let types = [
+            List::<List<i32>>::logical_type(&conn)?,
+            LogicalType::from_text(&conn, "STRUCT(a INTEGER)[]")?,
+        ];
+        let mut chunk = DataChunk::create(&conn, &types, true)?;
+        let mut lists = chunk.get_vector_at_mut::<List<List<i32>>>(0)?;
+        let error = lists.list_appender(|_| Ok(())).unwrap_err();
+        assert!(error.message.contains("cannot append"), "{error}");
+        let mut structs = chunk.get_vector_at_mut::<List<Struct>>(1)?;
+        assert!(structs.list_appender(|_| Ok(())).is_err());
         Ok(())
     }
 }
