@@ -43,15 +43,13 @@ fn register_upper_ascii(conn: &Connection) -> Result<()> {
         "vs_upper_ascii",
         |_context, input: Vector<'_, UncheckedString>, mut output: Vector<'_, String>| {
             let mut writer = output.writer()?;
-            let mut buffer = String::new();
             for (row, value) in input.reader()?.iter().enumerate() {
                 match value {
-                    Some(value) => {
-                        buffer.clear();
-                        buffer.push_str(value);
-                        buffer.make_ascii_uppercase();
-                        writer.set(row, &buffer)?;
-                    }
+                    Some(value) => writer.set_with(row, value.len(), |buffer| {
+                        buffer.push_str(value)?;
+                        buffer.as_mut_str().make_ascii_uppercase();
+                        Ok(())
+                    })?,
                     None => writer.set_null(row)?,
                 }
             }
@@ -103,18 +101,19 @@ fn register_repeat(conn: &Connection) -> Result<()> {
             let counts = input.get_vector_at::<i32>(1)?;
             let rows = CombinedVectorIterator::new((strings.reader()?, counts.reader()?))?;
             let mut writer = output.writer()?;
-            let mut buffer = String::new();
             for (row, values) in rows.enumerate() {
                 match values {
                     (Some(value), Some(&count)) if count >= 0 => {
-                        if value.len() * count as usize > u32::MAX as usize {
+                        let len = value.len() * count as usize;
+                        if len > u32::MAX as usize {
                             return Err(Error::invalid_input("vs_repeat: the result exceeds 4 GiB"));
                         }
-                        buffer.clear();
-                        for _ in 0..count {
-                            buffer.push_str(value);
-                        }
-                        writer.set(row, &buffer)?;
+                        writer.set_with(row, len, |buffer| {
+                            for _ in 0..count {
+                                buffer.push_str(value)?;
+                            }
+                            Ok(())
+                        })?;
                     }
                     _ => writer.set_null(row)?,
                 }
