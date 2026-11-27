@@ -356,6 +356,22 @@ FROM t
 """
 expect = "0"
 
+# Without NULLs, C++'s ScalarExecutor takes its all-valid loop, which the compiler vectorizes.
+[[case]]
+name = "mix/nulls_0"
+rows = [1, 2048, 100_000, 2_000_000]
+setup = ["""
+CREATE TABLE t AS SELECT
+    (i % 1000 - 500)::INTEGER AS a,
+    (i * 3)::BIGINT AS b,
+    ((i % 100) / 8.0)::DOUBLE AS c,
+    (i % 300 - 150)::SMALLINT AS d
+FROM range({rows}) r(i)
+"""]
+query = "SELECT vs_mix(a, b, c, d) FROM t"
+check = "SELECT count(*) FILTER (WHERE vs_mix(a, b, c, d) IS DISTINCT FROM a::DOUBLE * c + b::DOUBLE - d::DOUBLE)::VARCHAR FROM t"
+expect = "0"
+
 # ---------------------------------------------------------------------------------------------------------------------
 # vs_strict_sqrt(DOUBLE) -> DOUBLE: sqrt(v), an error for negative v. The timed query never fails; the check reaches
 # the error through TRY, which turns each failing row into NULL.
@@ -420,7 +436,7 @@ expect = "0"
 [[case]]
 name = "all/one_row"
 rows = [1]
-setup = ["CREATE TABLE t AS SELECT i::BIGINT AS v, (i / 2 + 0.5)::DOUBLE AS x, i::INTEGER AS a, i::SMALLINT AS d FROM range({rows}) r(i)"]
+setup = ["CREATE TABLE t AS SELECT i::BIGINT AS v, (i / 2 + 0.5)::DOUBLE AS x, i::INTEGER AS a, (i % 1000)::SMALLINT AS d FROM range({rows}) r(i)"]
 query = """
 SELECT vs_add_one(v), vs_clamp(x, 0.0, 1.0), vs_is_even(v), vs_coalesce_zero(v),
        vs_checked_div(v, 3), vs_mix(a, v, x, d), vs_strict_sqrt(x), vs_scale(v, 3)

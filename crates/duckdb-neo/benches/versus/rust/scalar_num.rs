@@ -20,15 +20,16 @@ use duckdb_neo::{
     vector::{CombinedVectorIterator, Unknown, Vector},
 };
 
+#[expect(clippy::manual_try_fold, reason = "the readers specialize `fold` but not `try_fold`")]
 fn register_add_one(conn: &Connection) -> Result<()> {
     MicroScalar::create(
         "vs_add_one",
         |_context, input: Vector<'_, i64>, mut output: Vector<'_, i64>| {
             let mut writer = output.writer()?;
-            for (row, value) in input.reader()?.iter().enumerate() {
-                writer.set_option(row, value.map(|value| value.wrapping_add(1)).as_ref())?;
-            }
-            Ok(())
+            // `fold` resolves the reader's storage kind once per batch; `for` dispatches per row through `next`.
+            input.reader()?.iter().enumerate().fold(Ok(()), |result, (row, value)| {
+                result.and_then(|()| writer.set_option(row, value.map(|value| value.wrapping_add(1)).as_ref()))
+            })
         },
     )
     .register(conn)
