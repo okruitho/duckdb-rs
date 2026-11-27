@@ -91,6 +91,7 @@ pub mod derive_support {
         data_chunk::VectorCollection,
         logical_type::LogicalType,
         logical_type::LogicalTypeID,
+        types::structs::param_names_match,
         value::{Value, ValueInput},
         vector::NativeElement,
     };
@@ -159,35 +160,28 @@ pub mod derive_support {
         value.ok_or_else(|| Error::invalid_input(format!("UNION member '{name}' is NULL")))
     }
 
-    /// Check that a vector type is a `UNION` with `count` members, and a `UTINYINT` tag child.
+    /// Check that a vector type is a `UNION` whose members are `names`, case-insensitively, with a
+    /// `UTINYINT` tag child.
     pub fn validate_union_layout(
         other: &LogicalType,
         children: Option<&VectorCollection>,
-        count: usize,
+        names: &'static [&'static str],
     ) -> Result<bool> {
-        if other.id()? != LogicalTypeID::Union || other.param_count()? != count {
+        if other.id()? != LogicalTypeID::Union || other.param_count()? != names.len() {
             return Ok(false);
         }
-        let Some(children) = children.filter(|children| children.col_count() == count + 1) else {
+        let Some(children) = children.filter(|children| children.col_count() == names.len() + 1) else {
             return Ok(false);
         };
         let tag = children.get_untyped_vector_at(0)?;
-        u8::validate(tag.logical_type(), tag.children())
+        Ok(u8::validate(tag.logical_type(), tag.children())? && param_names_match(other, Some(children), names)?)
     }
 
-    /// Check the name (case-insensitively) and child vector of the member at `index`.
-    pub fn validate_union_member<T: NativeElement>(
-        other: &LogicalType,
-        children: Option<&VectorCollection>,
-        index: usize,
-        name: &str,
-    ) -> Result<bool> {
+    /// Check the child vector of the member at `index`.
+    pub fn validate_union_member<T: NativeElement>(children: Option<&VectorCollection>, index: usize) -> Result<bool> {
         let Some(children) = children.filter(|children| index + 1 < children.col_count()) else {
             return Ok(false);
         };
-        if !other.get_param(index)?.0.eq_ignore_ascii_case(name) {
-            return Ok(false);
-        }
         let child = children.get_untyped_vector_at(index + 1)?;
         T::validate(child.logical_type(), child.children())
     }

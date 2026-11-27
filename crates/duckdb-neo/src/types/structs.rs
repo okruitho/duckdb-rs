@@ -4,6 +4,7 @@
 //! values and, with `#[duckdb(reader, writer)]`, row readers and writers. [`Struct`] is the
 //! untyped fallback.
 
+use super::type_memo::{TypeMemo, memo_find, memo_remember};
 use crate::{
     Result,
     data_chunk::VectorCollection,
@@ -67,6 +68,8 @@ pub mod derive_support {
         value::Value, vector::NativeElement,
     };
 
+    use super::param_names_match;
+
     /// Check that `value` is a `STRUCT` with `expected` fields and return their names.
     pub fn value_field_names(value: &Value, expected: usize) -> Result<Vec<String>> {
         let logical_type = value.logical_type()?;
@@ -101,29 +104,104 @@ pub mod derive_support {
         value.ok_or_else(|| Error::invalid_input(format!("STRUCT field '{name}' is NULL")))
     }
 
-    /// Check that a vector type is a `STRUCT` with `count` fields and child vectors.
-    pub fn validate_layout(other: &LogicalType, children: Option<&VectorCollection>, count: usize) -> Result<bool> {
-        Ok(other.id()? == LogicalTypeID::Struct
-            && other.param_count()? == count
-            && children.map_or(0, VectorCollection::col_count) == count)
-    }
-
-    /// Check the name (case-insensitively) and child vector of the field at `index`.
-    pub fn validate_field<T: NativeElement>(
+    /// Check that a vector type is a `STRUCT` whose fields and child vectors are `names`, case-insensitively.
+    pub fn validate_layout(
         other: &LogicalType,
         children: Option<&VectorCollection>,
-        index: usize,
-        name: &str,
+        names: &'static [&'static str],
     ) -> Result<bool> {
+        Ok(other.id()? == LogicalTypeID::Struct
+            && other.param_count()? == names.len()
+            && children.map_or(0, VectorCollection::col_count) == names.len()
+            && param_names_match(other, children, names)?)
+    }
+
+    /// Check the child vector of the field at `index`.
+    pub fn validate_field<T: NativeElement>(children: Option<&VectorCollection>, index: usize) -> Result<bool> {
         let Some(children) = children.filter(|children| index < children.col_count()) else {
             return Ok(false);
         };
-        if !other.get_param(index)?.0.eq_ignore_ascii_case(name) {
-            return Ok(false);
-        }
         let child = children.get_untyped_vector_at(index)?;
         T::validate(child.logical_type(), child.children())
     }
+}
+
+thread_local! {
+    static NAMED_TYPES: TypeMemo<&'static [&'static str]> = const { TypeMemo::new() };
+}
+
+/// Check that the `param_count()` parameters of a `STRUCT` or `UNION` are named `names`, case-insensitively.
+pub(crate) fn param_names_match(
+    other: &LogicalType,
+    children: Option<&VectorCollection>,
+    names: &'static [&'static str],
+) -> Result<bool> {
+    // Equal types have parameter names equal up to ASCII case, so a type equal to one already checked passes.
+    if memo_find(&NAMED_TYPES, other, |checked| (*checked == names).then_some(()))?.is_some() {
+        return Ok(true);
+    }
+    for (index, name) in names.iter().enumerate() {
+        if !other.get_param(index)?.0.eq_ignore_ascii_case(name) {
+            return Ok(false);
+        }
+    }
+    if children.map_or(Ok(true), owns_type_storage)? {
+        memo_remember(&NAMED_TYPES, other, names)?;
+    }
+    Ok(true)
+}
+
+/// Whether no type below `children` can share instance storage, as a catalog `ENUM` does.
+fn owns_type_storage(children: &VectorCollection) -> Result<bool> {
+    for index in 0..children.col_count() {
+        let child = children.get_untyped_vector_at(index)?;
+        let plain = match child.logical_type().id() {
+            Ok(id) => matches!(
+                id,
+                LogicalTypeID::Boolean
+                    | LogicalTypeID::TinyInt
+                    | LogicalTypeID::SmallInt
+                    | LogicalTypeID::Integer
+                    | LogicalTypeID::BigInt
+                    | LogicalTypeID::HugeInt
+                    | LogicalTypeID::UTinyInt
+                    | LogicalTypeID::USmallInt
+                    | LogicalTypeID::UInteger
+                    | LogicalTypeID::UBigInt
+                    | LogicalTypeID::UHugeInt
+                    | LogicalTypeID::Float
+                    | LogicalTypeID::Double
+                    | LogicalTypeID::Decimal
+                    | LogicalTypeID::Varchar
+                    | LogicalTypeID::Blob
+                    | LogicalTypeID::Bit
+                    | LogicalTypeID::BigNum
+                    | LogicalTypeID::Uuid
+                    | LogicalTypeID::Interval
+                    | LogicalTypeID::Date
+                    | LogicalTypeID::Time
+                    | LogicalTypeID::TimeNs
+                    | LogicalTypeID::TimeTz
+                    | LogicalTypeID::Timestamp
+                    | LogicalTypeID::TimestampSec
+                    | LogicalTypeID::TimestampMs
+                    | LogicalTypeID::TimestampNs
+                    | LogicalTypeID::TimestampTz
+                    | LogicalTypeID::TimestampTzNs
+                    | LogicalTypeID::Struct
+                    | LogicalTypeID::Tuple
+                    | LogicalTypeID::List
+                    | LogicalTypeID::Map
+                    | LogicalTypeID::Array
+                    | LogicalTypeID::Union
+            ),
+            Err(_) => false,
+        };
+        if !plain || !child.children().map_or(Ok(true), owns_type_storage)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -396,7 +474,7 @@ mod tests {
     }
 
     #[derive(Debug, PartialEq, crate::AsDuckDB)]
-    #[duckdb(reader)]
+    #[duckdb(reader, writer)]
     struct Entry {
         key: i32,
         value: String,
@@ -493,6 +571,74 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[derive(duckdb_loadable_macros::AsNativeElement)]
+    struct MoodRow {
+        _mood: crate::types::EnumIndex<u8>,
+    }
+
+    #[test]
+    fn struct_names_are_remembered_per_type() -> Result<()> {
+        let env = Environment::new()?;
+        let conn = env.open(StorageLocation::InMemory)?.connect()?;
+        let query =
+            |sql: &str| -> Result<DataChunk<'_>> { Ok(conn.query(sql, Parameters::None)?.next_chunk()?.unwrap()) };
+        let chunk =
+            query("SELECT {'key': 42, 'value': 'duck'}, {'kay': 42, 'value': 'duck'}, {'KEY': 7, 'Value': 'x'}")?;
+        let named_types = crate::types::type_memo::memo_len(&NAMED_TYPES);
+        for _ in 0..2 {
+            let reader = chunk.get_vector_at::<Entry>(0)?;
+            assert_eq!(reader.row_reader()?.get(0)?.unwrap().key, Some(&42));
+            assert!(chunk.get_vector_at::<Entry>(1).is_err());
+            let row = chunk.get_vector_at::<Entry>(2)?;
+            assert_eq!(row.row_reader()?.get(0)?.unwrap().value, Some("x"));
+        }
+        // DuckDB compares field names ignoring ASCII case, so the last type may hit the first one's entry.
+        let remembered = crate::types::type_memo::memo_len(&NAMED_TYPES);
+        assert!((named_types + 1..=named_types + 2).contains(&remembered));
+
+        let mut chunk = DataChunk::create(&conn, &[<Entry as DuckDBType>::logical_type(&conn)?], true)?;
+        let mut vector = chunk.get_vector_at_mut::<Entry>(0)?;
+        vector.set_size(1)?;
+        vector.row_writer()?.set(
+            0,
+            &Entry {
+                key: 1,
+                value: "written".to_owned(),
+            },
+        )?;
+        assert!(chunk.get_vector_at_mut::<IntegerEntry>(0).is_err());
+
+        conn.execute("CREATE TYPE mood AS ENUM ('sad', 'happy')", Parameters::None)?;
+        let chunk = query("SELECT {'_mood': 'happy'::mood}")?;
+        let named_types = crate::types::type_memo::memo_len(&NAMED_TYPES);
+        assert!(chunk.get_vector_at::<MoodRow>(0)?.reader()?.get(0)?.is_some());
+        assert_eq!(crate::types::type_memo::memo_len(&NAMED_TYPES), named_types);
+        Ok(())
+    }
+
+    #[test]
+    fn remembered_struct_types_outlive_their_database() -> Result<()> {
+        std::thread::spawn(|| -> Result<()> {
+            {
+                let env = Environment::new()?;
+                let conn = env.open(StorageLocation::InMemory)?.connect()?;
+                let chunk = conn
+                    .query(
+                        "SELECT {'key': 42, 'value': 'duck'}, 1.5::DECIMAL(18, 3)",
+                        Parameters::None,
+                    )?
+                    .next_chunk()?
+                    .unwrap();
+                chunk.get_vector_at::<Entry>(0)?;
+                chunk.get_vector_at::<crate::types::Decimal<18, 3>>(1)?;
+            }
+            assert!(crate::types::type_memo::memo_len(&NAMED_TYPES) > 0);
+            Ok(())
+        })
+        .join()
+        .unwrap()
     }
 
     #[test]

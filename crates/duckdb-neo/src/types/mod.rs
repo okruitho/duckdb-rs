@@ -44,6 +44,7 @@ mod primitive;
 mod string;
 mod temporal;
 mod tuple;
+mod type_memo;
 mod uuid;
 mod variant;
 

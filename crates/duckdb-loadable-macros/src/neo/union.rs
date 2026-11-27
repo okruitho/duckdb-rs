@@ -217,18 +217,17 @@ fn from_value(input: &syn::DeriveInput, variants: &UnionVariants<'_>) -> TokenSt
 fn union_native(input: &syn::DeriveInput, variants: &UnionVariants<'_>) -> TokenStream {
     let types = variants.inner_types();
     let names = &variants.names;
-    let count = types.len();
-    let indexes = 0..count;
+    let indexes = 0..types.len();
     native_impls(
         input,
         &types,
         quote!(Union),
         quote! {
-            if !::duckdb_neo::__derive::validate_union_layout(other, children, #count)? {
+            if !::duckdb_neo::__derive::validate_union_layout(other, children, &[#(#names),*])? {
                 return ::core::result::Result::Ok(false);
             }
             #(
-                if !::duckdb_neo::__derive::validate_union_member::<#types>(other, children, #indexes, #names)? {
+                if !::duckdb_neo::__derive::validate_union_member::<#types>(children, #indexes)? {
                     return ::core::result::Result::Ok(false);
                 }
             )*

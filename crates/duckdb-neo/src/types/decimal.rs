@@ -12,6 +12,7 @@
 use std::fmt::Debug;
 use std::hash::Hash;
 
+use super::type_memo::{TypeMemo, memo_find, memo_remember};
 use super::{DuckDBType, FromValue, ToValue};
 use crate::data_chunk::VectorCollection;
 use crate::ffi;
@@ -378,6 +379,12 @@ impl DecimalSignature {
 
     /// Read the width and scale of a `DECIMAL` logical type.
     pub fn from_logical_type(logical_type: &LogicalType) -> Result<Self> {
+        thread_local! {
+            static SIGNATURES: TypeMemo<DecimalSignature> = const { TypeMemo::new() };
+        }
+        if let Some(signature) = memo_find(&SIGNATURES, logical_type, |signature| Some(*signature))? {
+            return Ok(signature);
+        }
         if logical_type.id()? != LogicalTypeID::Decimal {
             return Err(Error::api_error("logical type is not DECIMAL"));
         }
@@ -388,10 +395,13 @@ impl DecimalSignature {
                 .get::<u8>()?
                 .ok_or_else(|| Error::api_error("DECIMAL logical type is missing a parameter"))
         };
-        Ok(Self {
+        let signature = Self {
             width: param(0)?,
             scale: param(1)?,
-        })
+        };
+        // A DECIMAL carries only its width, scale and alias, never instance storage.
+        memo_remember(&SIGNATURES, logical_type, signature)?;
+        Ok(signature)
     }
 
     /// Pair a scaled integer with this width and scale.
@@ -438,6 +448,7 @@ mod tests {
         data_chunk::DataChunk,
         environment::{Environment, StorageLocation},
         types::List,
+        vector::Unknown,
     };
 
     #[test]
@@ -479,6 +490,37 @@ mod tests {
             DecimalSignature { width: 9, scale: 3 }
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn decimal_signatures_are_remembered_per_type() -> Result<()> {
+        let env = Environment::new()?;
+        let instance = env.open(StorageLocation::InMemory)?;
+        let conn = instance.connect()?;
+        conn.execute("CREATE TYPE money AS DECIMAL(18, 3)", Parameters::None)?;
+        let columns = (1..=12)
+            .map(|width| format!("1::DECIMAL({width}, {})", width / 2))
+            .chain(["1::money".to_owned()])
+            .collect::<Vec<_>>();
+        let mut result = conn.query(format!("SELECT {}", columns.join(", ")), Parameters::None)?;
+        let chunk = result.next_chunk()?.expect("query returned no rows");
+        for _ in 0..2 {
+            for width in 1..=12_u8 {
+                let vector = chunk.get_vector_at::<Unknown>(usize::from(width) - 1)?;
+                assert_eq!(
+                    DecimalSignature::from_logical_type(vector.logical_type())?,
+                    DecimalSignature {
+                        width,
+                        scale: width / 2
+                    }
+                );
+            }
+            assert!(chunk.get_vector_at::<Decimal<18, 3>>(12).is_ok());
+            assert!(chunk.get_vector_at::<Decimal<18, 2>>(12).is_err());
+            assert!(chunk.get_vector_at::<Decimal<12, 6>>(11).is_ok());
+            assert!(chunk.get_vector_at::<WordDecimal>(11).is_err());
+        }
         Ok(())
     }
 

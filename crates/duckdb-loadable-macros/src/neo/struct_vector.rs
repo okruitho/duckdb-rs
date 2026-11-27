@@ -116,17 +116,16 @@ pub(crate) fn as_native_element(input: &syn::DeriveInput) -> syn::Result<TokenSt
         .collect::<Vec<_>>();
     let names = &fields.names;
     let indexes = 0..types.len();
-    let count = types.len();
     let native = native_impls(
         input,
         &types,
         quote!(Struct),
         quote! {
-            if !::duckdb_neo::__derive::validate_layout(other, children, #count)? {
+            if !::duckdb_neo::__derive::validate_layout(other, children, &[#(#names),*])? {
                 return ::core::result::Result::Ok(false);
             }
             #(
-                if !::duckdb_neo::__derive::validate_field::<#types>(other, children, #indexes, #names)? {
+                if !::duckdb_neo::__derive::validate_field::<#types>(children, #indexes)? {
                     return ::core::result::Result::Ok(false);
                 }
             )*
