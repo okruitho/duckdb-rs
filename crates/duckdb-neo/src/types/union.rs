@@ -174,7 +174,7 @@ pub mod derive_support {
             return Ok(false);
         };
         let tag = children.get_untyped_vector_at(0)?;
-        Ok(u8::validate(tag.logical_type(), tag.children())? && param_names_match(other, Some(children), names)?)
+        Ok(u8::validate(tag.logical_type(), tag.children())? && param_names_match(other, names)?)
     }
 
     /// Check the child vector of the member at `index`.
