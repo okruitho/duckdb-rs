@@ -70,6 +70,11 @@ constexpr const char *MAP_TYPE = "MAP(VARCHAR, INTEGER)";
 constexpr const char *UNION_TYPE = "UNION(num INTEGER, str VARCHAR)";
 using Amount = decimal_t<18, 3>;
 
+// An inlined string holds its bytes and can be copied as is; a longer one must be copied into the target's heap.
+varchar_t CopyString(Arena &heap, const varchar_t &value) {
+	return value.is_inlined() ? value : heap.AddStringUnsafe(value.view());
+}
+
 template <class T>
 void CopyColumn(const Vector &source, Vector &target, idx_t rows) {
 	const auto input = source.GetView();
@@ -94,7 +99,7 @@ void CopyStrings(const Vector &source, Vector &target, idx_t rows) {
 	for (idx_t row = 0; row < rows; row++) {
 		const auto entry = input.SelAt(row);
 		if (input.RowIsValid(entry)) {
-			data[row] = heap.AddStringUnsafe(input.Data<varchar_t>()[entry].view());
+			data[row] = CopyString(heap, input.Data<varchar_t>()[entry]);
 			validity.SetValid(row);
 		} else {
 			validity.SetNull(row);
@@ -139,7 +144,7 @@ void CopyMaps(const Vector &source, Vector &target, idx_t rows) {
 			if (!keys.RowIsValid(key)) {
 				throw InvalidInputException("merge_struct got a NULL MAP key");
 			}
-			key_data[offset + i] = key_heap.AddStringUnsafe(keys.Data<varchar_t>()[key].view());
+			key_data[offset + i] = CopyString(key_heap, keys.Data<varchar_t>()[key]);
 			const auto value = values.SelAt(list.offset + i);
 			if (values.RowIsValid(value)) {
 				value_data[offset + i] = values.Data<int32_t>()[value];
@@ -198,7 +203,7 @@ void CopyUnions(const Vector &source, Vector &target, idx_t rows) {
 			number_validity.SetNull(row);
 			const auto string = strings.SelAt(entry);
 			if (strings.RowIsValid(string)) {
-				string_data[row] = string_heap.AddStringUnsafe(strings.Data<varchar_t>()[string].view());
+				string_data[row] = CopyString(string_heap, strings.Data<varchar_t>()[string]);
 				string_validity.SetValid(row);
 			} else {
 				string_validity.SetNull(row);
@@ -344,7 +349,8 @@ void DashSplitExec(TableFunction::ExecInput &input) {
 		}
 	}
 
-	for (idx_t position = 0; position < input.GetColumnCount(); position++) {
+	const auto columns = input.GetColumnCount();
+	for (idx_t position = 0; position < columns; position++) {
 		auto vector = output.GetVector(position);
 		vector.SetSize(parts.size());
 		if (input.GetColumnIndex(position) == 0) {
@@ -428,7 +434,8 @@ void RowHashSize(AggregateFunction::SizeInput &input) {
 
 void RowHashInit(AggregateFunction::InitInput &input) {
 	auto states = input.GetStates();
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	const auto count = input.GetStateCount();
+	for (idx_t i = 0; i < count; i++) {
 		new (states[i]) HashState();
 	}
 }
@@ -438,7 +445,8 @@ void RowHashUpdate(AggregateFunction::UpdateInput &input) {
 	const auto d = Readable(input.GetArg(1)).GetView();
 	const auto b = Readable(input.GetArg(2)).GetView();
 	auto states = input.GetStates();
-	for (idx_t row = 0; row < input.GetRowCount(); row++) {
+	const auto rows = input.GetRowCount();
+	for (idx_t row = 0; row < rows; row++) {
 		std::optional<std::string_view> text;
 		if (s.IsValid(row)) {
 			text = s.Data<varchar_t>()[s.SelAt(row)].view();
@@ -460,7 +468,8 @@ void RowHashUpdate(AggregateFunction::UpdateInput &input) {
 void RowHashCombine(AggregateFunction::CombineInput &input) {
 	auto sources = input.GetSources();
 	auto targets = input.GetTargets();
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	const auto count = input.GetStateCount();
+	for (idx_t i = 0; i < count; i++) {
 		const auto &source = *static_cast<const HashState *>(sources[i]);
 		auto &target = *static_cast<HashState *>(targets[i]);
 		target.hash += source.hash;
@@ -474,7 +483,8 @@ void RowHashFinalize(AggregateFunction::FinalizeInput &input) {
 	auto *data = result.GetDataMutable<uint64_t>();
 	OutputValidity validity(result);
 	const auto offset = input.GetResultOffset();
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	const auto count = input.GetStateCount();
+	for (idx_t i = 0; i < count; i++) {
 		const auto &state = *static_cast<const HashState *>(states[i]);
 		if (state.rows > 0) {
 			data[offset + i] = state.hash;
@@ -522,7 +532,8 @@ void IntSumSize(AggregateFunction::SizeInput &input) {
 
 void IntSumInit(AggregateFunction::InitInput &input) {
 	auto states = input.GetStates();
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	const auto count = input.GetStateCount();
+	for (idx_t i = 0; i < count; i++) {
 		new (states[i]) SumState();
 	}
 }
@@ -530,7 +541,8 @@ void IntSumInit(AggregateFunction::InitInput &input) {
 void IntSumUpdate(AggregateFunction::UpdateInput &input) {
 	const auto values = Readable(input.GetArg(0)).GetView();
 	auto states = input.GetStates();
-	for (idx_t row = 0; row < input.GetRowCount(); row++) {
+	const auto rows = input.GetRowCount();
+	for (idx_t row = 0; row < rows; row++) {
 		const auto entry = values.SelAt(row);
 		if (values.RowIsValid(entry)) {
 			auto &state = *static_cast<SumState *>(states[row]);
@@ -543,7 +555,8 @@ void IntSumUpdate(AggregateFunction::UpdateInput &input) {
 void IntSumCombine(AggregateFunction::CombineInput &input) {
 	auto sources = input.GetSources();
 	auto targets = input.GetTargets();
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	const auto count = input.GetStateCount();
+	for (idx_t i = 0; i < count; i++) {
 		const auto &source = *static_cast<const SumState *>(sources[i]);
 		auto &target = *static_cast<SumState *>(targets[i]);
 		target.sum = WrappingAdd(target.sum, source.sum);
@@ -557,7 +570,8 @@ void IntSumFinalize(AggregateFunction::FinalizeInput &input) {
 	auto *data = result.GetDataMutable<int64_t>();
 	OutputValidity validity(result);
 	const auto offset = input.GetResultOffset();
-	for (idx_t i = 0; i < input.GetStateCount(); i++) {
+	const auto count = input.GetStateCount();
+	for (idx_t i = 0; i < count; i++) {
 		const auto &state = *static_cast<const SumState *>(states[i]);
 		if (state.rows > 0) {
 			data[offset + i] = state.sum;
@@ -616,11 +630,14 @@ uint32_t LoadLittleEndian32(const uint8_t *bytes) {
 }
 
 void PushDigits(uint64_t value, size_t count, std::string &out) {
-	const auto start = out.size();
-	out.resize(start + count);
+	char digits[6];
 	for (size_t index = count; index-- > 0;) {
-		out[start + index] = ALPHABET[value % 56];
+		digits[index] = ALPHABET[value % 56];
 		value /= 56;
+	}
+	// `push_back` inlines; `append` and `resize` are out-of-line calls for a few bytes.
+	for (size_t index = 0; index < count; index++) {
+		out.push_back(digits[index]);
 	}
 }
 
@@ -628,7 +645,6 @@ void PushDigits(uint64_t value, size_t count, std::string &out) {
 void EncodeInto(const uint8_t *bytes, size_t size, std::string &out) {
 	const auto blocks = size / 4;
 	const auto tail = size % 4;
-	out.reserve(out.size() + blocks * 6 + TAIL_DIGITS[tail]);
 	for (size_t block = 0; block < blocks; block++) {
 		PushDigits(LoadLittleEndian32(bytes + block * 4), 6, out);
 	}
@@ -668,7 +684,6 @@ void DecodeInto(std::string_view digits, std::string &out) {
 		throw InvalidInputException("invalid base56 length " + std::to_string(digits.size()));
 	}
 	const auto tail_bytes = static_cast<size_t>(tail - TAIL_DIGITS.begin());
-	out.reserve(out.size() + blocks * 4 + tail_bytes);
 	for (size_t block = 0; block < blocks; block++) {
 		AppendLittleEndian(ReadDigits(digits.substr(block * 6, 6), 4), 4, out);
 	}
@@ -797,7 +812,8 @@ void EncodeChunk(const std::vector<Column> &columns, const DataChunk &chunk, std
 	for (idx_t index = 0; index < columns.size(); index++) {
 		views.push_back(chunk.GetVector(index).GetView());
 	}
-	for (idx_t row = 0; row < chunk.GetRowCount(); row++) {
+	const auto rows = chunk.GetRowCount();
+	for (idx_t row = 0; row < rows; row++) {
 		for (idx_t index = 0; index < columns.size(); index++) {
 			if (index > 0) {
 				out.push_back(FIELD_SEPARATOR);
@@ -810,7 +826,8 @@ void EncodeChunk(const std::vector<Column> &columns, const DataChunk &chunk, std
 
 void Base56ToBindCallback(CopyFunction::CopyToBindInput &input) {
 	Base56ToBind bind;
-	for (idx_t index = 0; index < input.GetColumnCount(); index++) {
+	const auto columns = input.GetColumnCount();
+	for (idx_t index = 0; index < columns; index++) {
 		auto type = input.GetColumnType(index);
 		bind.columns.push_back(ColumnFromType(type));
 		bind.types.push_back(std::move(type));
@@ -996,7 +1013,8 @@ void DecodeStrings(Vector &vector, idx_t index, idx_t rows, idx_t columns, const
 void Base56FromBindCallback(CopyFunction::CopyFromBindInput &input) {
 	Base56FromBind bind;
 	bind.path = input.GetFilePath();
-	for (idx_t index = 0; index < input.GetColumnCount(); index++) {
+	const auto columns = input.GetColumnCount();
+	for (idx_t index = 0; index < columns; index++) {
 		bind.columns.push_back(ColumnFromType(input.GetColumnType(index)));
 	}
 	input.SetBindData<Base56FromBind>(std::move(bind));
