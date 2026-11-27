@@ -16,12 +16,12 @@ use duckdb_neo::{
     connection::Connection,
     scalar::MicroScalar,
     signature::{FunctionParameter, SignatureBuilder},
-    types::{Array, List, ListIndex, Map, UncheckedString},
+    types::{Array, List, ListIndex, Map, Struct, UncheckedString},
     vector::{CombinedVectorIterator, RowReader, RowWriter, Vector},
 };
 
 #[derive(AsDuckDB)]
-#[duckdb(reader, writer)]
+#[duckdb(writer)]
 struct Point {
     x: f64,
     y: f64,
@@ -39,8 +39,8 @@ fn register_list_sum(conn: &Connection) -> Result<()> {
                 let sum = list.map(|elements| {
                     elements
                         .iter()
-                        .flatten()
-                        .fold(0_i64, |sum, value| sum.wrapping_add(*value))
+                        .map(|value| value.copied().unwrap_or(0))
+                        .fold(0_i64, i64::wrapping_add)
                 });
                 writer.set_option(row, sum.as_ref())?;
             }
@@ -152,15 +152,21 @@ fn register_split(conn: &Connection) -> Result<()> {
                     writer.set_null(row)?;
                     continue;
                 };
-                // A single byte of valid UTF-8 is ASCII, so it is also a `char`.
-                let separator = char::from(separator_byte(separator)?);
-                let start = writer.child_offset();
-                let mut len = 0;
-                for part in string.split(separator) {
-                    writer.elements().set(start + len, part)?;
+                let separator = separator_byte(separator)?;
+                let offset = writer.child_offset();
+                let (mut len, mut start) = (0, 0);
+                loop {
+                    // `str::split(char)` calls `memcmp` per match; cutting at an ASCII byte keeps char boundaries.
+                    let end = string[start..].bytes().position(|byte| byte == separator);
+                    let part_end = end.map_or(string.len(), |end| start + end);
+                    writer.elements().set(offset + len, &string[start..part_end])?;
                     len += 1;
+                    match end {
+                        Some(_) => start = part_end + 1,
+                        None => break,
+                    }
                 }
-                writer.set_entry(row, ListIndex::new(start as u64, len as u64))?;
+                writer.set_entry(row, ListIndex::new(offset as u64, len as u64))?;
             }
             Ok(())
         },
@@ -206,15 +212,24 @@ fn register_list_join(conn: &Connection) -> Result<()> {
 }
 
 fn register_point_norm(conn: &Connection) -> Result<()> {
-    MicroScalar::create(
+    let signature = SignatureBuilder::new()
+        .param(FunctionParameter::new::<Point>("input"))
+        .return_type(f64::logical_type(conn)?);
+    MicroScalar::with_signature(
         "vs_point_norm",
-        |_context, input: Vector<'_, Point>, mut output: Vector<'_, f64>| {
-            let points = input.row_reader()?;
+        signature,
+        |_context, input, mut output: Vector<'_, f64>| {
+            // The untyped STRUCT skips the derived type's per-call field validation, and its rows combine with
+            // the field readers in one `CombinedVectorIterator`.
+            let points = input.get_vector_at_mut::<Struct>(0)?;
+            let fields = points
+                .children()
+                .ok_or_else(|| Error::invalid_input("vs_point_norm: the point has no fields"))?;
+            let (xs, ys) = (fields.get_vector_at::<f64>(0)?, fields.get_vector_at::<f64>(1)?);
+            let rows = CombinedVectorIterator::new((points.reader()?, xs.reader()?, ys.reader()?))?;
             let mut writer = output.writer()?;
-            for (row, point) in points.iter().enumerate() {
-                let norm = point
-                    .and_then(|point| Some((*point.x?, *point.y?)))
-                    .map(|(x, y)| (x * x + y * y).sqrt());
+            for (row, (point, x, y)) in rows.enumerate() {
+                let norm = point.and(x.zip(y)).map(|(x, y)| (x * x + y * y).sqrt());
                 writer.set_option(row, norm.as_ref())?;
             }
             Ok(())
@@ -237,7 +252,11 @@ fn register_make_point(conn: &Connection) -> Result<()> {
             let mut writer = output.row_writer()?;
             for (row, (x, y)) in CombinedVectorIterator::new((xs.reader()?, ys.reader()?))?.enumerate() {
                 match (x, y) {
-                    (Some(&x), Some(&y)) => writer.set(row, &Point { x, y })?,
+                    // Rows start valid, so writing the fields is enough.
+                    (Some(x), Some(y)) => {
+                        writer.x.set(row, x)?;
+                        writer.y.set(row, y)?;
+                    }
                     _ => writer.set_null(row)?,
                 }
             }
@@ -275,15 +294,22 @@ fn register_map_sum(conn: &Connection) -> Result<()> {
         "vs_map_sum",
         |_context, input: Vector<'_, Map<UncheckedString, i32>>, mut output: Vector<'_, i64>| {
             let maps = input.map_reader()?;
+            // Reading the values column directly skips the key that `Entries::values` reads per entry.
+            let values = maps.values();
             let mut writer = output.writer()?;
             for (row, entries) in maps.iter().enumerate() {
-                let sum = entries.map(|entries| {
-                    entries
-                        .values()
-                        .flatten()
-                        .fold(0_i64, |sum, value| sum.wrapping_add(i64::from(*value)))
-                });
-                writer.set_option(row, sum.as_ref())?;
+                let Some(entries) = entries else {
+                    writer.set_null(row)?;
+                    continue;
+                };
+                let entry = entries.entry();
+                let mut sum = 0_i64;
+                for index in entry.offset()..entry.offset() + entry.length() {
+                    if let Some(value) = values.get(index as usize)? {
+                        sum = sum.wrapping_add(i64::from(*value));
+                    }
+                }
+                writer.set(row, &sum)?;
             }
             Ok(())
         },
@@ -306,9 +332,13 @@ fn register_list_of_points(conn: &Connection) -> Result<()> {
                 };
                 let start = writer.child_offset();
                 let len = n.max(0);
+                // The sized elements start valid, so writing the fields is enough.
+                let points = writer.elements();
                 for index in 0..len {
                     let x = f64::from(index);
-                    writer.elements().set(start + index as usize, &Point { x, y: x * x })?;
+                    let element = start + index as usize;
+                    points.x.set(element, &x)?;
+                    points.y.set(element, &(x * x))?;
                 }
                 writer.set_entry(row, ListIndex::new(start as u64, len as u64))?;
             }

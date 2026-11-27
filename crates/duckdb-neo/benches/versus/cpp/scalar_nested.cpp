@@ -185,6 +185,8 @@ void SplitExec(ScalarFunction::ExecInput &input) {
 	auto result_elements = result.GetChild(0);
 	result_elements.SetSize(total);
 	auto *result_entries = result.GetDataMutable<list_entry_t>();
+	auto *result_values = result_elements.GetDataMutable<varchar_t>();
+	auto heap = result_elements.GetHeap();
 	NullWriter nulls(result, count);
 	idx_t offset = 0;
 	for (idx_t row = 0; row < count; row++) {
@@ -199,7 +201,7 @@ void SplitExec(ScalarFunction::ExecInput &input) {
 		while (true) {
 			const auto end = string.find(separator, start);
 			// Pieces of valid UTF-8 cut at an ASCII byte are valid UTF-8.
-			result_elements.AssignStringUnsafe(offset + len, string.substr(start, end - start));
+			result_values[offset + len] = heap.AddStringUnsafe(string.substr(start, end - start));
 			len++;
 			if (end == std::string_view::npos) {
 				break;
@@ -223,6 +225,8 @@ void ListJoinExec(ScalarFunction::ExecInput &input) {
 	const auto *separator_data = separator_view.Data<varchar_t>();
 	const auto *values = element_view.Data<varchar_t>();
 	auto result = input.GetResult();
+	auto *joined_values = result.GetDataMutable<varchar_t>();
+	auto heap = result.GetHeap();
 	NullWriter nulls(result, count);
 	std::string joined;
 	for (idx_t row = 0; row < count; row++) {
@@ -244,7 +248,7 @@ void ListJoinExec(ScalarFunction::ExecInput &input) {
 			joined += values[element_view.SelAt(i)].view();
 			first = false;
 		}
-		result.AssignStringUnsafe(row, joined);
+		joined_values[row] = heap.AddStringUnsafe(joined);
 	}
 }
 
