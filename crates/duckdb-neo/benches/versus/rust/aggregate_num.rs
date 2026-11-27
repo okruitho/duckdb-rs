@@ -18,8 +18,7 @@ use duckdb_neo::{
     vector::{CombinedVectorIterator, NativeElement, StorageKind, Unknown, Vector},
 };
 
-fn readable<T: NativeElement>(vector: Vector<'_, Unknown>) -> Result<Vector<'_, T>> {
-    let mut vector = vector.cast::<T>()?;
+fn readable<T: NativeElement>(mut vector: Vector<'_, T>) -> Result<Vector<'_, T>> {
     if vector.storage_kind() == StorageKind::Other {
         vector.flatten()?;
     }
@@ -52,14 +51,14 @@ impl AggregateCallbacks for Sum {
         data: &mut VectorCollection,
         mut states: States<'_, SumState>,
     ) -> Result<()> {
-        let values = readable::<i64>(data.get_untyped_vector_at_mut(0)?)?;
-        for (row, value) in values.reader()?.iter().enumerate() {
+        let values = readable(data.get_vector_at_mut::<i64>(0)?)?;
+        values.reader()?.iter().enumerate().for_each(|(row, value)| {
             if let Some(value) = value {
                 let state = &mut states[row];
                 state.sum = state.sum.wrapping_add(*value);
                 state.rows += 1;
             }
-        }
+        });
         Ok(())
     }
 
@@ -127,14 +126,14 @@ impl AggregateCallbacks for Avg {
         data: &mut VectorCollection,
         mut states: States<'_, AvgState>,
     ) -> Result<()> {
-        let values = readable::<f64>(data.get_untyped_vector_at_mut(0)?)?;
-        for (row, value) in values.reader()?.iter().enumerate() {
+        let values = readable(data.get_vector_at_mut::<f64>(0)?)?;
+        values.reader()?.iter().enumerate().for_each(|(row, value)| {
             if let Some(value) = value {
                 let state = &mut states[row];
                 state.sum += *value;
                 state.rows += 1;
             }
-        }
+        });
         Ok(())
     }
 
@@ -202,12 +201,12 @@ impl AggregateCallbacks for CountIf {
         data: &mut VectorCollection,
         mut states: States<'_, CountIfState>,
     ) -> Result<()> {
-        let values = readable::<bool>(data.get_untyped_vector_at_mut(0)?)?;
-        for (row, value) in values.reader()?.iter().enumerate() {
+        let values = readable(data.get_vector_at_mut::<bool>(0)?)?;
+        values.reader()?.iter().enumerate().for_each(|(row, value)| {
             if value == Some(&true) {
                 states[row].count += 1;
             }
-        }
+        });
         Ok(())
     }
 
@@ -283,15 +282,15 @@ impl AggregateCallbacks for Spread {
         data: &mut VectorCollection,
         mut states: States<'_, SpreadState>,
     ) -> Result<()> {
-        let values = readable::<i64>(data.get_untyped_vector_at_mut(0)?)?;
-        for (row, value) in values.reader()?.iter().enumerate() {
+        let values = readable(data.get_vector_at_mut::<i64>(0)?)?;
+        values.reader()?.iter().enumerate().for_each(|(row, value)| {
             if let Some(&value) = value {
                 let state = &mut states[row];
                 state.min = state.min.min(value);
                 state.max = state.max.max(value);
                 state.rows += 1;
             }
-        }
+        });
         Ok(())
     }
 
@@ -363,16 +362,16 @@ impl AggregateCallbacks for Wavg {
         mut states: States<'_, WavgState>,
     ) -> Result<()> {
         let [v, w] = data.get_vector_array_mut([0, 1])?;
-        let (v, w) = (readable::<f64>(v)?, readable::<f64>(w)?);
+        let (v, w) = (readable(v.cast::<f64>()?)?, readable(w.cast::<f64>()?)?);
         let rows = CombinedVectorIterator::new((v.reader()?, w.reader()?))?;
-        for (row, (v, w)) in rows.enumerate() {
+        rows.enumerate().for_each(|(row, (v, w))| {
             if let (Some(&v), Some(&w)) = (v, w) {
                 let state = &mut states[row];
                 state.weighted_sum += v * w;
                 state.weight_sum += w;
                 state.rows += 1;
             }
-        }
+        });
         Ok(())
     }
 
@@ -449,14 +448,14 @@ impl AggregateCallbacks for SumScaled {
         mut states: States<'_, SumState>,
     ) -> Result<()> {
         let factor = factor(bind_data)?;
-        let values = readable::<i64>(data.get_untyped_vector_at_mut(0)?)?;
-        for (row, value) in values.reader()?.iter().enumerate() {
+        let values = readable(data.get_vector_at_mut::<i64>(0)?)?;
+        values.reader()?.iter().enumerate().for_each(|(row, value)| {
             if let Some(value) = value {
                 let state = &mut states[row];
                 state.sum = state.sum.wrapping_add(value.wrapping_mul(factor));
                 state.rows += 1;
             }
-        }
+        });
         Ok(())
     }
 
