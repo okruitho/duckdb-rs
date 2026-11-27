@@ -136,11 +136,11 @@ impl<'arena> DuckDBBytes<'arena> {
             let slot = slot.cast::<DuckDBV2BytesPointer>();
             (&raw mut (*slot).length).write(length);
             let prefix = (&raw mut (*slot).prefix).cast::<u8>();
-            match parts {
-                [first, ..] if first.as_ref().len() >= 4 => {
+            match parts.first().map(|first| first.as_ref()) {
+                Some(first) if first.len() >= 4 => {
                     prefix
                         .cast::<[u8; 4]>()
-                        .write_unaligned(first.as_ref().as_ptr().cast::<[u8; 4]>().read_unaligned());
+                        .write_unaligned(first.as_ptr().cast::<[u8; 4]>().read_unaligned());
                 }
                 _ => copy_prefix(parts, prefix),
             }
@@ -149,10 +149,8 @@ impl<'arena> DuckDBBytes<'arena> {
         Ok(())
     }
 
-    /// Encode the bytes `fill` pushes into a buffer of `capacity` bytes, straight into `slot`.
-    ///
-    /// Short capacities build the value inside the slot, longer ones in one arena allocation; a result
-    /// that ends up short is moved inline. If `fill` fails or panics, the slot holds an empty value.
+    /// Encode what `fill` pushes into `capacity` bytes inside `slot` or one arena allocation.
+    /// If `fill` fails or panics, the slot holds an empty value; earlier failures leave it untouched.
     ///
     /// # Safety
     /// `slot` must be valid for writes of one `DuckDBBytes`.
@@ -185,10 +183,7 @@ impl<'arena> DuckDBBytes<'arena> {
             _marker: PhantomData,
         };
         fill(&mut buffer)?;
-        // Defensive: the higher-ranked closure cannot exchange its buffer with another row's.
-        if buffer.data != data {
-            return Err(Error::invalid_input("the buffer was exchanged with another row's"));
-        }
+        debug_assert_eq!(buffer.data, data, "the higher-ranked closure cannot exchange buffers");
         std::mem::forget(guard);
         let len = buffer.len;
         // SAFETY: `buffer` is the one created above (same data), so its first `len <= capacity` bytes at
@@ -424,6 +419,29 @@ impl<'row> StrBuffer<'row> {
     }
 }
 
+/// Fails with [`std::fmt::Error`] where [`StrBuffer::push_str`] fails, so `write!` builds text in place.
+impl std::fmt::Write for StrBuffer<'_> {
+    #[inline]
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        self.push_str(value).map_err(|_| std::fmt::Error)
+    }
+}
+
+/// Writes as many bytes as fit, like `&mut [u8]`, so `write_all` fails once the buffer is full.
+impl std::io::Write for BytesBuffer<'_> {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let fitting = &bytes[..bytes.len().min(self.capacity - self.len)];
+        self.extend_from_slice(fitting).map_err(std::io::Error::other)?;
+        Ok(fitting.len())
+    }
+
+    #[inline]
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cold]
 fn capacity_exceeded(capacity: usize) -> Error {
     Error {
@@ -488,10 +506,8 @@ unsafe fn copy_short(value: &[u8], destination: *mut u8) {
     }
 }
 
-/// Copy bytes in ascending chunks that do not overlap, instead of a `memcpy` call.
-///
-/// Callers read freshly pushed bytes back; loads matching these stores can be forwarded, unlike
-/// loads spanning the overlapping stores of `copy_short` or `memcpy`.
+/// Copy in ascending chunks that do not overlap, so reading the fresh bytes back can forward from
+/// these stores, unlike from the overlapping stores of `copy_short` or `memcpy`.
 ///
 /// # Safety
 /// `destination` must be valid for writes of `value.len()` bytes.
@@ -572,8 +588,8 @@ mod tests {
         data_chunk::DataChunk,
         environment::{Environment, StorageLocation},
         scalar::MicroScalar,
-        types::{BlobValue, UncheckedString, VarcharBytes},
-        vector::{StorageKind, Vector},
+        types::{BigNum, BitValue, BlobValue, UncheckedString, VarcharBytes},
+        vector::{HasDuckDBBytes, ReadableNativeElement, StorageKind, Vector, WritableNativeElement},
     };
     use std::sync::{
         Arc,
@@ -759,10 +775,11 @@ mod tests {
 
     #[test]
     fn set_with_failures_leave_an_empty_row_with_its_validity() -> Result<()> {
-        with_string_vector(6, |vector| {
+        let previous = "a previous value longer than inline";
+        with_string_vector(8, |vector| {
             let mut writer = vector.writer()?;
-            for row in 0..6 {
-                writer.set(row, "a previous value longer than inline")?;
+            for row in 0..8 {
+                writer.set(row, previous)?;
             }
             writer.set_null(1)?;
             writer.set_null(3)?;
@@ -782,21 +799,35 @@ mod tests {
                 })
                 .expect_err("the fill fails");
             assert_eq!(error.message, "rejected");
-            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                writer.set_with(5, 40, |buffer| {
-                    buffer.push_str("a partial value beyond the inline limit")?;
-                    panic!("fill panicked")
-                })
-            }));
-            assert!(panicked.is_err());
-            assert!(writer.set_with(6, 1, |_| Ok(())).is_err());
-            assert_eq!(
-                writer.set_with(0, u32::MAX as usize + 1, |_| Ok(())).unwrap_err().code,
-                DuckDBError::InputOutOfRange
-            );
+            for (row, capacity, partial) in [(5, 40, "a partial value beyond the inline limit"), (6, 12, "partial")] {
+                let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    writer.set_with(row, capacity, |buffer| {
+                        buffer.push_str(partial)?;
+                        panic!("fill panicked")
+                    })
+                }));
+                assert!(panicked.is_err());
+            }
+            assert!(writer.set_with(8, 1, |_| Ok(())).is_err());
+            let error = writer
+                .set_with(7, u32::MAX as usize + 1, |_| unreachable!("fill does not run"))
+                .unwrap_err();
+            assert_eq!(error.code, DuckDBError::InputOutOfRange);
             let values = vector.reader()?.iter().collect::<Vec<_>>();
-            assert_eq!(values, [Some(""), None, Some(""), None, Some(""), Some("")]);
-            for row in 0..6 {
+            assert_eq!(
+                values,
+                [
+                    Some(""),
+                    None,
+                    Some(""),
+                    None,
+                    Some(""),
+                    Some(""),
+                    Some(""),
+                    Some(previous)
+                ]
+            );
+            for row in 0..7 {
                 assert_eq!(raw_slot(vector, row)?, [0; 16], "row {row}");
             }
             Ok(())
@@ -996,5 +1027,112 @@ mod tests {
             assert_ne!(seen & (1 << kind as u8), 0, "{kind:?}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn buffers_implement_fmt_and_io_write() -> Result<()> {
+        use std::{fmt::Write as _, io::Write as _};
+        with_string_vector(2, |vector| {
+            let mut writer = vector.writer()?;
+            writer.set_with(0, 16, |buffer| {
+                write!(buffer, "row-{}", 42).map_err(|_| Error::invalid_input("full"))?;
+                assert!(write!(buffer, "{}", u64::MAX).is_err());
+                assert_eq!(buffer.as_str(), "row-42");
+                Ok(())
+            })?;
+            assert_eq!(vector.reader()?.get(0)?, Some("row-42"));
+            Ok(())
+        })?;
+        let env = Environment::new()?;
+        let conn = env.open(StorageLocation::InMemory)?.connect()?;
+        let mut chunk = DataChunk::create(&conn, &[BlobValue::logical_type(&conn)?], true)?;
+        let mut vector = chunk.get_vector_at_mut::<BlobValue>(0)?;
+        vector.set_size(1)?;
+        vector.writer()?.set_with(0, 5, |buffer| {
+            buffer.write_all(&[1, 2, 3]).map_err(|_| Error::invalid_input("full"))?;
+            assert_eq!(buffer.write(&[4, 5, 6]).map_err(|_| Error::invalid_input("write"))?, 2);
+            let error = buffer.write_all(&[7]).expect_err("the buffer is full");
+            assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
+            buffer.flush().map_err(|_| Error::invalid_input("flush"))
+        })?;
+        assert_eq!(vector.reader()?.get(0)?, Some(&[1, 2, 3, 4, 5][..]));
+        Ok(())
+    }
+
+    #[test]
+    fn unchecked_string_set_with_builds_text() -> Result<()> {
+        let env = Environment::new()?;
+        let conn = env.open(StorageLocation::InMemory)?.connect()?;
+        let mut chunk = DataChunk::create(&conn, &[UncheckedString::logical_type(&conn)?], true)?;
+        let mut vector = chunk.get_vector_at_mut::<UncheckedString>(0)?;
+        vector.set_size(2)?;
+        let mut writer = vector.writer()?;
+        writer.set_with(0, 3, |buffer| buffer.push_str("abc"))?;
+        writer.set_with(1, 30, |buffer| buffer.push_str("a value longer than inline"))?;
+        assert_eq!(
+            vector.reader()?.iter().collect::<Vec<_>>(),
+            [Some("abc"), Some("a value longer than inline")]
+        );
+        Ok(())
+    }
+
+    /// Copy column 0 of `query` into a fresh `T` vector, both ways, and compare the rows.
+    fn copy_same_type<T, R>(conn: &Connection, query: &str, read: impl Fn(T::Ref<'_>) -> R) -> Result<()>
+    where
+        T: HasDuckDBBytes + WritableNativeElement + ReadableNativeElement + DuckDBType,
+        R: PartialEq + std::fmt::Debug,
+    {
+        let mut result = conn.query(query, Parameters::None)?;
+        let source_chunk = result.next_chunk()?.unwrap();
+        let source = source_chunk.get_vector_at::<T>(0)?;
+        let expected = source.reader()?.iter().map(|row| row.map(&read)).collect::<Vec<_>>();
+        let mut chunk = DataChunk::create(conn, &[T::logical_type(conn)?], true)?;
+        let mut copied = chunk.get_vector_at_mut::<T>(0)?;
+        copied.set_size(2 * expected.len())?;
+        let mut writer = copied.writer()?;
+        writer.copy_bytes_from(&source.reader()?)?;
+        for row in 0..expected.len() {
+            writer.copy_row(expected.len() + row, &source.reader()?, row)?;
+        }
+        let actual = copied.reader()?.iter().map(|row| row.map(&read)).collect::<Vec<_>>();
+        assert_eq!(actual[..expected.len()], expected, "{query}");
+        assert_eq!(actual[expected.len()..], expected, "{query}");
+        Ok(())
+    }
+
+    #[test]
+    fn copies_blob_bit_and_bignum_rows() -> Result<()> {
+        let env = Environment::new()?;
+        let conn = env.open(StorageLocation::InMemory)?.connect()?;
+        copy_same_type::<BlobValue, _>(
+            &conn,
+            "SELECT * FROM (VALUES ('\\xAA\\x00'::BLOB), (NULL), (repeat('ab', 20)::BLOB)) t(b)",
+            <[u8]>::to_vec,
+        )?;
+        copy_same_type::<BitValue, _>(
+            &conn,
+            "SELECT * FROM (VALUES ('101'::BIT), (NULL), (repeat('10', 100)::BIT)) t(b)",
+            <[u8]>::to_vec,
+        )?;
+        copy_same_type::<BigNum, _>(
+            &conn,
+            "SELECT * FROM (VALUES (5::BIGNUM), (NULL), \
+             ('123456789012345678901234567890123456789012345678901234567890'::BIGNUM)) t(n)",
+            |value: &BigNum| value.decode().unwrap(),
+        )
+    }
+
+    #[test]
+    fn copy_bytes_from_an_empty_source_writes_nothing() -> Result<()> {
+        let env = Environment::new()?;
+        let conn = env.open(StorageLocation::InMemory)?.connect()?;
+        let source = DataChunk::create(&conn, &[String::logical_type(&conn)?], true)?;
+        with_string_vector(1, |vector| {
+            let mut writer = vector.writer()?;
+            writer.set(0, "kept")?;
+            writer.copy_bytes_from(&source.get_vector_at::<UncheckedString>(0)?.reader()?)?;
+            assert_eq!(vector.reader()?.get(0)?, Some("kept"));
+            Ok(())
+        })
     }
 }

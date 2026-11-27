@@ -614,7 +614,8 @@ impl VectorWriter<'_, String> {
     ///
     /// `fill` pushes the text; pushes beyond `capacity` fail. Short results are stored inline, longer
     /// ones in this vector's arena, where unused capacity stays reserved until the vector is reset.
-    /// If `fill` fails or panics, the row holds an empty string and keeps its validity.
+    /// If `fill` fails or panics, the row holds an empty string and keeps its validity. A failure
+    /// before `fill` runs (`capacity` above `u32::MAX`, or the arena allocation) leaves the row unchanged.
     ///
     /// ```
     /// # use duckdb_neo::{DuckDBType, Result, data_chunk::DataChunk, environment::{Environment, StorageLocation}};
@@ -655,6 +656,25 @@ impl VectorWriter<'_, String> {
 }
 
 impl VectorWriter<'_, crate::types::UncheckedString> {
+    /// Build a row's text in place, as with [`VectorWriter::<String>::set_with`].
+    #[inline(always)]
+    pub fn set_with(
+        &mut self,
+        index: usize,
+        capacity: usize,
+        fill: impl FnOnce(&mut StrBuffer<'_>) -> Result<()>,
+    ) -> Result<()> {
+        if index >= self.len() {
+            return Err(out_of_bounds(index, self.len()));
+        }
+        // SAFETY: The row is in bounds; a fresh buffer is empty, and a `StrBuffer` only holds UTF-8.
+        unsafe {
+            self.write_byte_buffer(index, capacity, |bytes| fill(StrBuffer::from_bytes_mut(bytes)))?;
+            self.mark_valid_unchecked(index);
+        }
+        Ok(())
+    }
+
     /// Concatenate UTF-8 fragments, as with [`VectorWriter::<String>::set_parts`].
     #[inline(always)]
     pub fn set_parts(&mut self, index: usize, parts: Option<&[&str]>) -> Result<()> {
@@ -770,7 +790,10 @@ impl<T: HasDuckDBBytes + WritableNativeElement> VectorWriter<'_, T> {
     /// Copy row `source_row` of `source`, value or NULL, into row `index` without decoding it.
     ///
     /// Inline values are copied as they are, longer ones into this vector's arena. Both element types
-    /// must store the same logical type, e.g. any `VARCHAR` marker into [`String`].
+    /// must store the same logical type, e.g. any `VARCHAR` marker into [`String`]. The bytes are
+    /// copied unvalidated, so they are exactly as valid as the source's (see [`VarcharBytes`]).
+    ///
+    /// [`VarcharBytes`]: crate::types::VarcharBytes
     ///
     /// A vector cannot be copied into itself:
     ///

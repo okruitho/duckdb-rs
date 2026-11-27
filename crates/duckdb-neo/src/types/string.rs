@@ -223,11 +223,16 @@ impl FromValue for BitValue {
     }
 }
 
-impl HasDuckDBBytes for String {}
-impl HasDuckDBBytes for UncheckedString {}
-impl HasDuckDBBytes for BlobValue {}
-impl HasDuckDBBytes for BitValue {}
-impl HasDuckDBBytes for VarcharBytes {}
+// SAFETY: VARCHAR, BLOB and BIT rows are `duckdb_v2_bytes` slots.
+unsafe impl HasDuckDBBytes for String {}
+// SAFETY: as above.
+unsafe impl HasDuckDBBytes for UncheckedString {}
+// SAFETY: as above.
+unsafe impl HasDuckDBBytes for BlobValue {}
+// SAFETY: as above.
+unsafe impl HasDuckDBBytes for BitValue {}
+// SAFETY: as above.
+unsafe impl HasDuckDBBytes for VarcharBytes {}
 
 // SAFETY: `DuckDBBytes` matches DuckDB's string storage.
 unsafe impl NativeElement for BlobValue {
@@ -424,7 +429,8 @@ unsafe impl ReadableNativeElement for &str {
     }
 }
 
-impl HasDuckDBBytes for &str {}
+// SAFETY: VARCHAR rows are `duckdb_v2_bytes` slots.
+unsafe impl HasDuckDBBytes for &str {}
 
 // SAFETY: input strings are UTF-8 and are copied into the vector's arena.
 unsafe impl WritableNativeElement for &str {

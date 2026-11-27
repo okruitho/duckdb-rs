@@ -151,7 +151,25 @@ pub unsafe trait ReadableNativeElement: NativeElement {
 ///     Ok(())
 /// }
 /// ```
-pub trait HasDuckDBBytes: NativeElement {}
+///
+/// # Safety
+///
+/// Every vector the type validates for must store its rows as `duckdb_v2_bytes` slots, because
+/// [`VectorWriter::copy_row`](crate::vector::VectorWriter::copy_row) copies them as such. A safe
+/// implementation, e.g. on an element of `INTEGER` vectors, is rejected:
+///
+/// ```compile_fail,E0200
+/// # use duckdb_neo::{logical_type::LogicalTypeID, vector::{HasDuckDBBytes, NativeElement}};
+/// struct Id;
+///
+/// unsafe impl NativeElement for Id {
+///     const TYPE_ID: LogicalTypeID = LogicalTypeID::Integer;
+///     type Native<'a> = i32;
+/// }
+///
+/// impl HasDuckDBBytes for Id {}
+/// ```
+pub unsafe trait HasDuckDBBytes: NativeElement {}
 
 /// Element types whose rows encode into their physical slot.
 ///
