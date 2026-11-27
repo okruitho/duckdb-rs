@@ -29,14 +29,27 @@ fn check_distinct(indices: &[usize]) -> Result<()> {
     Ok(())
 }
 
-fn collect_array<V, const N: usize>(results: [Result<V>; N]) -> Result<[V; N]> {
-    if results.iter().any(Result::is_err) {
-        return Err(results
-            .into_iter()
-            .find_map(Result::err)
-            .expect("one result is an error"));
+/// Wrap every index in order, building the array in place.
+#[inline(always)]
+fn collect_array<V, const N: usize>(indices: [usize; N], mut wrap: impl FnMut(usize) -> Result<V>) -> Result<[V; N]> {
+    let mut vectors = [const { std::mem::MaybeUninit::<V>::uninit() }; N];
+    for (written, index) in indices.into_iter().enumerate() {
+        match wrap(index) {
+            Ok(vector) => {
+                vectors[written].write(vector);
+            }
+            Err(error) => {
+                for vector in &mut vectors[..written] {
+                    // SAFETY: the slots before `written` were initialized above, and are dropped once.
+                    unsafe { vector.assume_init_drop() };
+                }
+                return Err(error);
+            }
+        }
     }
-    Ok(results.map(|result| result.unwrap_or_else(|_| unreachable!("every result is Ok"))))
+    // SAFETY: every slot was initialized, and `MaybeUninit<V>` has the layout of `V`. A panic in
+    // `wrap` only leaks the slots written before it.
+    Ok(unsafe { std::ptr::read(vectors.as_ptr().cast::<[V; N]>()) })
 }
 
 /// Input vectors and their row count for scalar and aggregate callbacks, and
@@ -275,7 +288,7 @@ impl VectorCollection {
         for index in indices {
             self.evict(index);
         }
-        collect_array(indices.map(|index| self.wrap(index, self.access)))
+        collect_array(indices, |index| self.wrap(index, self.access))
     }
 
     /// Return the number of vectors, which is the column count.
@@ -798,6 +811,15 @@ mod tests {
         fn fail(_: *mut std::ffi::c_void, _: usize) -> crate::Result<crate::ffi::duckdb_v2_vector_handle> {
             Err(crate::Error::invalid_input("no argument"))
         }
+        fn fail_second(
+            info: *mut std::ffi::c_void,
+            index: usize,
+        ) -> crate::Result<crate::ffi::duckdb_v2_vector_handle> {
+            match index {
+                1 => Err(crate::Error::invalid_input("no second argument")),
+                _ => get(info, index),
+            }
+        }
 
         let env = Environment::new()?;
         let conn = env.open(StorageLocation::InMemory)?.connect()?;
@@ -829,6 +851,15 @@ mod tests {
         assert!(failing.get_vector_at::<i64>(0).is_err());
         assert!(failing.get_vector_at_mut::<i64>(1).is_err());
         assert!(failing.get_vector_array_mut([0, 1]).is_err());
+
+        // A failure after the first vector drops the vectors wrapped so far and reports the error.
+        // SAFETY: `handles` and `chunk` outlive the collection.
+        let mut partial =
+            unsafe { VectorCollection::arguments(info, 2, fail_second, Access::Exclusive, RowCount::Fixed(1)) };
+        let error = partial.get_vector_array_mut([0, 1]).unwrap_err();
+        assert!(error.message.contains("no second argument"), "{error}");
+        let [first] = partial.get_vector_array_mut([0])?;
+        assert_eq!(first.cast::<i64>()?.reader()?.get(0)?, Some(&10));
         Ok(())
     }
 
