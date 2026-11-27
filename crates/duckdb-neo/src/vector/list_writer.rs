@@ -1,8 +1,8 @@
 use std::{borrow::Borrow, ptr::NonNull};
 
 use super::{
-    NativeElement, PlainNative, RowWriter, Unknown, Vector, VectorWriter, WithWriter, WritableNativeElement,
-    out_of_bounds,
+    Elements, NativeElement, PlainNative, ReadableNativeElement, RowLayout, RowWriter, Unknown, Vector, VectorReader,
+    VectorWriter, WithWriter, WritableNativeElement, out_of_bounds,
 };
 use crate::{Result, error::Error, types::List, types::ListIndex};
 
@@ -557,6 +557,79 @@ impl<T: PlainNative> ListAppender<'_, T> {
         unsafe { self.commit(row, start, count) };
         Ok(())
     }
+
+    /// Write a row from the elements of a `LIST` or `ARRAY` row, `f(value)` for each; NULL elements stay NULL
+    /// without a call. Storage is resolved once, so flat elements without NULLs run a vectorizable loop.
+    ///
+    /// ```
+    /// # use duckdb_neo::{Parameters, Result, environment::{Environment, StorageLocation}, scalar::MicroScalar, types::List, vector::{RowReader, Vector}};
+    /// # fn main() -> Result<()> {
+    /// # let conn = Environment::new()?.open(StorageLocation::InMemory)?.connect()?;
+    /// MicroScalar::create("doubled", |_ctx, input: Vector<'_, List<i64>>, mut output: Vector<'_, List<i64>>| {
+    ///     let lists = input.list_reader()?;
+    ///     output.list_appender(|doubled| {
+    ///         for (row, list) in lists.iter().enumerate() {
+    ///             match list {
+    ///                 Some(list) => doubled.map_elements(row, list, |value| 2 * value)?,
+    ///                 None => doubled.set_null(row)?,
+    ///             }
+    ///         }
+    ///         Ok(())
+    ///     })
+    /// })
+    /// .register(&conn)?;
+    /// let chunk = conn.query("SELECT doubled([1, NULL, 3])", Parameters::None)?.next_chunk()?.unwrap();
+    /// let row = chunk.get_vector_at::<List<i64>>(0)?.get_value_slow(0)?.get::<List<i64>>()?;
+    /// assert_eq!(row, Some(List(vec![Some(2), None, Some(6)])));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn map_elements<'a, I: ReadableNativeElement + 'a>(
+        &mut self,
+        row: usize,
+        elements: Elements<'_, VectorReader<'a, I>>,
+        mut f: impl FnMut(I::Ref<'a>) -> T,
+    ) -> Result<()> {
+        self.check_row(row)?;
+        let (reader, rows) = elements.child_rows();
+        let count = rows.len();
+        let start = self.claim(count)?;
+        let data = self.elements.as_mut_ptr().cast::<T>();
+        let layout = reader.layout();
+        if matches!(layout, RowLayout::Flat { validity } if validity.is_null()) {
+            for (index, source) in rows.enumerate() {
+                // SAFETY: `source` is a valid flat row of the reader, its own slot; the element is reserved and
+                // marked valid, and `T` is the slot type. If `f` panics, `used` has not moved, so `finish` cuts
+                // these elements off.
+                unsafe { data.add(start + index).write(f(I::get(reader, source, source))) };
+            }
+        } else {
+            let written = Remark {
+                appender: self,
+                start,
+                end: start + count,
+            };
+            for (index, source) in rows.enumerate() {
+                // SAFETY: `source` is a row of the reader, read only when valid at its physical slot; the element
+                // is reserved, and zero bytes are a valid `T`, as `PlainNative` requires. If `f` panics or the
+                // mask fails, `written` re-marks the elements valid and `finish` cuts them off.
+                unsafe {
+                    match layout.valid_physical(source) {
+                        Some(physical) => data.add(start + index).write(f(I::get(reader, physical, source))),
+                        None => {
+                            data.add(start + index).write_bytes(0, 1);
+                            written.appender.elements.mark_null_unchecked(start + index)?;
+                        }
+                    }
+                }
+            }
+            std::mem::forget(written);
+        }
+        // SAFETY: the row is in bounds, and the elements were just written.
+        unsafe { self.commit(row, start, count) };
+        Ok(())
+    }
 }
 
 impl<T: NativeElement> std::fmt::Debug for ListAppender<'_, T> {
@@ -1052,6 +1125,152 @@ mod tests {
         let mut chunk = DataChunk::create(&conn, &[List::<i32>::logical_type(&conn)?], true)?;
         let sequence = chunk.get_vector_at_mut::<List<i32>>(0)?.make_sequence(0, 1, 3)?;
         assert!(sequence.child_len().is_err());
+        Ok(())
+    }
+
+    fn copy_lists(conn: &Connection, sql: &str) -> Result<usize> {
+        let mut result = conn.query(sql, crate::Parameters::None)?;
+        let mut rows = 0;
+        while let Some(chunk) = result.next_chunk()? {
+            let input = chunk.get_vector_at::<List<i64>>(0)?;
+            let lists = input.list_reader()?;
+            let mut output = DataChunk::create(conn, &[List::<i64>::logical_type(conn)?], true)?;
+            let mut doubled = output.get_vector_at_mut::<List<i64>>(0)?;
+            doubled.set_size(lists.len())?;
+            doubled.list_appender(|appender| {
+                for (row, list) in lists.iter().enumerate() {
+                    match list {
+                        Some(list) => appender.map_elements(row, list, |value| value.wrapping_mul(2))?,
+                        None => appender.set_null(row)?,
+                    }
+                }
+                Ok(())
+            })?;
+            for row in 0..lists.len() {
+                let expected = input.get_value_slow(row)?.get::<List<i64>>()?.map(|list| {
+                    list.0
+                        .into_iter()
+                        .map(|value| value.map(|value| value.wrapping_mul(2)))
+                        .collect::<List<_>>()
+                });
+                assert_eq!(doubled.get_value_slow(row)?.get::<List<i64>>()?, expected, "row {row}");
+                rows += 1;
+            }
+        }
+        Ok(rows)
+    }
+
+    #[test]
+    fn map_elements_reads_every_storage_layout() -> Result<()> {
+        let conn = connection()?;
+        let layouts = "SELECT * FROM test_vector_types(NULL::BIGINT[], all_flat := false)";
+        assert!(copy_lists(&conn, layouts)? > 0);
+        let sliced = "SELECT l FROM (SELECT i, CASE WHEN i % 7 = 0 THEN NULL ELSE list_transform(range(i % 5), \
+                      lambda x: CASE WHEN (x + i) % 3 = 0 THEN NULL ELSE x * i END) END AS l FROM range(3000) r(i)) \
+                      WHERE i % 4 <> 1";
+        assert!(copy_lists(&conn, sliced)? > 2000);
+        let without_nulls = "SELECT list_transform(range(i % 9), lambda x: x + i) FROM range(3000) r(i)";
+        assert_eq!(copy_lists(&conn, without_nulls)?, 3000);
+        assert_eq!(copy_lists(&conn, "SELECT [1] WHERE false")?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn map_elements_maps_array_rows() -> Result<()> {
+        use crate::types::Array;
+        let conn = connection()?;
+        let chunk = conn
+            .query(
+                "SELECT * FROM (VALUES ([1, NULL, 3]::DOUBLE[3]), (NULL), ([4, 5, 6]::DOUBLE[3])) t(a)",
+                crate::Parameters::None,
+            )?
+            .next_chunk()?
+            .unwrap();
+        let input = chunk.get_vector_at::<Array<f64, 3>>(0)?;
+        let arrays = input.array_reader()?;
+        let mut output = DataChunk::create(&conn, &[List::<f64>::logical_type(&conn)?], true)?;
+        let mut lists = output.get_vector_at_mut::<List<f64>>(0)?;
+        lists.set_size(3)?;
+        lists.list_appender(|lists| {
+            for (row, array) in arrays.iter().enumerate() {
+                match array {
+                    Some(array) => lists.map_elements(row, array, |value| value / 2.0)?,
+                    None => lists.set_null(row)?,
+                }
+            }
+            Ok(())
+        })?;
+        assert_eq!(lists.child_len()?, 6);
+        assert_eq!(
+            rows(&lists)?,
+            [
+                Some(List(vec![Some(0.5), None, Some(1.5)])),
+                None,
+                Some(List(vec![Some(2.0), Some(2.5), Some(3.0)])),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn map_elements_keeps_only_finished_rows_after_a_panic_or_error() -> Result<()> {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let conn = connection()?;
+        let chunk = conn
+            .query(
+                "SELECT [1, NULL, 3, NULL, 5]::BIGINT[], [6, 7, 8]::BIGINT[]",
+                crate::Parameters::None,
+            )?
+            .next_chunk()?
+            .unwrap();
+        let (with_nulls, without_nulls) = (
+            chunk.get_vector_at::<List<i64>>(0)?,
+            chunk.get_vector_at::<List<i64>>(1)?,
+        );
+        let (with_nulls, without_nulls) = (with_nulls.list_reader()?, without_nulls.list_reader()?);
+        let (with_nulls, without_nulls) = (with_nulls.get(0)?.unwrap(), without_nulls.get(0)?.unwrap());
+        let mut output = DataChunk::create(&conn, &[List::<i64>::logical_type(&conn)?], true)?;
+        let mut vector = output.get_vector_at_mut::<List<i64>>(0)?;
+        vector.set_size(4)?;
+        vector.list_appender(|lists| {
+            lists.map_elements(0, without_nulls, |value| *value)?;
+            for list in [with_nulls, without_nulls] {
+                let panicked = catch_unwind(AssertUnwindSafe(|| {
+                    lists.map_elements(1, list, |value| if *value > 3 { panic!("in f") } else { *value })
+                }));
+                assert!(panicked.is_err());
+                assert_eq!(lists.child_len(), 3);
+            }
+            // The panicked row's NULL elements do not leak into the next row.
+            lists.set_slice(1, &[9, 9, 9, 9, 9])?;
+            Ok(())
+        })?;
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            vector.list_appender(|lists| {
+                lists.map_elements(2, with_nulls, |value| -value)?;
+                lists.map_elements(3, with_nulls, |_| panic!("in f"))
+            })
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(vector.child_len()?, 13);
+        let error = vector
+            .list_appender(|lists| {
+                lists.map_elements(3, without_nulls, |value| value + 1)?;
+                assert!(lists.map_elements(4, without_nulls, |value| *value).is_err());
+                Err::<(), _>(crate::Error::invalid_input("stop"))
+            })
+            .unwrap_err();
+        assert!(error.message.contains("stop"), "{error}");
+        assert_eq!(vector.child_len()?, 16);
+        assert_eq!(
+            rows(&vector)?,
+            [
+                Some(List(vec![Some(6), Some(7), Some(8)])),
+                Some(List(vec![Some(9); 5])),
+                Some(List(vec![Some(-1), None, Some(-3), None, Some(-5)])),
+                Some(List(vec![Some(7), Some(8), Some(9)])),
+            ]
+        );
         Ok(())
     }
 }

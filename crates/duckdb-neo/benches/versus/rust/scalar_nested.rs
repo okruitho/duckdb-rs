@@ -70,10 +70,7 @@ fn register_list_scale(conn: &Connection) -> Result<()> {
                         scaled.set_null(row)?;
                         continue;
                     };
-                    scaled.set_elements(
-                        row,
-                        list.iter().map(|value| value.map(|value| value.wrapping_mul(factor))),
-                    )?;
+                    scaled.map_elements(row, list, |value| value.wrapping_mul(factor))?;
                 }
                 Ok(())
             })

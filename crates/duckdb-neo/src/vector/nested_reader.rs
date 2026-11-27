@@ -125,6 +125,12 @@ impl<'r, R: RowReader> Elements<'r, R> {
         // SAFETY: DuckDB keeps every entry within its child.
         unsafe { RowIter::new_unchecked(self.reader, self.offset..self.offset + self.len) }
     }
+
+    /// The child reader and the elements' rows in it, which are rows of the reader.
+    #[inline(always)]
+    pub(super) fn child_rows(&self) -> (&'r R, std::ops::Range<usize>) {
+        (self.reader, self.offset..self.offset + self.len)
+    }
 }
 
 /// Reads `MAP` rows, with the key and value readers prepared once.
