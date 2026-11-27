@@ -314,6 +314,7 @@ macro_rules! ffi_enum_redeclaration {
         };
 
         impl From<$name> for $ffi_ty {
+            #[inline]
             fn from(value: $name) -> Self {
                 match value {
                     $($name::$variant => <$ffi_ty>::$ffi_variant,)*
@@ -323,6 +324,7 @@ macro_rules! ffi_enum_redeclaration {
 
         impl TryFrom<$ffi_ty> for $name {
             type Error = $crate::Error;
+            #[inline]
             fn try_from(value: $ffi_ty) -> $crate::Result<Self> {
                 match value {
                     $(<$ffi_ty>::$ffi_variant => Ok($name::$variant),)*

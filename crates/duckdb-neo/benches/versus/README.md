@@ -88,9 +88,9 @@ Per iteration both runners make the same v2 C API calls:
 | per chunk | `next_chunk()`, `row_count()`, drop | `FetchChunk()`, `GetRowCount()`, destructor | `result_fetch_chunk`, `data_chunk_get_size`, `data_chunk_destroy` |
 | end | drop the result | destructor | `result_destroy` |
 
-duckdb-neo's `DataChunk` also calls `data_chunk_get_vector_count` and `data_chunk_get_vector` per column
-for every chunk; that is part of what is measured. Both results are the lazy streaming kind. The fixtures
-differ in one call: the C++ API has no startup option for `threads`, so its runner sets it right after
+duckdb-neo's `DataChunk` also calls `data_chunk_get_vector_count` for every chunk, and `data_chunk_get_vector`
+only for the columns it reads (none here); that is part of what is measured. Both results are the lazy
+streaming kind. The fixtures differ in one call: the C++ API has no startup option for `threads`, so its runner sets it right after
 creating the instance (`Config::SetOption`, GLOBAL) where duckdb-neo passes it to the instance builder.
 
 ## Cases

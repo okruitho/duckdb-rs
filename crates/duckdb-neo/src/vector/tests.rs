@@ -32,20 +32,166 @@ fn vector_from_handle_rejects_type_mismatches() -> crate::Result<()> {
     )?;
     let chunk = result.next_chunk()?.expect("one result chunk");
 
-    let err = super::Vector::<i64>::from_handle(&chunk.get_vector_handle_at(0), super::Access::Shared)
+    let err = super::Vector::<i64>::from_handle(&chunk.get_vector_handle_at(0)?, super::Access::Shared)
         .expect_err("scalar type mismatch");
     assert!(err.message.contains("INTEGER"), "{}", err.message);
 
-    let err = super::Vector::<List<i64>>::from_handle(&chunk.get_vector_handle_at(1), super::Access::Shared)
+    let err = super::Vector::<List<i64>>::from_handle(&chunk.get_vector_handle_at(1)?, super::Access::Shared)
         .expect_err("nested child type mismatch");
     assert!(err.message.contains("INTEGER[]"), "{}", err.message);
 
     let err = super::Vector::<crate::types::Decimal<18, 2>>::from_handle(
-        &chunk.get_vector_handle_at(2),
+        &chunk.get_vector_handle_at(2)?,
         super::Access::Shared,
     )
     .expect_err("decimal scale mismatch");
     assert!(err.message.contains("DECIMAL(18,3)"), "{}", err.message);
+    Ok(())
+}
+
+#[test]
+fn vector_from_handle_fetches_children_only_for_nested_types() -> crate::Result<()> {
+    let env = Environment::new()?;
+    let conn = env.open(StorageLocation::InMemory)?.connect()?;
+    let mut result = conn.query(
+        "SELECT 42::INTEGER, 'text', [1, 2]::INTEGER[], {'a': 1, 'b': 'x'}, union_value(n := 1), \
+         [1, 2]::INTEGER[2], MAP {1: 2}, 1::VARIANT, 'b'::ENUM('a', 'b'), 1.5::DECIMAL(18, 3), (1, 'x')",
+        Parameters::None,
+    )?;
+    let mut chunk = result.next_chunk()?.expect("one result chunk");
+    let mut ids = Vec::new();
+    let child_counts = (0..chunk.col_count())
+        .map(|index| {
+            let handle = chunk.get_vector_handle_at(index)?;
+            let vector = Vector::<crate::vector::Unknown>::from_handle(&handle, super::Access::Shared)?;
+            // The type id alone must predict what DuckDB reports.
+            let reported = crate::check_api_call!(crate::ffi::duckdb_v2_vector_get_child_count, handle, RET)?;
+            let fetched = vector.children().map(|children| children.col_count());
+            assert_eq!(fetched.unwrap_or(0) as u64, reported, "column {index}");
+            ids.push(vector.logical_type().id()?);
+            Ok(fetched)
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert_eq!(
+        ids[7..],
+        [
+            LogicalTypeID::Variant,
+            LogicalTypeID::Enum,
+            LogicalTypeID::Decimal,
+            LogicalTypeID::Tuple
+        ]
+    );
+    assert_eq!(
+        child_counts,
+        [
+            None,
+            None,
+            Some(1),
+            Some(2),
+            Some(2),
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+            Some(2)
+        ]
+    );
+
+    // Types that validate by id still reject other ids, also through a later cast.
+    assert!(chunk.get_vector_at::<i32>(0).is_ok());
+    assert!(chunk.get_vector_at::<i64>(0).is_err());
+    assert!(chunk.get_vector_at::<BlobValue>(1).is_err());
+    assert!(chunk.get_vector_at::<String>(2).is_err());
+    let [integer, text] = chunk.get_vector_array_mut([0, 1])?;
+    assert!(integer.cast::<u32>().is_err());
+    assert_eq!(text.cast::<String>()?.reader()?.get(0)?, Some("text"));
+    Ok(())
+}
+
+#[test]
+fn storage_kind_maps_unknown_kinds_to_other() {
+    use crate::ffi::DUCKDB_V2_VECTOR_TYPE as Kind;
+    assert_eq!(
+        StorageKind::from_ffi(Kind::DUCKDB_V2_VECTOR_TYPE_FLAT),
+        StorageKind::Flat
+    );
+    assert_eq!(
+        StorageKind::from_ffi(Kind::DUCKDB_V2_VECTOR_TYPE_CONSTANT),
+        StorageKind::Constant
+    );
+    assert_eq!(
+        StorageKind::from_ffi(Kind::DUCKDB_V2_VECTOR_TYPE_DICTIONARY),
+        StorageKind::Dictionary
+    );
+    assert_eq!(
+        StorageKind::from_ffi(Kind::DUCKDB_V2_VECTOR_TYPE_OTHER),
+        StorageKind::Other
+    );
+    assert_eq!(
+        StorageKind::from_ffi(Kind::DUCKDB_V2_VECTOR_TYPE_MAX_ENUM),
+        StorageKind::Other
+    );
+}
+
+#[test]
+fn vector_make_constant_reuses_borrowed_values_and_refreshes_children() -> crate::Result<()> {
+    let env = Environment::new()?;
+    let conn = env.open(StorageLocation::InMemory)?.connect()?;
+    let source = conn
+        .query(
+            "SELECT [1, 2, 3]::INTEGER[], NULL::INTEGER[], 'a long string, not inlined'",
+            Parameters::None,
+        )?
+        .next_chunk()?
+        .expect("one result chunk");
+    let values = (0..3)
+        .map(|index| source.get_vector_at::<crate::vector::Unknown>(index)?.get_value_slow(0))
+        .collect::<crate::Result<Vec<_>>>()?;
+
+    let types = [
+        List::<i32>::logical_type(&conn)?,
+        List::<i32>::logical_type(&conn)?,
+        String::logical_type(&conn)?,
+    ];
+    let mut chunk = DataChunk::create(&conn, &types, true)?;
+    {
+        // Written rows and their child elements are replaced by the constant.
+        let mut lists = chunk.get_vector_at_mut::<List<i32>>(0)?;
+        lists.set_size(2)?;
+        lists.set_child_size(1)?;
+        lists.list_writer()?.set(1, &List(vec![Some(9)]))?;
+        let lists = lists.make_constant(&values[0], 4)?;
+        assert_eq!(
+            (lists.storage_kind(), lists.len(), lists.is_writable()),
+            (StorageKind::Constant, 4, false)
+        );
+        assert_eq!(lists.list_child_len()?, 3);
+        let reader = lists.list_reader()?;
+        for row in 0..4 {
+            let items = RowReader::get(&reader, row)?.map(|items| items.iter().map(|x| x.copied()).collect::<Vec<_>>());
+            assert_eq!(items, Some(vec![Some(1), Some(2), Some(3)]));
+        }
+    }
+    // The same borrowed values build more constants, including a NULL one.
+    let lists = chunk.get_vector_at_mut::<List<i32>>(1)?.make_constant(&values[1], 2)?;
+    assert_eq!(lists.reader()?.get(1)?, None);
+    let lists = chunk.get_vector_at_mut::<List<i32>>(1)?;
+    assert!(
+        lists.make_constant(&values[0], 1).is_err(),
+        "constants are not writable"
+    );
+    let mut text = chunk.get_vector_at_mut::<String>(2)?;
+    text.set_size(1)?;
+    text.writer()?.set(0, "written before the constant")?;
+    let text = text.make_constant(&values[2], 3)?;
+    assert_eq!(text.reader()?.get(2)?, Some("a long string, not inlined"));
+    assert_eq!(values[2].to_string(), "a long string, not inlined");
+
+    // A value of another type is rejected and leaves the vector writable.
+    let mut other = DataChunk::create(&conn, &[i64::logical_type(&conn)?], true)?;
+    assert!(other.get_vector_at_mut::<i64>(0)?.make_constant(&values[2], 1).is_err());
+    assert!(other.get_vector_at_mut::<i64>(0)?.is_writable());
     Ok(())
 }
 
@@ -213,7 +359,7 @@ fn vector_fill_validity_rejects_read_only_and_constant_storage() -> crate::Resul
     vector.set_size(1)?;
     vector.row_writer()?.set(0, &42)?;
     drop(vector);
-    let mut shared = super::Vector::<i32>::from_handle(&chunk.get_vector_handle_at(0), super::Access::Shared)?;
+    let mut shared = super::Vector::<i32>::from_handle(&chunk.get_vector_handle_at(0)?, super::Access::Shared)?;
     assert!(shared.writer().is_err());
     assert_eq!(shared.row_reader()?.get(0)?, Some(&42));
     drop(shared);
@@ -440,7 +586,7 @@ fn vector_writer_arena_rejects_read_only_vectors() -> crate::Result<()> {
     let env = Environment::new()?;
     let conn = env.open(StorageLocation::InMemory)?.connect()?;
     let chunk = DataChunk::create(&conn, &[String::logical_type(&conn)?], true)?;
-    let mut shared = super::Vector::<String>::from_handle(&chunk.get_vector_handle_at(0), super::Access::Shared)?;
+    let mut shared = super::Vector::<String>::from_handle(&chunk.get_vector_handle_at(0)?, super::Access::Shared)?;
     let error = shared.writer().expect_err("shared input");
     assert!(error.message.contains("not writable"), "{}", error.message);
     assert!(shared.heap.is_none());

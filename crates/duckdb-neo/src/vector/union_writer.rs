@@ -137,6 +137,7 @@ macro_rules! union_members {
                 Ok(($(unsafe { $name::row_writer(members[$index].cast()) }?,)+))
             }
 
+            #[inline]
             fn set_null(writers: &mut Self::Writers<'_>, member: usize, row: usize) -> Result<()> {
                 match member {
                     $($index => writers.$index.set_null(row),)+
@@ -389,6 +390,7 @@ impl<'w, M: UnionWriters + 'w> UnionWriter<'w, M> {
     }
 
     /// Make a row SQL NULL, along with its tag and every member.
+    #[inline]
     pub fn set_null(&mut self, row: usize) -> Result<()> {
         if row >= self.len() {
             return Err(out_of_bounds(row, self.len()));
