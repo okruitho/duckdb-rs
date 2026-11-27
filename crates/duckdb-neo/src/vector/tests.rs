@@ -32,16 +32,16 @@ fn vector_from_handle_rejects_type_mismatches() -> crate::Result<()> {
     )?;
     let chunk = result.next_chunk()?.expect("one result chunk");
 
-    let err = super::Vector::<i64>::from_handle(&chunk.get_vector_handle_at(0), super::Access::Shared)
+    let err = super::Vector::<i64>::from_handle(&chunk.get_vector_handle_at(0)?, super::Access::Shared)
         .expect_err("scalar type mismatch");
     assert!(err.message.contains("INTEGER"), "{}", err.message);
 
-    let err = super::Vector::<List<i64>>::from_handle(&chunk.get_vector_handle_at(1), super::Access::Shared)
+    let err = super::Vector::<List<i64>>::from_handle(&chunk.get_vector_handle_at(1)?, super::Access::Shared)
         .expect_err("nested child type mismatch");
     assert!(err.message.contains("INTEGER[]"), "{}", err.message);
 
     let err = super::Vector::<crate::types::Decimal<18, 2>>::from_handle(
-        &chunk.get_vector_handle_at(2),
+        &chunk.get_vector_handle_at(2)?,
         super::Access::Shared,
     )
     .expect_err("decimal scale mismatch");
@@ -61,7 +61,7 @@ fn vector_from_handle_fetches_children_only_for_nested_types() -> crate::Result<
     let child_counts = (0..chunk.col_count())
         .map(|index| {
             let vector = Vector::<crate::vector::Unknown>::from_handle(
-                &chunk.get_vector_handle_at(index),
+                &chunk.get_vector_handle_at(index)?,
                 super::Access::Shared,
             )?;
             Ok(vector.children().map(|children| children.col_count()))
@@ -269,7 +269,7 @@ fn vector_fill_validity_rejects_read_only_and_constant_storage() -> crate::Resul
     vector.set_size(1)?;
     vector.row_writer()?.set(0, &42)?;
     drop(vector);
-    let mut shared = super::Vector::<i32>::from_handle(&chunk.get_vector_handle_at(0), super::Access::Shared)?;
+    let mut shared = super::Vector::<i32>::from_handle(&chunk.get_vector_handle_at(0)?, super::Access::Shared)?;
     assert!(shared.writer().is_err());
     assert_eq!(shared.row_reader()?.get(0)?, Some(&42));
     drop(shared);
@@ -496,7 +496,7 @@ fn vector_writer_arena_rejects_read_only_vectors() -> crate::Result<()> {
     let env = Environment::new()?;
     let conn = env.open(StorageLocation::InMemory)?.connect()?;
     let chunk = DataChunk::create(&conn, &[String::logical_type(&conn)?], true)?;
-    let mut shared = super::Vector::<String>::from_handle(&chunk.get_vector_handle_at(0), super::Access::Shared)?;
+    let mut shared = super::Vector::<String>::from_handle(&chunk.get_vector_handle_at(0)?, super::Access::Shared)?;
     let error = shared.writer().expect_err("shared input");
     assert!(error.message.contains("not writable"), "{}", error.message);
     assert!(shared.heap.is_none());

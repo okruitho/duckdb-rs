@@ -70,13 +70,18 @@ enum Handles {
         count: usize,
         get: GetArgument,
     },
+    /// A data chunk's vectors, fetched from DuckDB on access.
+    Chunk {
+        chunk: ffi::duckdb_v2_data_chunk_handle,
+        count: usize,
+    },
 }
 
 impl Handles {
     fn len(&self) -> usize {
         match self {
             Self::Fetched(handles) => handles.len(),
-            Self::Arguments { count, .. } => *count,
+            Self::Arguments { count, .. } | Self::Chunk { count, .. } => *count,
         }
     }
 
@@ -84,6 +89,9 @@ impl Handles {
         match self {
             Self::Fetched(handles) => Ok(handles[index]),
             Self::Arguments { info, get, .. } => get(*info, index),
+            Self::Chunk { chunk, .. } => {
+                check_api_call!(ffi::duckdb_v2_data_chunk_get_vector, *chunk, index as u64, RET)
+            }
         }
     }
 }
@@ -306,7 +314,7 @@ impl VectorCollection {
         let chunk = DataChunk::allocate(link.factory()?, &logical_types, false)?;
 
         for i in 0..self.col_count() {
-            let chunk_handle = chunk.get_vector_handle_at(i);
+            let chunk_handle = chunk.get_vector_handle_at(i)?;
 
             check_api_call!(ffi::duckdb_v2_vector_reference, chunk_handle, self.handles.get(i)?)?;
         }
@@ -467,24 +475,19 @@ impl<'a> DataChunk<'a> {
 
     fn wrap(handle: ffi::duckdb_v2_data_chunk_handle, is_writable: bool, owner: Option<ChunkOwner>) -> Result<Self> {
         let count: ffi::idx_t = check_api_call!(ffi::duckdb_v2_data_chunk_get_vector_count, handle, RET)?;
-        let mut handles = Vec::with_capacity(count as usize);
-        for index in 0..count {
-            handles.push(check_api_call!(
-                ffi::duckdb_v2_data_chunk_get_vector,
-                handle,
-                index,
-                RET
-            )?);
-        }
         let access = if is_writable {
             Access::Writable
         } else {
             Access::Exclusive
         };
+        let handles = Handles::Chunk {
+            chunk: handle,
+            count: count as usize,
+        };
 
         Ok(Self {
             handle,
-            vectors: VectorCollection::new(handles, access, RowCount::Chunk(handle)),
+            vectors: VectorCollection::with_handles(handles, access, RowCount::Chunk(handle)),
             owner,
             _marker: std::marker::PhantomData,
         })
@@ -576,12 +579,9 @@ impl<'a> DataChunk<'a> {
         self.vectors.get_vector_array_mut(indices)
     }
 
-    pub(crate) fn get_vector_handle_at(&self, index: usize) -> ffi::duckdb_v2_vector_handle {
+    pub(crate) fn get_vector_handle_at(&self, index: usize) -> Result<ffi::duckdb_v2_vector_handle> {
         self.vectors.check_index(index);
-        self.vectors
-            .handles
-            .get(index)
-            .expect("a chunk fetches its handles up front")
+        self.vectors.handles.get(index)
     }
 
     /// Drop cached views after DuckDB changed the chunk's vectors.
@@ -807,7 +807,7 @@ mod tests {
             vector.set_size(1)?;
             vector.writer()?.set(0, &value)?;
         }
-        let mut handles = [chunk.get_vector_handle_at(0), chunk.get_vector_handle_at(1)];
+        let mut handles = [chunk.get_vector_handle_at(0)?, chunk.get_vector_handle_at(1)?];
         let info = (&mut handles as *mut [crate::ffi::duckdb_v2_vector_handle; 2]).cast();
 
         // SAFETY: `handles` and `chunk` outlive the collection.
