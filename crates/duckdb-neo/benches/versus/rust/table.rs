@@ -72,35 +72,40 @@ fn fill_series(output: &mut DataChunk<'_>, rows: usize, first: i64) -> Result<()
     fill_column::<i64>(output, 0, rows, |row| first + row as i64)
 }
 
-fn push_decimal(text: &mut String, value: u64) {
-    let mut digits = [0u8; 20];
-    let mut start = digits.len();
+/// The decimal digits of `value`, right-aligned in `buffer`.
+fn format_decimal(buffer: &mut [u8; 20], value: u64) -> &[u8] {
+    let mut start = buffer.len();
     let mut rest = value;
     loop {
         start -= 1;
-        digits[start] = b'0' + (rest % 10) as u8;
+        buffer[start] = b'0' + (rest % 10) as u8;
         rest /= 10;
         if rest == 0 {
             break;
         }
     }
-    text.extend(digits[start..].iter().map(|&digit| char::from(digit)));
+    &buffer[start..]
+}
+
+fn push_ascii(text: &mut String, bytes: &[u8]) {
+    text.extend(bytes.iter().map(|&byte| char::from(byte)));
 }
 
 fn write_tag(text: &mut String, i: i64) {
+    let mut digits = [0u8; 20];
     text.clear();
     text.push_str("row-");
-    push_decimal(text, i as u64);
+    push_ascii(text, format_decimal(&mut digits, i as u64));
 }
 
 // Like `lpad(i::VARCHAR, len, '.')`, which keeps the leading `len` digits of a longer number.
-fn write_word(word: &mut String, digits: &mut String, i: i64, len: usize) {
-    digits.clear();
-    push_decimal(digits, i as u64);
-    let shown = digits.len().min(len);
+fn write_word(word: &mut String, i: i64, padding: &str) {
+    let mut digits = [0u8; 20];
+    let digits = format_decimal(&mut digits, i as u64);
+    let shown = digits.len().min(padding.len());
     word.clear();
-    word.extend(std::iter::repeat_n('.', len - shown));
-    word.push_str(&digits[..shown]);
+    word.push_str(&padding[..padding.len() - shown]);
+    push_ascii(word, &digits[..shown]);
 }
 
 /// Where a single-threaded scan continues.
@@ -254,16 +259,16 @@ impl TableFunctionCallbacks for Grid {
     }
 }
 
+/// `padding` is `len` dots, the longest prefix a word needs.
 pub struct WordsBind {
     count: i64,
-    len: usize,
+    padding: String,
 }
 
-/// Reused buffers of one scan.
+/// The reused buffer of one scan.
 pub struct WordsScan {
     position: i64,
     word: String,
-    digits: String,
 }
 
 pub struct Words;
@@ -289,7 +294,10 @@ impl TableFunctionCallbacks for Words {
         };
         bind_handle.add_result_column("word", &String::logical_type(context)?)?;
         bind_handle.set_cardinality(count as usize, true)?;
-        Ok(WordsBind { count, len })
+        Ok(WordsBind {
+            count,
+            padding: ".".repeat(len),
+        })
     }
 
     fn init_local_state(
@@ -302,7 +310,6 @@ impl TableFunctionCallbacks for Words {
         Ok(Some(WordsScan {
             position: 0,
             word: String::new(),
-            digits: String::new(),
         }))
     }
 
@@ -321,12 +328,7 @@ impl TableFunctionCallbacks for Words {
         vector.set_size(rows)?;
         let mut writer = vector.writer()?;
         for row in 0..rows {
-            write_word(
-                &mut scan.word,
-                &mut scan.digits,
-                scan.position + row as i64,
-                bind_data.len,
-            );
+            write_word(&mut scan.word, scan.position + row as i64, &bind_data.padding);
             writer.set(row, &scan.word)?;
         }
         scan.position += rows as i64;
