@@ -349,19 +349,15 @@ impl LinesReadState {
 fn split_line(data: &[u8], line: Range<usize>, sep: u8, columns: usize, fields: &mut Vec<Range<usize>>) -> Result<()> {
     let mut field_start = line.start;
     let mut count = 1;
-    let mut pos = line.start;
-    while pos < line.end {
-        let byte = data[pos];
+    let mut bytes = data[line.clone()].iter().zip(line.clone());
+    while let Some((&byte, pos)) = bytes.next() {
         if byte == b'\\' {
-            pos += 2;
-            continue;
-        }
-        if byte == sep {
+            bytes.next();
+        } else if byte == sep {
             fields.push(field_start..pos);
             count += 1;
             field_start = pos + 1;
         }
-        pos += 1;
     }
     fields.push(field_start..line.end);
     if count != columns {
@@ -410,7 +406,12 @@ fn parse_bool(field: &[u8]) -> Option<bool> {
     }
 }
 
-fn unescape(field: &[u8], sep: u8, out: &mut Vec<u8>) -> Result<()> {
+/// The field with its escapes resolved; the field itself when it has none, which saves the copy.
+fn unescape<'a>(field: &'a [u8], sep: u8, out: &'a mut Vec<u8>) -> Result<&'a [u8]> {
+    if memchr::memchr(b'\\', field).is_none() {
+        return Ok(field);
+    }
+    out.clear();
     let mut bytes = field.iter();
     while let Some(&byte) = bytes.next() {
         if byte != b'\\' {
@@ -424,7 +425,7 @@ fn unescape(field: &[u8], sep: u8, out: &mut Vec<u8>) -> Result<()> {
             _ => return Err(invalid_field("vs_lines", "VARCHAR", field)),
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 fn decode_lines_column<'f, T>(
@@ -468,9 +469,8 @@ fn decode_lines_varchar<'f>(
             writer.set_null(row)?;
             continue;
         }
-        unescaped.clear();
-        unescape(field, sep, unescaped)?;
-        let text = std::str::from_utf8(unescaped).map_err(|_| invalid_field("vs_lines", "VARCHAR", field))?;
+        let text = std::str::from_utf8(unescape(field, sep, unescaped)?)
+            .map_err(|_| invalid_field("vs_lines", "VARCHAR", field))?;
         writer.set(row, text)?;
     }
     Ok(())
@@ -586,40 +586,40 @@ fn fixed_header(columns: &[FixedColumn]) -> Vec<u8> {
     header
 }
 
-fn push_fixed(value: Option<[u8; 8]>, out: &mut Vec<u8>) {
-    match value {
-        Some(bytes) => {
-            out.push(1);
-            out.extend_from_slice(&bytes);
+/// Fill one column of the rows in `out`, whose NULL values are already zero.
+fn encode_fixed_column<'a, T: Copy + 'a>(
+    values: impl Iterator<Item = Option<&'a T>>,
+    to_le_bytes: impl Fn(T) -> [u8; 8],
+    offset: usize,
+    row_width: usize,
+    out: &mut [u8],
+) {
+    for (row, value) in out.chunks_exact_mut(row_width).zip(values) {
+        if let Some(value) = value {
+            let field = &mut row[offset..offset + FIXED_VALUE_WIDTH];
+            field[0] = 1;
+            field[1..].copy_from_slice(&to_le_bytes(*value));
         }
-        None => out.extend_from_slice(&[0; FIXED_VALUE_WIDTH]),
     }
 }
 
-enum FixedReader<'a> {
-    BigInt(VectorReader<'a, i64>),
-    Double(VectorReader<'a, f64>),
-}
-
+// The row width is fixed, so the chunk's rows are sized up front and filled a column at a time.
 fn encode_fixed_chunk(columns: &[FixedColumn], chunk: &DataChunk<'_>, out: &mut Vec<u8>) -> Result<()> {
-    let readers = columns
-        .iter()
-        .enumerate()
-        .map(|(index, column)| {
-            Ok(match column {
-                FixedColumn::BigInt => FixedReader::BigInt(chunk.get_vector_at(index)?.reader()?),
-                FixedColumn::Double => FixedReader::Double(chunk.get_vector_at(index)?.reader()?),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    for row in 0..chunk.row_count()? {
-        for reader in &readers {
-            let value = match reader {
-                FixedReader::BigInt(reader) => reader.get(row)?.map(|value| value.to_le_bytes()),
-                FixedReader::Double(reader) => reader.get(row)?.map(|value| value.to_le_bytes()),
-            };
-            push_fixed(value, out);
+    let row_width = columns.len() * FIXED_VALUE_WIDTH;
+    let start = out.len();
+    out.resize(start + chunk.row_count()? * row_width, 0);
+    let out = &mut out[start..];
+    for (index, column) in columns.iter().enumerate() {
+        let offset = index * FIXED_VALUE_WIDTH;
+        match column {
+            FixedColumn::BigInt => {
+                let reader = chunk.get_vector_at::<i64>(index)?.reader()?;
+                encode_fixed_column(reader.iter(), i64::to_le_bytes, offset, row_width, out);
+            }
+            FixedColumn::Double => {
+                let reader = chunk.get_vector_at::<f64>(index)?.reader()?;
+                encode_fixed_column(reader.iter(), f64::to_le_bytes, offset, row_width, out);
+            }
         }
     }
     Ok(())
@@ -702,12 +702,12 @@ where
     T: NativeElement + WritableNativeElement<Write = T>,
 {
     let row_width = data.len() / rows;
+    let offset = index * FIXED_VALUE_WIDTH;
     let mut vector = output.get_vector_at_mut::<T>(index)?;
     vector.set_size(rows)?;
     let mut writer = vector.writer()?;
-    for row in 0..rows {
-        let start = row * row_width + index * FIXED_VALUE_WIDTH;
-        let field = &data[start..start + FIXED_VALUE_WIDTH];
+    for (row, bytes) in data.chunks_exact(row_width).enumerate() {
+        let field = &bytes[offset..offset + FIXED_VALUE_WIDTH];
         let value: [u8; 8] = field[1..].try_into().expect("a fixed value has 8 value bytes");
         match field[0] {
             0 => writer.set_null(row)?,
