@@ -30,7 +30,14 @@ FileHandle OpenOutput(Context &context, const std::string &file_path) {
 	return context.GetFileSystem().OpenFile(file_path, {FileFlags::WRITE, FileFlags::FILE_CREATE_NEW});
 }
 
-void WriteAll(FileHandle &file, const std::string &bytes) {
+// Encoded bytes, like Rust's Vec<u8>: std::string appends through out-of-line libstdc++ calls.
+using Bytes = std::vector<char>;
+
+void Append(Bytes &out, std::string_view text) {
+	out.insert(out.end(), text.begin(), text.end());
+}
+
+void WriteAll(FileHandle &file, std::string_view bytes) {
 	const char *data = bytes.data();
 	idx_t left = bytes.size();
 	while (left > 0) {
@@ -120,7 +127,7 @@ LinesBind BindLines(INPUT &input) {
 	return bind;
 }
 
-void PushI64(int64_t value, std::string &out) {
+void PushI64(int64_t value, Bytes &out) {
 	char digits[20];
 	idx_t start = sizeof(digits);
 	auto rest = value < 0 ? 0 - static_cast<uint64_t>(value) : static_cast<uint64_t>(value);
@@ -129,54 +136,54 @@ void PushI64(int64_t value, std::string &out) {
 		rest /= 10;
 	} while (rest != 0);
 	if (value < 0) {
-		out += '-';
+		out.push_back('-');
 	}
-	out.append(digits + start, sizeof(digits) - start);
+	out.insert(out.end(), digits + start, digits + sizeof(digits));
 }
 
-void PushF64(double value, std::string &out) {
+void PushF64(double value, Bytes &out) {
 	if (std::isnan(value)) {
-		out += "nan";
+		Append(out, "nan");
 		return;
 	}
 	if (std::isinf(value)) {
-		out += value < 0 ? "-inf" : "inf";
+		Append(out, value < 0 ? "-inf" : "inf");
 		return;
 	}
 	char text[32];
 	const auto end = std::to_chars(text, text + sizeof(text), value, std::chars_format::scientific, 16).ptr;
 	// to_chars spells the exponent e+05 or e-05; the format spells it e5 or e-5.
 	const auto exponent = std::find(text, end, 'e');
-	out.append(text, exponent + 1);
+	out.insert(out.end(), text, exponent + 1);
 	if (exponent[1] == '-') {
-		out += '-';
+		out.push_back('-');
 	}
 	auto digit = exponent + 2;
 	while (digit + 1 < end && *digit == '0') {
 		digit++;
 	}
-	out.append(digit, end);
+	out.insert(out.end(), digit, end);
 }
 
-void PushEscaped(std::string_view text, char sep, std::string &out) {
+void PushEscaped(std::string_view text, char sep, Bytes &out) {
 	for (const char byte : text) {
 		if (byte == '\\') {
-			out += "\\\\";
+			Append(out, "\\\\");
 		} else if (byte == '\n') {
-			out += "\\n";
+			Append(out, "\\n");
 		} else if (byte == sep) {
-			out += '\\';
-			out += sep;
+			out.push_back('\\');
+			out.push_back(sep);
 		} else {
-			out += byte;
+			out.push_back(byte);
 		}
 	}
 }
 
-void EncodeLinesField(LinesColumn column, const VectorView &view, idx_t row, char sep, std::string &out) {
+void EncodeLinesField(LinesColumn column, const VectorView &view, idx_t row, char sep, Bytes &out) {
 	const auto element = view.SelAt(row);
 	if (!view.RowIsValid(element)) {
-		out += NULL_FIELD;
+		Append(out, NULL_FIELD);
 		return;
 	}
 	switch (column) {
@@ -187,7 +194,7 @@ void EncodeLinesField(LinesColumn column, const VectorView &view, idx_t row, cha
 		PushF64(view.Data<double>()[element], out);
 		break;
 	case LinesColumn::BOOLEAN:
-		out += view.Data<bool>()[element] ? "true" : "false";
+		Append(out, view.Data<bool>()[element] ? "true" : "false");
 		break;
 	case LinesColumn::VARCHAR:
 		PushEscaped(view.Data<varchar_t>()[element].view(), sep, out);
@@ -195,7 +202,7 @@ void EncodeLinesField(LinesColumn column, const VectorView &view, idx_t row, cha
 	}
 }
 
-void EncodeLinesChunk(const LinesBind &bind, const DataChunk &chunk, std::string &out) {
+void EncodeLinesChunk(const LinesBind &bind, const DataChunk &chunk, Bytes &out) {
 	std::vector<VectorView> views;
 	for (idx_t index = 0; index < bind.columns.size(); index++) {
 		views.push_back(chunk.GetVector(index).GetView());
@@ -205,11 +212,11 @@ void EncodeLinesChunk(const LinesBind &bind, const DataChunk &chunk, std::string
 	for (idx_t row = 0; row < rows; row++) {
 		for (idx_t index = 0; index < views.size(); index++) {
 			if (index > 0) {
-				out += bind.sep;
+				out.push_back(bind.sep);
 			}
 			EncodeLinesField(bind.columns[index], views[index], row, bind.sep, out);
 		}
-		out += '\n';
+		out.push_back('\n');
 	}
 }
 
@@ -227,15 +234,16 @@ void LinesToBatch(CopyFunction::CopyToBatchInput &input) {
 	auto shared = batch.CreateSharedScanState();
 	auto worker = batch.CreateWorkerScanState();
 	DataChunk chunk(input.GetContext().GetFactory(), bind.types);
-	std::string encoded;
+	Bytes encoded;
 	while (batch.Scan(shared, worker, chunk)) {
 		EncodeLinesChunk(bind, chunk, encoded);
 	}
-	input.SetBatchData<std::string>(std::move(encoded));
+	input.SetBatchData<Bytes>(std::move(encoded));
 }
 
 void LinesToFlush(CopyFunction::CopyToFlushInput &input) {
-	WriteAll(input.GetInitData<FileHandle>(), input.GetBatchData<std::string>());
+	const auto &encoded = input.GetBatchData<Bytes>();
+	WriteAll(input.GetInitData<FileHandle>(), std::string_view(encoded.data(), encoded.size()));
 }
 
 void LinesToFinalize(CopyFunction::CopyToFinalizeInput &input) {
@@ -285,7 +293,7 @@ struct LinesReadState {
 	idx_t end = 0;
 	bool eof = false;
 	std::vector<FieldRange> fields;
-	std::string unescaped;
+	Bytes unescaped;
 
 	explicit LinesReadState(FileHandle file) : file(std::move(file)), buffer(LINES_BUFFER_SIZE) {
 	}
@@ -376,11 +384,16 @@ bool ParseBool(std::string_view field, bool &out) {
 	return false;
 }
 
-void Unescape(std::string_view field, char sep, std::string &out) {
+// The field with its escapes resolved; the field itself when it has none, which saves the copy.
+std::string_view Unescape(std::string_view field, char sep, Bytes &out) {
+	if (!std::memchr(field.data(), '\\', field.size())) {
+		return field;
+	}
+	out.clear();
 	for (idx_t pos = 0; pos < field.size(); pos++) {
 		const auto byte = field[pos];
 		if (byte != '\\') {
-			out += byte;
+			out.push_back(byte);
 			continue;
 		}
 		if (++pos == field.size()) {
@@ -388,15 +401,16 @@ void Unescape(std::string_view field, char sep, std::string &out) {
 		}
 		const auto escaped = field[pos];
 		if (escaped == '\\') {
-			out += '\\';
+			out.push_back('\\');
 		} else if (escaped == 'n') {
-			out += '\n';
+			out.push_back('\n');
 		} else if (escaped == sep) {
-			out += sep;
+			out.push_back(sep);
 		} else {
 			throw InvalidField("vs_lines", "VARCHAR", field);
 		}
 	}
+	return std::string_view(out.data(), out.size());
 }
 
 // Fetches the validity mask on the first NULL, so output without NULLs allocates none.
@@ -433,9 +447,12 @@ void DecodeLinesColumn(DataChunk &output, idx_t index, idx_t rows, const LinesRe
 	}
 }
 
+// Writes through the vector's heap: `AssignString` looks the heap up again for every row.
 void DecodeLinesVarchar(DataChunk &output, idx_t index, idx_t rows, LinesReadState &state, idx_t columns, char sep) {
 	auto vec = output.GetVector(index);
 	vec.SetSize(rows);
+	auto *data = vec.GetDataMutable<varchar_t>();
+	auto heap = vec.GetHeap();
 	OutputValidity validity {vec};
 	for (idx_t row = 0; row < rows; row++) {
 		const auto field = state.Field(row * columns + index);
@@ -443,9 +460,7 @@ void DecodeLinesVarchar(DataChunk &output, idx_t index, idx_t rows, LinesReadSta
 			validity.SetNull(row);
 			continue;
 		}
-		state.unescaped.clear();
-		Unescape(field, sep, state.unescaped);
-		vec.AssignString(row, state.unescaped);
+		data[row] = heap.AddString(Unescape(field, sep, state.unescaped));
 	}
 }
 
@@ -532,34 +547,37 @@ std::string FixedHeader(const std::vector<FixedColumn> &columns) {
 	return header;
 }
 
+// Fills one column of the rows at `out`, whose NULL values are already zero.
 template <class T>
-void PushFixed(const VectorView &view, idx_t row, std::string &out) {
-	const auto element = view.SelAt(row);
-	if (!view.RowIsValid(element)) {
-		out.append(FIXED_VALUE_WIDTH, '\0');
-		return;
+void EncodeFixedColumn(const VectorView &view, idx_t rows, idx_t offset, idx_t row_width, char *out) {
+	const auto *values = view.Data<T>();
+	for (idx_t row = 0; row < rows; row++) {
+		const auto element = view.SelAt(row);
+		if (!view.RowIsValid(element)) {
+			continue;
+		}
+		auto *field = out + row * row_width + offset;
+		field[0] = 1;
+		std::memcpy(field + 1, &values[element], sizeof(T));
 	}
-	out += '\1';
-	out.append(reinterpret_cast<const char *>(&view.Data<T>()[element]), sizeof(T));
 }
 
-void EncodeFixedChunk(const std::vector<FixedColumn> &columns, const DataChunk &chunk, std::string &out) {
-	std::vector<VectorView> views;
-	for (idx_t index = 0; index < columns.size(); index++) {
-		views.push_back(chunk.GetVector(index).GetView());
-	}
-
+// The row width is fixed, so the chunk's rows are sized up front and filled a column at a time.
+void EncodeFixedChunk(const std::vector<FixedColumn> &columns, const DataChunk &chunk, Bytes &out) {
+	const auto row_width = columns.size() * FIXED_VALUE_WIDTH;
 	const auto rows = chunk.GetRowCount();
-	for (idx_t row = 0; row < rows; row++) {
-		for (idx_t index = 0; index < views.size(); index++) {
-			switch (columns[index]) {
-			case FixedColumn::BIGINT:
-				PushFixed<int64_t>(views[index], row, out);
-				break;
-			case FixedColumn::DOUBLE:
-				PushFixed<double>(views[index], row, out);
-				break;
-			}
+	const auto start = out.size();
+	out.resize(start + rows * row_width);
+	for (idx_t index = 0; index < columns.size(); index++) {
+		const auto view = chunk.GetVector(index).GetView();
+		const auto offset = index * FIXED_VALUE_WIDTH;
+		switch (columns[index]) {
+		case FixedColumn::BIGINT:
+			EncodeFixedColumn<int64_t>(view, rows, offset, row_width, out.data() + start);
+			break;
+		case FixedColumn::DOUBLE:
+			EncodeFixedColumn<double>(view, rows, offset, row_width, out.data() + start);
+			break;
 		}
 	}
 }
@@ -580,15 +598,16 @@ void FixedToBatch(CopyFunction::CopyToBatchInput &input) {
 	auto shared = batch.CreateSharedScanState();
 	auto worker = batch.CreateWorkerScanState();
 	DataChunk chunk(input.GetContext().GetFactory(), bind.types);
-	std::string encoded;
+	Bytes encoded;
 	while (batch.Scan(shared, worker, chunk)) {
 		EncodeFixedChunk(bind.columns, chunk, encoded);
 	}
-	input.SetBatchData<std::string>(std::move(encoded));
+	input.SetBatchData<Bytes>(std::move(encoded));
 }
 
 void FixedToFlush(CopyFunction::CopyToFlushInput &input) {
-	WriteAll(input.GetInitData<FileHandle>(), input.GetBatchData<std::string>());
+	const auto &encoded = input.GetBatchData<Bytes>();
+	WriteAll(input.GetInitData<FileHandle>(), std::string_view(encoded.data(), encoded.size()));
 }
 
 void FixedToFinalize(CopyFunction::CopyToFinalizeInput &input) {

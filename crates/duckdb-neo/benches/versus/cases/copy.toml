@@ -3,7 +3,9 @@
 #   Option sep: the field separator, one ASCII punctuation or whitespace character (default tab).
 # vs_fixed: COPY TO/FROM a binary BIGINT/DOUBLE format: header, then a validity byte and 8 LE bytes per value.
 #
-# COPY TO cases run the timed statement once in setup, so the check sees the file it writes. Where every column
+# COPY TO cases run the timed statement once in setup, writing to {tmp} so the check sees the file. The timed
+# statement writes the same rows to /dev/null: writing back a fresh file of megabytes costs more wall time than
+# encoding it and varies from run to run, which hid the CPU cost of both APIs. The empty cases keep a real file. Where every column
 # is BIGINT, BOOLEAN or VARCHAR the check rebuilds the expected file text in builtin SQL; where DOUBLE or vs_fixed
 # is involved it reads the file back with COPY FROM and, when the round trip holds, returns the file's md5, which
 # also makes the driver require byte-identical files from both languages.
@@ -21,7 +23,7 @@ setup = [
        ELSE i * 7919 - {rows}::BIGINT * 4000 END::BIGINT AS v FROM range({rows}) r(i)''',
     '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)''',
 ]
-query = '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+query = '''COPY src TO '/dev/null' (FORMAT vs_lines)'''
 check = '''
 SELECT ((SELECT content FROM read_text('{tmp}/out.tsv'))
         IS DISTINCT FROM (SELECT coalesce(string_agg(v::VARCHAR || chr(10), '' ORDER BY rowid), '') FROM src))::INT::VARCHAR
@@ -36,7 +38,7 @@ setup = [
        FROM range({rows}) r(i)''',
     '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)''',
 ]
-query = '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+query = '''COPY src TO '/dev/null' (FORMAT vs_lines)'''
 check = '''
 SELECT ((SELECT content FROM read_text('{tmp}/out.tsv'))
         IS DISTINCT FROM (SELECT coalesce(string_agg(coalesce(v::VARCHAR, '\N') || chr(10), '' ORDER BY rowid), '')
@@ -52,7 +54,7 @@ setup = [
        FROM range({rows}) r(i)''',
     '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)''',
 ]
-query = '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+query = '''COPY src TO '/dev/null' (FORMAT vs_lines)'''
 check = '''
 SELECT ((SELECT content FROM read_text('{tmp}/out.tsv'))
         IS DISTINCT FROM (SELECT coalesce(string_agg(coalesce(v::VARCHAR, '\N') || chr(10), '' ORDER BY rowid), '')
@@ -68,7 +70,7 @@ setup = [
        FROM range({rows}) r(i)''',
     '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)''',
 ]
-query = '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+query = '''COPY src TO '/dev/null' (FORMAT vs_lines)'''
 check = '''
 SELECT ((SELECT content FROM read_text('{tmp}/out.tsv'))
         IS DISTINCT FROM (SELECT coalesce(string_agg(coalesce(s, '\N') || chr(10), '' ORDER BY rowid), '')
@@ -83,7 +85,7 @@ setup = [
     '''CREATE TABLE src AS SELECT repeat(chr(97 + (i % 26)::INTEGER), 80 + (i % 40)::INTEGER) || i AS s FROM range({rows}) r(i)''',
     '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)''',
 ]
-query = '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+query = '''COPY src TO '/dev/null' (FORMAT vs_lines)'''
 check = '''
 SELECT ((SELECT content FROM read_text('{tmp}/out.tsv'))
         IS DISTINCT FROM (SELECT coalesce(string_agg(s || chr(10), '' ORDER BY rowid), '') FROM src))::INT::VARCHAR
@@ -105,7 +107,7 @@ setup = [
     "CREATE TABLE dst AS FROM src LIMIT 0",
     '''COPY dst FROM '{tmp}/out.tsv' (FORMAT vs_lines)''',
 ]
-query = '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+query = '''COPY src TO '/dev/null' (FORMAT vs_lines)'''
 check = '''
 SELECT (((SELECT content FROM read_text('{tmp}/out.tsv'))
          IS DISTINCT FROM (SELECT coalesce(string_agg(id::VARCHAR || chr(9) || coalesce(
@@ -124,7 +126,7 @@ setup = [
        FROM range({rows}) r(i)''',
     '''COPY (SELECT f, id, s FROM src WHERE id % 4 <> 1) TO '{tmp}/out.tsv' (FORMAT vs_lines)''',
 ]
-query = '''COPY (SELECT f, id, s FROM src WHERE id % 4 <> 1) TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+query = '''COPY (SELECT f, id, s FROM src WHERE id % 4 <> 1) TO '/dev/null' (FORMAT vs_lines)'''
 check = '''
 SELECT ((SELECT content FROM read_text('{tmp}/out.tsv'))
         IS DISTINCT FROM (SELECT coalesce(string_agg(f::VARCHAR || chr(9) || id || chr(9) || s || chr(10), ''
@@ -140,7 +142,7 @@ setup = [
     '''CREATE TABLE src AS SELECT i::BIGINT AS id, 'name_' || i AS s FROM range({rows}) r(i)''',
     '''COPY (FROM src LIMIT 1000) TO '{tmp}/out.tsv' (FORMAT vs_lines)''',
 ]
-query = '''COPY (FROM src LIMIT 1000) TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+query = '''COPY (FROM src LIMIT 1000) TO '/dev/null' (FORMAT vs_lines)'''
 check = '''
 SELECT ((SELECT content FROM read_text('{tmp}/out.tsv'))
         IS DISTINCT FROM (SELECT coalesce(string_agg(id || chr(9) || s || chr(10), '' ORDER BY rowid), '')
@@ -157,7 +159,7 @@ setup = [
        i % 2 = 0 AS f FROM range({rows}) r(i)''',
     '''COPY src TO '{tmp}/out.csv' (FORMAT vs_lines, SEP ',')''',
 ]
-query = '''COPY src TO '{tmp}/out.csv' (FORMAT vs_lines, SEP ',')'''
+query = '''COPY src TO '/dev/null' (FORMAT vs_lines, SEP ',')'''
 check = '''
 SELECT ((SELECT content FROM read_text('{tmp}/out.csv'))
         IS DISTINCT FROM (SELECT coalesce(string_agg(id || ',' || replace(s, ',', '\,') || ',' || f || chr(10), ''
@@ -179,7 +181,7 @@ setup = [
     "CREATE TABLE dst AS FROM src LIMIT 0",
     '''COPY dst FROM '{tmp}/out.tsv' (FORMAT vs_lines)''',
 ]
-query = '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+query = '''COPY src TO '/dev/null' (FORMAT vs_lines)'''
 check = '''
 SELECT CASE WHEN (SELECT count(*) FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src))) = 0
             THEN (SELECT md5(content) FROM read_text('{tmp}/out.tsv')) ELSE 'round trip differs' END
@@ -207,7 +209,7 @@ setup = [
     "CREATE TABLE dst AS FROM src LIMIT 0",
     '''COPY dst FROM '{tmp}/out.tsv' (FORMAT vs_lines)''',
 ]
-query = '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+query = '''COPY src TO '/dev/null' (FORMAT vs_lines)'''
 check = '''
 SELECT CASE WHEN (SELECT count(*) FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src))) = 0
             THEN (SELECT md5(content) FROM read_text('{tmp}/out.tsv')) ELSE 'round trip differs' END
@@ -232,7 +234,7 @@ setup = [
     "CREATE TABLE dst AS FROM src LIMIT 0",
     '''COPY dst FROM '{tmp}/out.tsv' (FORMAT vs_lines)''',
 ]
-query = '''COPY src TO '{tmp}/out.tsv' (FORMAT vs_lines)'''
+query = '''COPY src TO '/dev/null' (FORMAT vs_lines)'''
 check = '''
 SELECT CASE WHEN (SELECT count(*) FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src))) = 0
                  AND (SELECT count(*) FROM dst WHERE v = 0 AND signbit(v)) = (SELECT count(*) FROM src WHERE v = 0 AND signbit(v))
@@ -413,7 +415,7 @@ setup = [
     "CREATE TABLE dst AS FROM src LIMIT 0",
     '''COPY dst FROM '{tmp}/out.bin' (FORMAT vs_fixed)''',
 ]
-query = '''COPY src TO '{tmp}/out.bin' (FORMAT vs_fixed)'''
+query = '''COPY src TO '/dev/null' (FORMAT vs_fixed)'''
 check = '''
 SELECT CASE WHEN (SELECT count(*) FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src))) = 0
             THEN (SELECT md5(content) || ' ' || size FROM read_blob('{tmp}/out.bin')) ELSE 'round trip differs' END
@@ -437,7 +439,7 @@ setup = [
     "CREATE TABLE dst AS FROM src LIMIT 0",
     '''COPY dst FROM '{tmp}/out.bin' (FORMAT vs_fixed)''',
 ]
-query = '''COPY src TO '{tmp}/out.bin' (FORMAT vs_fixed)'''
+query = '''COPY src TO '/dev/null' (FORMAT vs_fixed)'''
 check = '''
 SELECT CASE WHEN (SELECT count(*) FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src))) = 0
             THEN (SELECT md5(content) || ' ' || size FROM read_blob('{tmp}/out.bin')) ELSE 'round trip differs' END
@@ -465,7 +467,7 @@ setup = [
     "CREATE TABLE dst AS FROM src LIMIT 0",
     '''COPY dst FROM '{tmp}/out.bin' (FORMAT vs_fixed)''',
 ]
-query = '''COPY src TO '{tmp}/out.bin' (FORMAT vs_fixed)'''
+query = '''COPY src TO '/dev/null' (FORMAT vs_fixed)'''
 check = '''
 SELECT CASE WHEN (SELECT count(*) FROM ((FROM src EXCEPT ALL FROM dst) UNION ALL (FROM dst EXCEPT ALL FROM src))) = 0
             THEN (SELECT md5(content) || ' ' || size FROM read_blob('{tmp}/out.bin')) ELSE 'round trip differs' END
@@ -490,7 +492,7 @@ setup = [
     "CREATE TABLE dst (y DOUBLE, id BIGINT)",
     '''COPY dst FROM '{tmp}/out.bin' (FORMAT vs_fixed)''',
 ]
-query = '''COPY (SELECT y, id FROM src WHERE a % 4 <> 1) TO '{tmp}/out.bin' (FORMAT vs_fixed)'''
+query = '''COPY (SELECT y, id FROM src WHERE a % 4 <> 1) TO '/dev/null' (FORMAT vs_fixed)'''
 check = '''
 SELECT CASE WHEN (SELECT count(*) FROM (((SELECT y, id FROM src WHERE a % 4 <> 1) EXCEPT ALL FROM dst)
                                         UNION ALL (FROM dst EXCEPT ALL (SELECT y, id FROM src WHERE a % 4 <> 1)))) = 0
