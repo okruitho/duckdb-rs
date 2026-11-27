@@ -209,6 +209,7 @@ impl<'writer, T: NativeElement> VectorWriter<'writer, T> {
     ///
     /// # Safety
     /// A row marked valid must contain an initialized value of the logical type before any read.
+    #[inline]
     pub unsafe fn set_row_validity(&mut self, index: usize, is_valid: bool) -> Result<()> {
         if index >= self.len() {
             return Err(out_of_bounds(index, self.len()));

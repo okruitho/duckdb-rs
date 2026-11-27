@@ -217,18 +217,17 @@ fn from_value(input: &syn::DeriveInput, variants: &UnionVariants<'_>) -> TokenSt
 fn union_native(input: &syn::DeriveInput, variants: &UnionVariants<'_>) -> TokenStream {
     let types = variants.inner_types();
     let names = &variants.names;
-    let count = types.len();
-    let indexes = 0..count;
+    let indexes = 0..types.len();
     native_impls(
         input,
         &types,
         quote!(Union),
         quote! {
-            if !::duckdb_neo::__derive::validate_union_layout(other, children, #count)? {
+            if !::duckdb_neo::__derive::validate_union_layout(other, children, &[#(#names),*])? {
                 return ::core::result::Result::Ok(false);
             }
             #(
-                if !::duckdb_neo::__derive::validate_union_member::<#types>(other, children, #indexes, #names)? {
+                if !::duckdb_neo::__derive::validate_union_member::<#types>(children, #indexes)? {
                     return ::core::result::Result::Ok(false);
                 }
             )*
@@ -392,6 +391,7 @@ fn union_rows(
                 format!("Make `{variant}` a row's active member and borrow its writer, to write the member's row.");
             methods.push(quote! {
                 #[doc = #doc]
+                #[inline]
                 pub fn #method(
                     &mut self,
                     row: ::core::primitive::usize,
@@ -434,6 +434,7 @@ fn union_rows(
             impl #row_impl_generics #row_writer for #writer_ident #writer_generics #row_where_clause {
                 type Value = #ident #type_generics;
 
+                #[inline]
                 fn len(&self) -> ::core::primitive::usize {
                     self.inner.len()
                 }
@@ -445,6 +446,7 @@ fn union_rows(
                     }
                 }
 
+                #[inline]
                 fn set_null(&mut self, row: ::core::primitive::usize) -> ::duckdb_neo::Result<()> {
                     self.inner.set_null(row)
                 }
