@@ -29,7 +29,8 @@ use duckdb_neo::{
         BindFunctionHandle, ExecColumnInfo, InitColumnData, OrderPreservation, PushdownData,
         TableFilterPushdownCallbacks, TableFunctionBuilder, TableFunctionCallbacks,
     },
-    vector::PlainNative,
+    value::Value,
+    vector::{PlainNative, VectorAppender},
 };
 
 /// Rows a parallel scan claims at a time, which also sizes its thread count.
@@ -50,13 +51,15 @@ fn chunk_rows(output: &DataChunk<'_>, remaining: i64) -> Result<usize> {
     Ok(remaining.clamp(0, output.capacity()? as i64) as usize)
 }
 
-fn fill_column<T>(output: &mut DataChunk<'_>, position: usize, rows: usize, value: impl FnMut(usize) -> T) -> Result<()>
-where
-    T: PlainNative,
-{
+fn fill_column<T: PlainNative>(
+    output: &mut DataChunk<'_>,
+    position: usize,
+    rows: usize,
+    value: impl FnMut(usize) -> T,
+) -> Result<()> {
     output
         .get_vector_at_mut::<T>(position)?
-        .append(rows, |column| column.push_with(rows, value))
+        .append(rows, |column| column.extend_with(rows, value))
 }
 
 fn fill_series(output: &mut DataChunk<'_>, rows: usize, first: i64) -> Result<()> {
@@ -78,25 +81,24 @@ fn format_decimal(buffer: &mut [u8; 20], value: u64) -> &[u8] {
     &buffer[start..]
 }
 
-fn push_ascii(text: &mut String, bytes: &[u8]) {
-    text.extend(bytes.iter().map(|&byte| char::from(byte)));
-}
-
-fn write_tag(text: &mut String, i: i64) {
+fn write_tag(tags: &mut VectorAppender<'_, String>, i: i64) -> Result<()> {
     let mut digits = [0u8; 20];
-    text.clear();
-    text.push_str("row-");
-    push_ascii(text, format_decimal(&mut digits, i as u64));
+    let digits = std::str::from_utf8(format_decimal(&mut digits, i as u64)).expect("decimal digits are ASCII");
+    tags.push_with(4 + digits.len(), |tag| {
+        tag.push_str("row-")?;
+        tag.push_str(digits)
+    })
 }
 
 // Like `lpad(i::VARCHAR, len, '.')`, which keeps the leading `len` digits of a longer number.
-fn write_word(word: &mut String, i: i64, padding: &str) {
+fn write_word(words: &mut VectorAppender<'_, String>, i: i64, padding: &str) -> Result<()> {
     let mut digits = [0u8; 20];
     let digits = format_decimal(&mut digits, i as u64);
     let shown = digits.len().min(padding.len());
-    word.clear();
-    word.push_str(&padding[..padding.len() - shown]);
-    push_ascii(word, &digits[..shown]);
+    words.push_with(padding.len(), |word| {
+        word.push_str(&padding[..padding.len() - shown])?;
+        word.push_str(std::str::from_utf8(&digits[..shown]).expect("decimal digits are ASCII"))
+    })
 }
 
 /// Where a single-threaded scan continues.
@@ -219,11 +221,9 @@ impl TableFunctionCallbacks for Grid {
                 1 => fill_column::<i64>(output, position, rows, |row| at(row).wrapping_mul(at(row)))?,
                 2 => fill_column::<f64>(output, position, rows, |row| at(row) as f64 / 2.0)?,
                 3 => {
-                    let mut tag = String::new();
                     output.get_vector_at_mut::<String>(position)?.append(rows, |tags| {
                         for row in 0..rows {
-                            write_tag(&mut tag, at(row));
-                            tags.push(&tag)?;
+                            write_tag(tags, at(row))?;
                         }
                         Ok(())
                     })?;
@@ -256,10 +256,9 @@ pub struct WordsBind {
     padding: String,
 }
 
-/// The reused buffer of one scan.
+/// Where a scan continues.
 pub struct WordsScan {
     position: i64,
-    word: String,
 }
 
 pub struct Words;
@@ -298,10 +297,7 @@ impl TableFunctionCallbacks for Words {
         _global_state: Option<&Self::GlobalState>,
         _column_data: InitColumnData<'_>,
     ) -> Result<Option<Self::LocalState>> {
-        Ok(Some(WordsScan {
-            position: 0,
-            word: String::new(),
-        }))
+        Ok(Some(WordsScan { position: 0 }))
     }
 
     fn exec(
@@ -317,8 +313,7 @@ impl TableFunctionCallbacks for Words {
         let rows = chunk_rows(output, bind_data.count - scan.position)?;
         output.get_vector_at_mut::<String>(0)?.append(rows, |words| {
             for row in 0..rows {
-                write_word(&mut scan.word, scan.position + row as i64, &bind_data.padding);
-                words.push(&scan.word)?;
+                write_word(words, scan.position + row as i64, &bind_data.padding)?;
             }
             Ok(())
         })?;
@@ -328,8 +323,8 @@ impl TableFunctionCallbacks for Words {
 }
 
 pub struct RepeatBind {
-    s: Option<String>,
-    k: Option<i64>,
+    s: Value,
+    k: Value,
     count: i64,
 }
 
@@ -352,7 +347,11 @@ impl TableFunctionCallbacks for RepeatRow {
         bind_handle.add_result_column("s", &String::logical_type(context)?)?;
         bind_handle.add_result_column("k", &i64::logical_type(context)?)?;
         bind_handle.set_cardinality(count as usize, true)?;
-        Ok(RepeatBind { s, k, count })
+        Ok(RepeatBind {
+            s: s.value(context)?,
+            k: k.value(context)?,
+            count,
+        })
     }
 
     fn init_local_state(
@@ -367,7 +366,7 @@ impl TableFunctionCallbacks for RepeatRow {
 
     fn exec(
         &self,
-        context: &Context,
+        _context: &Context,
         bind_data: &Self::BindData,
         local_state: Option<&mut Self::LocalState>,
         _global_state: Option<&Self::GlobalState>,
@@ -379,18 +378,17 @@ impl TableFunctionCallbacks for RepeatRow {
         if rows == 0 {
             return Ok(());
         }
-        // `make_constant` consumes its value, so every chunk builds its own.
         for position in 0..column_info.count()? {
             match column_info.get_column_index(position)? {
                 0 => {
-                    let value = bind_data.s.value(context)?;
                     output
                         .get_vector_at_mut::<String>(position)?
-                        .make_constant(value, rows)?;
+                        .make_constant(&bind_data.s, rows)?;
                 }
                 1 => {
-                    let value = bind_data.k.value(context)?;
-                    output.get_vector_at_mut::<i64>(position)?.make_constant(value, rows)?;
+                    output
+                        .get_vector_at_mut::<i64>(position)?
+                        .make_constant(&bind_data.k, rows)?;
                 }
                 column => return Err(Error::invalid_input(format!("vs_repeat_row has no column {column}"))),
             }

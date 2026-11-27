@@ -10,7 +10,8 @@
 //!   `prefixes`, which is split once at bind time.
 //! - `vs_null_if_empty(s)`: NULL for '' and NULL, otherwise `s`.
 //!
-//! Inputs are read as `UncheckedString`: DuckDB guarantees valid UTF-8 in VARCHAR, so reads skip validation.
+//! Inputs are read without validating UTF-8: as `VarcharBytes` where the bytes suffice, else as `UncheckedString`,
+//! relying on DuckDB's guarantee of valid UTF-8 in VARCHAR.
 
 use duckdb_neo::{
     DuckDBType, Error, Result,
@@ -20,19 +21,15 @@ use duckdb_neo::{
     enums::FunctionProperty,
     scalar::{MicroScalar, ScalarBindCallbacks, ScalarCallbacks, ScalarFunctionBuilder},
     signature::{FunctionParameter, SignatureBuilder},
-    types::UncheckedString,
+    types::{UncheckedString, VarcharBytes},
     vector::{CombinedVectorIterator, Unknown, Vector},
 };
 
 fn register_len(conn: &Connection) -> Result<()> {
     MicroScalar::create(
         "vs_len",
-        |_context, input: Vector<'_, UncheckedString>, mut output: Vector<'_, i64>| {
-            let mut writer = output.writer()?;
-            for (row, value) in input.reader()?.iter().enumerate() {
-                writer.set_option(row, value.map(|value| value.len() as i64).as_ref())?;
-            }
-            Ok(())
+        |_context, input: Vector<'_, VarcharBytes>, mut output: Vector<'_, i64>| {
+            output.writer()?.map_from(&input.reader()?, |value| value.len() as i64)
         },
     )
     .register(conn)
@@ -43,15 +40,13 @@ fn register_upper_ascii(conn: &Connection) -> Result<()> {
         "vs_upper_ascii",
         |_context, input: Vector<'_, UncheckedString>, mut output: Vector<'_, String>| {
             let mut writer = output.writer()?;
-            let mut buffer = String::new();
             for (row, value) in input.reader()?.iter().enumerate() {
                 match value {
-                    Some(value) => {
-                        buffer.clear();
-                        buffer.push_str(value);
-                        buffer.make_ascii_uppercase();
-                        writer.set(row, &buffer)?;
-                    }
+                    Some(value) => writer.set_with(row, value.len(), |buffer| {
+                        buffer.push_str(value)?;
+                        buffer.as_mut_str().make_ascii_uppercase();
+                        Ok(())
+                    })?,
                     None => writer.set_null(row)?,
                 }
             }
@@ -103,18 +98,19 @@ fn register_repeat(conn: &Connection) -> Result<()> {
             let counts = input.get_vector_at::<i32>(1)?;
             let rows = CombinedVectorIterator::new((strings.reader()?, counts.reader()?))?;
             let mut writer = output.writer()?;
-            let mut buffer = String::new();
             for (row, values) in rows.enumerate() {
                 match values {
                     (Some(value), Some(&count)) if count >= 0 => {
-                        if value.len() * count as usize > u32::MAX as usize {
+                        let len = value.len() * count as usize;
+                        if len > u32::MAX as usize {
                             return Err(Error::invalid_input("vs_repeat: the result exceeds 4 GiB"));
                         }
-                        buffer.clear();
-                        for _ in 0..count {
-                            buffer.push_str(value);
-                        }
-                        writer.set(row, &buffer)?;
+                        writer.set_with(row, len, |buffer| {
+                            for _ in 0..count {
+                                buffer.push_str(value)?;
+                            }
+                            Ok(())
+                        })?;
                     }
                     _ => writer.set_null(row)?,
                 }
@@ -151,17 +147,17 @@ fn register_count_char(conn: &Connection) -> Result<()> {
         "vs_count_char",
         signature,
         |_context, input: &mut VectorCollection, mut output: Vector<'_, i64>| {
-            let strings = input.get_vector_at::<UncheckedString>(0)?;
-            let needles = input.get_vector_at::<UncheckedString>(1)?;
+            let strings = input.get_vector_at::<VarcharBytes>(0)?;
+            let needles = input.get_vector_at::<VarcharBytes>(1)?;
             let rows = CombinedVectorIterator::new((strings.reader()?, needles.reader()?))?;
             let mut writer = output.writer()?;
             for (row, values) in rows.enumerate() {
                 match values {
                     (Some(value), Some(needle)) => {
-                        let &[needle] = needle.as_bytes() else {
+                        let &[needle] = needle else {
                             return Err(Error::invalid_input("vs_count_char: c must be exactly one byte"));
                         };
-                        let count = value.bytes().filter(|&byte| byte == needle).count();
+                        let count = value.iter().filter(|&&byte| byte == needle).count();
                         writer.set(row, &(count as i64))?;
                     }
                     _ => writer.set_null(row)?,
@@ -191,13 +187,10 @@ impl ScalarCallbacks for HasPrefixAny {
         let prefixes = bind_data.expect("with_bind sets the prefixes");
         let mut output = output.cast::<bool>()?;
         output.set_size(input.row_count()?)?;
-        let strings = input.get_vector_at::<UncheckedString>(0)?;
-        let mut writer = output.writer()?;
-        for (row, value) in strings.reader()?.iter().enumerate() {
-            let matched = value.map(|value| prefixes.iter().any(|prefix| value.starts_with(prefix.as_str())));
-            writer.set_option(row, matched.as_ref())?;
-        }
-        Ok(())
+        let strings = input.get_vector_at::<VarcharBytes>(0)?;
+        output.writer()?.map_from(&strings.reader()?, |value| {
+            prefixes.iter().any(|prefix| value.starts_with(prefix.as_bytes()))
+        })
     }
 }
 

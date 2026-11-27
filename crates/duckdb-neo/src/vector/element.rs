@@ -71,7 +71,8 @@ use crate::{
 ///
 /// Vector accessors trust the implementation: `Native<'a>` must match DuckDB's physical layout for
 /// every lifetime and logical type `validate` accepts, and `validate` must establish the layout every
-/// reader and writer of the type relies on, including child types and field order.
+/// reader and writer of the type relies on, including child types and field order. `VALIDATES_BY_ID`
+/// may only be `true` when that layout follows from the type id alone.
 ///
 /// A safe implementation is rejected:
 ///
@@ -92,6 +93,10 @@ pub unsafe trait NativeElement: Sized {
     /// Use `()` when the element does not expose a physical representation.
     /// The lifetime bounds any storage referenced by an entry.
     type Native<'a>;
+
+    /// Whether [`Self::validate`] accepts exactly the logical types whose id is [`Self::TYPE_ID`],
+    /// so a vector validates by its type id alone.
+    const VALIDATES_BY_ID: bool = false;
 
     /// Check the logical type and nested children when attaching this element type to a vector.
     /// A successful check must establish the layout for both reading and writing.
@@ -138,7 +143,7 @@ pub unsafe trait ReadableNativeElement: NativeElement {
 /// Marks vector elements backed by DuckDB's byte storage and arena.
 ///
 /// Implemented for [`String`], [`UncheckedString`](crate::types::UncheckedString),
-/// [`BlobValue`](crate::types::BlobValue), [`BitValue`](crate::types::BitValue),
+/// [`VarcharBytes`](crate::types::VarcharBytes), [`BlobValue`](crate::types::BlobValue), [`BitValue`](crate::types::BitValue),
 /// [`BigNum`](crate::types::BigNum), and [`BigNumValue`](crate::types::BigNumValue).
 ///
 /// Non-byte vectors do not expose an arena:
@@ -151,7 +156,25 @@ pub unsafe trait ReadableNativeElement: NativeElement {
 ///     Ok(())
 /// }
 /// ```
-pub trait HasDuckDBBytes: NativeElement {}
+///
+/// # Safety
+///
+/// Every vector the type validates for must store its rows as `duckdb_v2_bytes` slots, because
+/// [`VectorWriter::copy_row`](crate::vector::VectorWriter::copy_row) copies them as such. A safe
+/// implementation, e.g. on an element of `INTEGER` vectors, is rejected:
+///
+/// ```compile_fail,E0200
+/// # use duckdb_neo::{logical_type::LogicalTypeID, vector::{HasDuckDBBytes, NativeElement}};
+/// struct Id;
+///
+/// unsafe impl NativeElement for Id {
+///     const TYPE_ID: LogicalTypeID = LogicalTypeID::Integer;
+///     type Native<'a> = i32;
+/// }
+///
+/// impl HasDuckDBBytes for Id {}
+/// ```
+pub unsafe trait HasDuckDBBytes: NativeElement {}
 
 /// Element types whose rows encode into their physical slot.
 ///
@@ -231,8 +254,9 @@ unsafe impl ReadableNativeElement for Unknown {
 /// Element types stored as themselves: a slot holds exactly one `Self`, so slices copy unchanged.
 ///
 /// Enables [`VectorWriter::write_slice`](crate::vector::VectorWriter::write_slice),
-/// [`VectorWriter::write_slice_as`](crate::vector::VectorWriter::write_slice_as) and
-/// [`VectorWriter::copy_from`](crate::vector::VectorWriter::copy_from).
+/// [`VectorWriter::write_slice_as`](crate::vector::VectorWriter::write_slice_as),
+/// [`VectorWriter::copy_from`](crate::vector::VectorWriter::copy_from) and the bulk maps such as
+/// [`VectorWriter::map_from`](crate::vector::VectorWriter::map_from).
 ///
 /// These writes copy values unchecked, so a value can lie outside its logical type's range: a
 /// `DECIMAL` value with more digits than the width, or a `TIME` past midnight. Checking every
@@ -243,6 +267,8 @@ unsafe impl ReadableNativeElement for Unknown {
 ///
 /// `Self` must have the size and alignment of one physical slot, and every value of `Self` must be
 /// a row of every logical type DuckDB stores in the same physical type that is safe to read.
+/// Conversely, every valid slot of those types must be a valid `Self`, and all-zero bytes must be a
+/// valid `Self`, which bulk writes use to initialize rows.
 pub unsafe trait PlainNative:
     slot::PlainSlot + WritableNativeElement<Write = Self> + ReadableNativeElement + Copy
 {
@@ -310,7 +336,8 @@ macro_rules! plain_native {
             const SLOT: slot::Slot = slot::Slot::$slot;
         }
 
-        // SAFETY: the type is its own physical slot, and every value is a valid row.
+        // SAFETY: the type is its own physical slot, every value is a valid row, and every valid slot as well as
+        // all-zero bytes is a valid value.
         unsafe impl PlainNative for $type {}
     )*};
 }

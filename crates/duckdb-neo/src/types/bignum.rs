@@ -72,8 +72,10 @@ impl ToValue for BigNum {
     }
 }
 
-impl HasDuckDBBytes for BigNum {}
-impl HasDuckDBBytes for BigNumValue {}
+// SAFETY: BIGNUM rows are `duckdb_v2_bignum_t`, a `duckdb_v2_bytes` slot.
+unsafe impl HasDuckDBBytes for BigNum {}
+// SAFETY: as above.
+unsafe impl HasDuckDBBytes for BigNumValue {}
 
 // SAFETY: `BigNum` matches DuckDB's string storage for `BIGNUM`.
 unsafe impl NativeElement for BigNum {

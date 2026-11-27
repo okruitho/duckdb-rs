@@ -1,7 +1,8 @@
 //! Appending rows in order, so a vector is sized without initializing rows that are written anyway.
 
 use super::{
-    NativeElement, PlainNative, StorageKind, Vector, VectorWriter, WritableNativeElement, not_flat, not_writable,
+    NativeElement, PlainNative, StorageKind, StrBuffer, Vector, VectorWriter, WritableNativeElement, not_flat,
+    not_writable,
 };
 use crate::{Result, error::Error};
 
@@ -145,13 +146,13 @@ impl<T: PlainNative> VectorAppender<'_, T> {
     /// # let conn = Environment::new()?.open(StorageLocation::InMemory)?.connect()?;
     /// let mut chunk = DataChunk::create(&conn, &[i64::logical_type(&conn)?], true)?;
     /// let mut vector = chunk.get_vector_at_mut::<i64>(0)?;
-    /// vector.append(4, |rows| rows.push_with(4, |i| 10 * i as i64))?;
+    /// vector.append(4, |rows| rows.extend_with(4, |i| 10 * i as i64))?;
     /// assert_eq!(vector.reader()?.iter().collect::<Vec<_>>(), [Some(&0), Some(&10), Some(&20), Some(&30)]);
     /// # Ok(())
     /// # }
     /// ```
     #[inline(always)]
-    pub fn push_with(&mut self, count: usize, mut f: impl FnMut(usize) -> T) -> Result<()> {
+    pub fn extend_with(&mut self, count: usize, mut f: impl FnMut(usize) -> T) -> Result<()> {
         if count > self.remaining() {
             return Err(full(self.end));
         }
@@ -162,6 +163,17 @@ impl<T: PlainNative> VectorAppender<'_, T> {
             unsafe { data.add(start + index).write(f(index)) };
         }
         self.next = start + count;
+        Ok(())
+    }
+}
+
+impl VectorAppender<'_, String> {
+    /// Push a row whose text `fill` builds in place, as with [`VectorWriter::<String>::set_with`].
+    #[inline(always)]
+    pub fn push_with(&mut self, capacity: usize, fill: impl FnOnce(&mut StrBuffer<'_>) -> Result<()>) -> Result<()> {
+        let row = self.claim()?;
+        self.writer.set_with(row, capacity, fill)?;
+        self.next = row + 1;
         Ok(())
     }
 }
@@ -248,12 +260,12 @@ mod tests {
             rows.push_null()?;
             rows.push_option(Some(&8))?;
             rows.push_option(None)?;
-            rows.push_with(2, |index| index as i64 + 100)?;
+            rows.extend_with(2, |index| index as i64 + 100)?;
             assert_eq!(rows.remaining(), 0);
             assert!(rows.push(&9).is_err());
             assert!(rows.push_null().is_err());
-            assert!(rows.push_with(1, |_| 9).is_err());
-            rows.push_with(0, |_| unreachable!())?;
+            assert!(rows.extend_with(1, |_| 9).is_err());
+            rows.extend_with(0, |_| unreachable!())?;
             Ok(6 - rows.remaining())
         })?;
         assert_eq!(pushed, 6);
@@ -276,7 +288,7 @@ mod tests {
         vector.writer()?.set_null(69)?;
         vector.set_size(2)?;
         // The mask exists, and rows 2..70 of it were left NULL or valid by earlier writes.
-        vector.append(100, |rows| rows.push_with(100, |index| index as i32))?;
+        vector.append(100, |rows| rows.extend_with(100, |index| index as i32))?;
         let read = vector.reader()?.iter().map(|value| value.copied()).collect::<Vec<_>>();
         assert_eq!(read.len(), 102);
         assert_eq!(read[..2], [Some(0), None]);
@@ -302,10 +314,14 @@ mod tests {
         assert_eq!(vector.len(), 3);
         vector.append(0, |_| Ok(()))?;
         assert_eq!(vector.len(), 3);
-        vector.append(5, |rows| rows.push(""))?;
+        vector.append(5, |rows| {
+            rows.push("")?;
+            assert!(rows.push_with(4, |text| text.push_str("too long")).is_err());
+            rows.push_with(5, |text| text.push_str("built"))
+        })?;
         assert_eq!(
             vector.reader()?.iter().collect::<Vec<_>>(),
-            [Some("short"), None, Some(LONG), Some("")]
+            [Some("short"), None, Some(LONG), Some(""), Some("built")]
         );
         Ok(())
     }
@@ -346,7 +362,7 @@ mod tests {
         let panicked = catch_unwind(AssertUnwindSafe(|| {
             numbers.append(10, |rows| {
                 rows.push(&1)?;
-                rows.push_with(5, |index| if index == 3 { panic!("in push_with") } else { 2 })
+                rows.extend_with(5, |index| if index == 3 { panic!("in extend_with") } else { 2 })
             })
         }));
         assert!(panicked.is_err());

@@ -466,3 +466,52 @@ fn cached_child_views_follow_parent_writes() -> Result<()> {
     assert_view_is_current(vector.children().unwrap().get_vector_at::<i32>(0)?)?;
     Ok(())
 }
+
+#[test]
+fn valid_values_borrow_only_flat_rows_without_a_mask() -> Result<()> {
+    let env = Environment::new()?;
+    let conn = env.open(StorageLocation::InMemory)?.connect()?;
+    let mut chunk = DataChunk::create(&conn, &[i64::logical_type(&conn)?], true)?;
+    let mut vector = chunk.get_vector_at_mut::<i64>(0)?;
+    vector.set_size(0)?;
+    assert_eq!(vector.reader()?.valid_values(), Some(&[][..]));
+    vector.set_size(130)?;
+    vector.writer()?.write_slice(0, &(0..130).collect::<Vec<_>>())?;
+    let values = vector.reader()?.valid_values().expect("flat rows without a mask");
+    assert_eq!(values, (0..130).collect::<Vec<_>>());
+    vector.writer()?.set_null(129)?;
+    assert_eq!(vector.reader()?.valid_values(), None);
+
+    MicroScalar::create(
+        "valid_values_probe",
+        |_ctx, mut input: Vector<'_, i64>, mut output: Vector<'_, bool>| {
+            if input.storage_kind() == StorageKind::Other {
+                input.flatten()?;
+            }
+            let reader = input.reader()?;
+            let values = reader.valid_values();
+            let expected = input.storage_kind() == StorageKind::Flat && reader.validity().is_none();
+            assert_eq!(values.is_some(), expected);
+            if let Some(values) = values {
+                assert_eq!(values.len(), reader.len());
+                assert!(values.iter().map(Some).eq(reader.iter()));
+            }
+            output.writer()?.map_from(&reader, |_| expected)
+        },
+    )
+    .register(&conn)?;
+    let mut result = conn.query(
+        "SELECT count(*) FILTER (WHERE valid_values_probe(test_vector)) \
+         FROM test_vector_types(NULL::BIGINT, all_flat := false)",
+        Parameters::None,
+    )?;
+    let chunk = result.next_chunk()?.unwrap();
+    assert!(
+        chunk
+            .get_vector_at::<i64>(0)?
+            .reader()?
+            .get(0)?
+            .is_some_and(|count| *count > 0)
+    );
+    Ok(())
+}

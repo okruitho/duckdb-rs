@@ -32,7 +32,7 @@ use crate::{
 };
 
 mod micro;
-pub use micro::MicroScalar;
+pub use micro::{MicroScalar, RowArgument, RowResult};
 
 fn resolve_types_callback<T: ScalarResolveTypesCallbacks>(
     context: &Context,

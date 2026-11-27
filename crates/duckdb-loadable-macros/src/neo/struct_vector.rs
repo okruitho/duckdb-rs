@@ -116,17 +116,16 @@ pub(crate) fn as_native_element(input: &syn::DeriveInput) -> syn::Result<TokenSt
         .collect::<Vec<_>>();
     let names = &fields.names;
     let indexes = 0..types.len();
-    let count = types.len();
     let native = native_impls(
         input,
         &types,
         quote!(Struct),
         quote! {
-            if !::duckdb_neo::__derive::validate_layout(other, children, #count)? {
+            if !::duckdb_neo::__derive::validate_layout(other, children, &[#(#names),*])? {
                 return ::core::result::Result::Ok(false);
             }
             #(
-                if !::duckdb_neo::__derive::validate_field::<#types>(other, children, #indexes, #names)? {
+                if !::duckdb_neo::__derive::validate_field::<#types>(children, #indexes)? {
                     return ::core::result::Result::Ok(false);
                 }
             )*
@@ -298,14 +297,20 @@ fn struct_rows(
         let (element_impl_generics, _, element_where_clause) = element_generics.split_for_impl();
         let writes = fields.fields.iter().map(|field| {
             let name = field.ident.as_ref().unwrap();
-            if option_inner_type(&field.ty).is_some() {
+            let write = if option_inner_type(&field.ty).is_some() {
                 quote!(#row_writer::set_option(
                     &mut self.#name,
                     row,
                     ::core::option::Option::as_ref(&value.#name).map(::core::borrow::Borrow::borrow),
-                )?;)
+                ))
             } else {
-                quote!(#row_writer::set(&mut self.#name, row, ::core::borrow::Borrow::borrow(&value.#name))?;)
+                quote!(#row_writer::set(&mut self.#name, row, ::core::borrow::Borrow::borrow(&value.#name)))
+            };
+            quote! {
+                if let ::core::result::Result::Err(error) = #write {
+                    // Earlier fields were written, so NULL the row to keep its fields consistent.
+                    return ::duckdb_neo::__derive::null_failed_row(self, row, error);
+                }
             }
         });
         output.extend(quote! {
@@ -334,16 +339,19 @@ fn struct_rows(
                 }
 
                 /// Return the number of rows.
+                #[inline]
                 pub fn len(&self) -> ::core::primitive::usize {
                     self.rows.len()
                 }
 
                 /// Return whether there are no rows.
+                #[inline]
                 pub fn is_empty(&self) -> ::core::primitive::bool {
                     self.rows.is_empty()
                 }
 
                 /// Make a row valid after writing its fields through the public field writers.
+                #[inline]
                 pub fn set_valid(&mut self, row: ::core::primitive::usize) -> ::duckdb_neo::Result<()> {
                     // SAFETY: every field is always initialized.
                     unsafe { ::duckdb_neo::__derive::set_row_validity(&mut self.rows, row, true) }
@@ -359,24 +367,18 @@ fn struct_rows(
             impl #row_impl_generics #row_writer for #writer_ident #writer_generics #row_where_clause {
                 type Value = #ident #type_generics;
 
+                #[inline]
                 fn len(&self) -> ::core::primitive::usize {
                     self.rows.len()
                 }
 
-                #[inline]
+                #[inline(always)]
                 fn set(&mut self, row: ::core::primitive::usize, value: &Self::Value) -> ::duckdb_neo::Result<()> {
-                    let written = (|| -> ::duckdb_neo::Result<()> {
-                        #(#writes)*
-                        ::core::result::Result::Ok(())
-                    })();
-                    if let ::core::result::Result::Err(error) = written {
-                        // Earlier fields were written, so NULL the row to keep its fields consistent.
-                        #row_writer::set_null(self, row)?;
-                        return ::core::result::Result::Err(error);
-                    }
+                    #(#writes)*
                     self.set_valid(row)
                 }
 
+                #[inline]
                 fn set_null(&mut self, row: ::core::primitive::usize) -> ::duckdb_neo::Result<()> {
                     #(#row_writer::set_null(&mut self.#field_idents, row)?;)*
                     // SAFETY: a NULL row needs no initialized children.

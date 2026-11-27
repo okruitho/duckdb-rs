@@ -4,8 +4,9 @@ use crate::raw::RawExt;
 use crate::{Error, Result, check_api_call, ffi, logical_type::LogicalTypeID};
 
 use super::{
-    Arena, DuckDBBytes, HasDuckDBBytes, NativeElement, PlainNative, Selection, StorageKind, Vector, VectorReader,
-    WritableNativeElement, not_flat, not_writable, out_of_bounds,
+    Arena, BytesBuffer, DuckDBBytes, HasDuckDBBytes, NativeElement, PlainNative, ReadableNativeElement, Selection,
+    StorageKind, StrBuffer, Vector, VectorReader, WritableNativeElement, not_flat, not_writable, out_of_bounds,
+    reader::RowLayout,
 };
 
 /// Exclusive access to a writable flat vector.
@@ -209,6 +210,7 @@ impl<'writer, T: NativeElement> VectorWriter<'writer, T> {
     ///
     /// # Safety
     /// A row marked valid must contain an initialized value of the logical type before any read.
+    #[inline]
     pub unsafe fn set_row_validity(&mut self, index: usize, is_valid: bool) -> Result<()> {
         if index >= self.len() {
             return Err(out_of_bounds(index, self.len()));
@@ -580,6 +582,268 @@ impl<T: PlainNative> VectorWriter<'_, T> {
         }
         Ok(())
     }
+
+    /// Write `f(value)` for each row of `input` into the first rows, NULL rows staying NULL without a call; fails if
+    /// `input` is longer. Storage is resolved once, so a flat input without NULLs runs a vectorizable loop.
+    ///
+    /// ```
+    /// # use duckdb_neo::{Parameters, Result, environment::{Environment, StorageLocation}, scalar::MicroScalar, vector::Vector};
+    /// # fn main() -> Result<()> {
+    /// # let conn = Environment::new()?.open(StorageLocation::InMemory)?.connect()?;
+    /// MicroScalar::create("plus_one", |_ctx, input: Vector<'_, i64>, mut output: Vector<'_, i64>| {
+    ///     output.writer()?.map_from(&input.reader()?, |value| value.wrapping_add(1))
+    /// })
+    /// .register(&conn)?;
+    /// let chunk = conn.query("SELECT plus_one(v) FROM (VALUES (1), (NULL)) t(v)", Parameters::None)?
+    ///     .next_chunk()?.unwrap();
+    /// let rows = chunk.get_vector_at::<i64>(0)?.reader()?.iter().collect::<Vec<_>>();
+    /// assert_eq!(rows, [Some(&2), None]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn map_from<'v, I: ReadableNativeElement + 'v>(
+        &mut self,
+        input: &VectorReader<'v, I>,
+        mut f: impl FnMut(I::Ref<'v>) -> T,
+    ) -> Result<()> {
+        self.map_reader(input, true, |value| Ok(value.map(&mut f)))
+    }
+
+    /// As [`Self::map_from`], but `f` gets `None` for NULL rows and its `None` makes the row NULL.
+    ///
+    /// ```
+    /// # use duckdb_neo::{Parameters, Result, environment::{Environment, StorageLocation}, scalar::MicroScalar, vector::Vector};
+    /// # fn main() -> Result<()> {
+    /// # let conn = Environment::new()?.open(StorageLocation::InMemory)?.connect()?;
+    /// MicroScalar::create("swap_null", |_ctx, input: Vector<'_, i64>, mut output: Vector<'_, i64>| {
+    ///     output.writer()?.map_option_from(&input.reader()?, |value| match value {
+    ///         Some(0) => None,
+    ///         Some(value) => Some(*value),
+    ///         None => Some(0),
+    ///     })
+    /// })
+    /// .set_property(duckdb_neo::enums::FunctionProperty::HasSpecialNullHandling(true))
+    /// .register(&conn)?;
+    /// let chunk = conn.query("SELECT swap_null(v) FROM (VALUES (0), (NULL), (5)) t(v)", Parameters::None)?
+    ///     .next_chunk()?.unwrap();
+    /// let rows = chunk.get_vector_at::<i64>(0)?.reader()?.iter().collect::<Vec<_>>();
+    /// assert_eq!(rows, [None, Some(&0), Some(&5)]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn map_option_from<'v, I: ReadableNativeElement + 'v>(
+        &mut self,
+        input: &VectorReader<'v, I>,
+        mut f: impl FnMut(Option<I::Ref<'v>>) -> Option<T>,
+    ) -> Result<()> {
+        self.map_reader(input, false, |value| Ok(f(value)))
+    }
+
+    /// As [`Self::map_from`] with a fallible `f`, returning its first error; each row of `input` then holds its old
+    /// or its new value.
+    #[inline]
+    pub fn try_map_from<'v, I: ReadableNativeElement + 'v>(
+        &mut self,
+        input: &VectorReader<'v, I>,
+        mut f: impl FnMut(I::Ref<'v>) -> Result<T>,
+    ) -> Result<()> {
+        self.map_reader(input, true, |value| value.map(&mut f).transpose())
+    }
+
+    #[inline(always)]
+    fn map_reader<'v, I: ReadableNativeElement + 'v>(
+        &mut self,
+        input: &VectorReader<'v, I>,
+        propagate_nulls: bool,
+        f: impl FnMut(Option<I::Ref<'v>>) -> Result<Option<T>>,
+    ) -> Result<()> {
+        let reader = input.clone();
+        let len = reader.len();
+        if len > self.len() {
+            return Err(out_of_bounds(len - 1, self.len()));
+        }
+        // SAFETY: the layout describes the reader's `len` rows, and `I::get` reads the slot of a valid row.
+        unsafe {
+            self.map_layout(
+                len,
+                reader.layout(),
+                propagate_nulls,
+                |physical, row| I::get(&reader, physical, row),
+                f,
+            )
+        }
+    }
+
+    /// Write rows `0..len` with `f` over the rows of `layout`, each read as `read(physical, row)`; with
+    /// `propagate_nulls`, NULL rows become NULL without calling `f`, otherwise `f` gets `None`.
+    ///
+    /// # Safety
+    /// `len` must not exceed [`Self::len`], `layout` must describe at least `len` rows, and `read` must be sound for
+    /// each valid row and its slot.
+    #[inline(always)]
+    pub(crate) unsafe fn map_layout<V>(
+        &mut self,
+        len: usize,
+        layout: RowLayout,
+        propagate_nulls: bool,
+        read: impl Fn(usize, usize) -> V,
+        mut f: impl FnMut(Option<V>) -> Result<Option<T>>,
+    ) -> Result<()> {
+        // SAFETY (every arm): the caller guarantees the layout covers `len` rows and `read` is sound for valid ones;
+        // the validity words only report rows the layout marks valid.
+        unsafe {
+            match layout {
+                RowLayout::Flat { validity } if validity.is_null() => self.write_rows(
+                    len,
+                    propagate_nulls,
+                    |_, _| u64::MAX,
+                    |row, valid| f(valid.then(|| read(row, row))),
+                ),
+                RowLayout::Flat { validity } => self.write_rows(
+                    len,
+                    propagate_nulls,
+                    |start, _| *validity.add(start / 64),
+                    |row, valid| f(valid.then(|| read(row, row))),
+                ),
+                RowLayout::Constant { is_null } => self.write_rows(
+                    len,
+                    propagate_nulls,
+                    |_, _| if is_null { 0 } else { u64::MAX },
+                    |row, valid| f(valid.then(|| read(0, row))),
+                ),
+                RowLayout::Dictionary { selection, .. } => self.write_rows(
+                    len,
+                    propagate_nulls,
+                    |start, end| layout.validity_word(start, end),
+                    |row, valid| f(valid.then(|| read(*selection.add(row) as usize, row))),
+                ),
+            }
+        }
+    }
+
+    /// Write rows `0..len` from `row(index, valid)` 64 at a time, `None` writing NULL; `valid(start, end)` has bit `i`
+    /// set when input row `start + i` is valid, and with `propagate_nulls` other rows become NULL without a call.
+    ///
+    /// # Safety
+    /// `len` must not exceed [`Self::len`], and both closures must be sound for every row below `len`.
+    #[inline(always)]
+    pub(crate) unsafe fn write_rows(
+        &mut self,
+        len: usize,
+        propagate_nulls: bool,
+        valid: impl Fn(usize, usize) -> u64,
+        mut row: impl FnMut(usize, bool) -> Result<Option<T>>,
+    ) -> Result<()> {
+        let data = self.data.cast::<T>();
+        let mut start = 0;
+        while start < len {
+            let end = len.min(start + 64);
+            let rows = u64::MAX >> (64 - (end - start));
+            let input = valid(start, end) & rows;
+            let mut output;
+            if input == rows {
+                output = rows;
+                for index in start..end {
+                    match row(index, true)? {
+                        // SAFETY: the caller guarantees the row is in bounds, and `T` is the slot type.
+                        Some(value) => unsafe { data.add(index).write(value) },
+                        None => output &= !(1 << (index - start)),
+                    }
+                }
+            } else if propagate_nulls {
+                output = input;
+                let mut bits = input;
+                while bits != 0 {
+                    let index = start + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    match row(index, true)? {
+                        // SAFETY: as above.
+                        Some(value) => unsafe { data.add(index).write(value) },
+                        None => output &= !(1 << (index - start)),
+                    }
+                }
+            } else {
+                output = rows;
+                for index in start..end {
+                    match row(index, input >> (index - start) & 1 != 0)? {
+                        // SAFETY: as above.
+                        Some(value) => unsafe { data.add(index).write(value) },
+                        None => output &= !(1 << (index - start)),
+                    }
+                }
+            }
+            // SAFETY: the rows are in bounds, and the valid ones were just written.
+            unsafe { self.store_validity_word(start / 64, output, rows)? };
+            start = end;
+        }
+        Ok(())
+    }
+
+    /// Resize to `len` rows without zeroing them, then run `write`; if it fails or panics, zero every row.
+    ///
+    /// # Safety
+    /// When `write` succeeds, it must have written or marked NULL each of the `len` rows.
+    #[inline(always)]
+    pub(crate) unsafe fn resize_and_write(
+        &mut self,
+        len: usize,
+        write: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
+        let old = self.len();
+        // SAFETY: the new rows are written by `write`, or zeroed, before this returns.
+        let resized = unsafe { self.vector_mut().set_size_uninit(len) };
+        self.len = self.vector().len();
+        if let Err(error) = resized.and_then(|()| self.refresh_buffers()) {
+            let len = self.len;
+            self.vector_mut().init_rows(old, len)?;
+            self.refresh_buffers()?;
+            return Err(error);
+        }
+        let zero = ZeroRowsOnDrop {
+            data: self.data.cast::<T>(),
+            len: self.len,
+        };
+        write(self)?;
+        std::mem::forget(zero);
+        Ok(())
+    }
+}
+
+struct ZeroRowsOnDrop<T: PlainNative> {
+    data: *mut T,
+    len: usize,
+}
+
+impl<T: PlainNative> Drop for ZeroRowsOnDrop<T> {
+    fn drop(&mut self) {
+        if self.len != 0 && !self.data.is_null() {
+            // SAFETY: the slots are the writer's flat rows of `T`, and `PlainNative` guarantees that all-zero bytes are
+            // a valid `T` and row.
+            unsafe { self.data.write_bytes(0, self.len) };
+        }
+    }
+}
+
+impl<T: NativeElement> VectorWriter<'_, T> {
+    /// Set the bits `rows` of validity word `word` to `bits`, allocating the mask only for a NULL row.
+    ///
+    /// # Safety
+    /// The word must be within the mask, and rows marked valid must hold initialized values.
+    #[inline(always)]
+    unsafe fn store_validity_word(&mut self, word: usize, bits: u64, rows: u64) -> Result<()> {
+        if bits == rows && self.validity.is_null() {
+            return Ok(());
+        }
+        let validity = self.allocated_validity()?;
+        // SAFETY: the caller guarantees the word is within the writable mask.
+        unsafe {
+            let slot = validity.add(word);
+            *slot = (*slot & !rows) | bits;
+        }
+        Ok(())
+    }
 }
 
 impl<T: NativeElement> VectorWriter<'_, T> {
@@ -609,7 +873,72 @@ impl VectorWriter<'_, String> {
     }
 }
 
+impl VectorWriter<'_, String> {
+    /// Build a row's text in place, in at most `capacity` bytes, and mark the row valid.
+    ///
+    /// `fill` pushes the text; pushes beyond `capacity` fail. Short results are stored inline, longer
+    /// ones in this vector's arena, where unused capacity stays reserved until the vector is reset.
+    /// If `fill` fails or panics, the row holds an empty string and keeps its validity. A failure
+    /// before `fill` runs (`capacity` above `u32::MAX`, or the arena allocation) leaves the row unchanged.
+    ///
+    /// ```
+    /// # use duckdb_neo::{DuckDBType, Result, data_chunk::DataChunk, environment::{Environment, StorageLocation}};
+    /// # fn main() -> Result<()> {
+    /// # let conn = Environment::new()?.open(StorageLocation::InMemory)?.connect()?;
+    /// let mut chunk = DataChunk::create(&conn, &[String::logical_type(&conn)?], true)?;
+    /// let mut vector = chunk.get_vector_at_mut::<String>(0)?;
+    /// vector.set_size(1)?;
+    /// let mut writer = vector.writer()?;
+    /// let input = "a string longer than twelve bytes";
+    /// writer.set_with(0, input.len(), |buffer| {
+    ///     buffer.push_str(input)?;
+    ///     buffer.as_mut_str().make_ascii_uppercase();
+    ///     Ok(())
+    /// })?;
+    /// # drop(writer);
+    /// assert_eq!(vector.reader()?.get(0)?, Some("A STRING LONGER THAN TWELVE BYTES"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline(always)]
+    pub fn set_with(
+        &mut self,
+        index: usize,
+        capacity: usize,
+        fill: impl FnOnce(&mut StrBuffer<'_>) -> Result<()>,
+    ) -> Result<()> {
+        if index >= self.len() {
+            return Err(out_of_bounds(index, self.len()));
+        }
+        // SAFETY: The row is in bounds; a fresh buffer is empty, and a `StrBuffer` only holds UTF-8.
+        unsafe {
+            self.write_byte_buffer(index, capacity, |bytes| fill(StrBuffer::from_bytes_mut(bytes)))?;
+            self.mark_valid_unchecked(index);
+        }
+        Ok(())
+    }
+}
+
 impl VectorWriter<'_, crate::types::UncheckedString> {
+    /// Build a row's text in place, as with [`VectorWriter::<String>::set_with`].
+    #[inline(always)]
+    pub fn set_with(
+        &mut self,
+        index: usize,
+        capacity: usize,
+        fill: impl FnOnce(&mut StrBuffer<'_>) -> Result<()>,
+    ) -> Result<()> {
+        if index >= self.len() {
+            return Err(out_of_bounds(index, self.len()));
+        }
+        // SAFETY: The row is in bounds; a fresh buffer is empty, and a `StrBuffer` only holds UTF-8.
+        unsafe {
+            self.write_byte_buffer(index, capacity, |bytes| fill(StrBuffer::from_bytes_mut(bytes)))?;
+            self.mark_valid_unchecked(index);
+        }
+        Ok(())
+    }
+
     /// Concatenate UTF-8 fragments, as with [`VectorWriter::<String>::set_parts`].
     #[inline(always)]
     pub fn set_parts(&mut self, index: usize, parts: Option<&[&str]>) -> Result<()> {
@@ -639,6 +968,27 @@ impl VectorWriter<'_, crate::types::BlobValue> {
         }
         // SAFETY: Non-NULL rows are initialized; BLOB has no descendants.
         unsafe { self.set_validity_unchecked(index, parts.is_some()) }
+    }
+}
+
+impl VectorWriter<'_, crate::types::BlobValue> {
+    /// Build a row's bytes in place, as with [`VectorWriter::<String>::set_with`].
+    #[inline(always)]
+    pub fn set_with(
+        &mut self,
+        index: usize,
+        capacity: usize,
+        fill: impl FnOnce(&mut BytesBuffer<'_>) -> Result<()>,
+    ) -> Result<()> {
+        if index >= self.len() {
+            return Err(out_of_bounds(index, self.len()));
+        }
+        // SAFETY: The row is in bounds, and arbitrary bytes are valid BLOB storage.
+        unsafe {
+            self.write_byte_buffer(index, capacity, fill)?;
+            self.mark_valid_unchecked(index);
+        }
+        Ok(())
     }
 }
 
@@ -682,6 +1032,111 @@ impl<T: HasDuckDBBytes> VectorWriter<'_, T> {
             DuckDBBytes::write_parts(slot, parts, || self.arena())
         }
     }
+
+    /// # Safety
+    /// `index` must be in bounds, and every value `fill` can build must be valid for the logical type.
+    #[inline(always)]
+    unsafe fn write_byte_buffer(
+        &mut self,
+        index: usize,
+        capacity: usize,
+        fill: impl FnOnce(&mut BytesBuffer<'_>) -> Result<()>,
+    ) -> Result<()> {
+        // SAFETY: The row is in bounds, and long bytes are built in this vector's arena.
+        unsafe {
+            let slot = self.data.cast::<DuckDBBytes<'_>>().add(index);
+            DuckDBBytes::write_with(slot, capacity, || self.arena(), fill)
+        }
+    }
+}
+
+impl<T: HasDuckDBBytes + WritableNativeElement> VectorWriter<'_, T> {
+    /// Copy row `source_row` of `source`, value or NULL, into row `index` without decoding it.
+    ///
+    /// Inline values are copied as they are, longer ones into this vector's arena. Both element types
+    /// must store the same logical type, e.g. any `VARCHAR` marker into [`String`]. The bytes are
+    /// copied unvalidated, so they are exactly as valid as the source's (see [`VarcharBytes`]).
+    ///
+    /// [`VarcharBytes`]: crate::types::VarcharBytes
+    ///
+    /// A vector cannot be copied into itself:
+    ///
+    /// ```compile_fail,E0502
+    /// use duckdb_neo::{Result, vector::Vector};
+    ///
+    /// fn copy(vector: &mut Vector<'_, String>) -> Result<()> {
+    ///     let reader = vector.reader()?;
+    ///     vector.writer()?.copy_row(0, &reader, 1)
+    /// }
+    /// ```
+    #[inline]
+    pub fn copy_row<S: HasDuckDBBytes>(
+        &mut self,
+        index: usize,
+        source: &VectorReader<'_, S>,
+        source_row: usize,
+    ) -> Result<()> {
+        check_same_bytes_type::<S, T>()?;
+        if index >= self.len() {
+            return Err(out_of_bounds(index, self.len()));
+        }
+        if source_row >= source.len() {
+            return Err(out_of_bounds(source_row, source.len()));
+        }
+        // SAFETY: both rows are in bounds, and the types share their storage.
+        unsafe { self.copy_row_unchecked(index, source, source_row) }
+    }
+
+    /// Copy every row of `source`, values and NULLs, into the first rows of this vector, as with
+    /// [`Self::copy_row`].
+    pub fn copy_bytes_from<S: HasDuckDBBytes>(&mut self, source: &VectorReader<'_, S>) -> Result<()> {
+        check_same_bytes_type::<S, T>()?;
+        let len = source.len();
+        if len > self.len() {
+            return Err(out_of_bounds(len - 1, self.len()));
+        }
+        for row in 0..len {
+            // SAFETY: the row is in bounds of both, and the types share their storage.
+            unsafe { self.copy_row_unchecked(row, source, row)? };
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    /// `index` and `source_row` must be rows of this writer and `source`, whose types share storage.
+    #[inline(always)]
+    unsafe fn copy_row_unchecked<S: HasDuckDBBytes>(
+        &mut self,
+        index: usize,
+        source: &VectorReader<'_, S>,
+        source_row: usize,
+    ) -> Result<()> {
+        // SAFETY: the caller guarantees the rows; a valid physical slot holds a value of the shared
+        // logical type, which is copied as stored, long bytes into this vector's arena.
+        unsafe {
+            match source.physical_index_unchecked(source_row) {
+                Some(physical) => {
+                    let value = &*source.as_ptr().cast::<DuckDBBytes<'_>>().add(physical);
+                    let slot = self.data.cast::<DuckDBBytes<'_>>().add(index);
+                    DuckDBBytes::write_copy(slot, value, || self.arena())?;
+                    self.mark_valid_unchecked(index);
+                    Ok(())
+                }
+                None => self.set_null_unchecked(index),
+            }
+        }
+    }
+}
+
+fn check_same_bytes_type<S: NativeElement, T: NativeElement>() -> Result<()> {
+    if S::TYPE_ID != T::TYPE_ID {
+        return Err(Error::invalid_input(format!(
+            "cannot copy {:?} rows into a {:?} vector",
+            S::TYPE_ID,
+            T::TYPE_ID
+        )));
+    }
+    Ok(())
 }
 
 #[inline]

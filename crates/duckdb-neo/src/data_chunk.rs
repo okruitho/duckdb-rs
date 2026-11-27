@@ -29,12 +29,26 @@ fn check_distinct(indices: &[usize]) -> Result<()> {
     Ok(())
 }
 
-fn collect_array<V, const N: usize>(results: [Result<V>; N]) -> Result<[V; N]> {
-    let vectors = results.into_iter().collect::<Result<Vec<_>>>()?;
-    match vectors.try_into() {
-        Ok(array) => Ok(array),
-        Err(_) => unreachable!("collected exactly N vectors"),
+/// Wrap every index in order, building the array in place.
+#[inline(always)]
+fn collect_array<V, const N: usize>(indices: [usize; N], mut wrap: impl FnMut(usize) -> Result<V>) -> Result<[V; N]> {
+    let mut vectors = [const { std::mem::MaybeUninit::<V>::uninit() }; N];
+    for (written, index) in indices.into_iter().enumerate() {
+        match wrap(index) {
+            Ok(vector) => {
+                vectors[written].write(vector);
+            }
+            Err(error) => {
+                for vector in &mut vectors[..written] {
+                    // SAFETY: the slots before `written` were initialized above, and are dropped once.
+                    unsafe { vector.assume_init_drop() };
+                }
+                return Err(error);
+            }
+        }
     }
+    // SAFETY: every slot was initialized, and `MaybeUninit<V>` has the layout of `V`.
+    Ok(unsafe { std::ptr::read(vectors.as_ptr().cast::<[V; N]>()) })
 }
 
 /// Input vectors and their row count for scalar and aggregate callbacks, and
@@ -60,7 +74,7 @@ pub(crate) type GetArgument = fn(*mut c_void, usize) -> Result<ffi::duckdb_v2_ve
 /// Where a [`VectorCollection`] finds the handles of its vectors.
 #[derive(Debug)]
 enum Handles {
-    /// Fetched up front, such as a chunk's vectors or a nested vector's children.
+    /// Fetched up front, such as a nested vector's children.
     Fetched(Vec<ffi::duckdb_v2_vector_handle>),
     /// A callback's arguments, fetched from DuckDB on access instead of copied into an array.
     Arguments {
@@ -68,13 +82,18 @@ enum Handles {
         count: usize,
         get: GetArgument,
     },
+    /// A data chunk's vectors, fetched from DuckDB on access.
+    Chunk {
+        chunk: ffi::duckdb_v2_data_chunk_handle,
+        count: usize,
+    },
 }
 
 impl Handles {
     fn len(&self) -> usize {
         match self {
             Self::Fetched(handles) => handles.len(),
-            Self::Arguments { count, .. } => *count,
+            Self::Arguments { count, .. } | Self::Chunk { count, .. } => *count,
         }
     }
 
@@ -82,6 +101,9 @@ impl Handles {
         match self {
             Self::Fetched(handles) => Ok(handles[index]),
             Self::Arguments { info, get, .. } => get(*info, index),
+            Self::Chunk { chunk, .. } => {
+                check_api_call!(ffi::duckdb_v2_data_chunk_get_vector, *chunk, index as u64, RET)
+            }
         }
     }
 }
@@ -265,7 +287,7 @@ impl VectorCollection {
         for index in indices {
             self.evict(index);
         }
-        collect_array(indices.map(|index| self.wrap(index, self.access)))
+        collect_array(indices, |index| self.wrap(index, self.access))
     }
 
     /// Return the number of vectors, which is the column count.
@@ -304,7 +326,7 @@ impl VectorCollection {
         let chunk = DataChunk::allocate(link.factory()?, &logical_types, false)?;
 
         for i in 0..self.col_count() {
-            let chunk_handle = chunk.get_vector_handle_at(i);
+            let chunk_handle = chunk.get_vector_handle_at(i)?;
 
             check_api_call!(ffi::duckdb_v2_vector_reference, chunk_handle, self.handles.get(i)?)?;
         }
@@ -465,24 +487,19 @@ impl<'a> DataChunk<'a> {
 
     fn wrap(handle: ffi::duckdb_v2_data_chunk_handle, is_writable: bool, owner: Option<ChunkOwner>) -> Result<Self> {
         let count: ffi::idx_t = check_api_call!(ffi::duckdb_v2_data_chunk_get_vector_count, handle, RET)?;
-        let mut handles = Vec::with_capacity(count as usize);
-        for index in 0..count {
-            handles.push(check_api_call!(
-                ffi::duckdb_v2_data_chunk_get_vector,
-                handle,
-                index,
-                RET
-            )?);
-        }
         let access = if is_writable {
             Access::Writable
         } else {
             Access::Exclusive
         };
+        let handles = Handles::Chunk {
+            chunk: handle,
+            count: count as usize,
+        };
 
         Ok(Self {
             handle,
-            vectors: VectorCollection::new(handles, access, RowCount::Chunk(handle)),
+            vectors: VectorCollection::with_handles(handles, access, RowCount::Chunk(handle)),
             owner,
             _marker: std::marker::PhantomData,
         })
@@ -574,12 +591,9 @@ impl<'a> DataChunk<'a> {
         self.vectors.get_vector_array_mut(indices)
     }
 
-    pub(crate) fn get_vector_handle_at(&self, index: usize) -> ffi::duckdb_v2_vector_handle {
+    pub(crate) fn get_vector_handle_at(&self, index: usize) -> Result<ffi::duckdb_v2_vector_handle> {
         self.vectors.check_index(index);
-        self.vectors
-            .handles
-            .get(index)
-            .expect("a chunk fetches its handles up front")
+        self.vectors.handles.get(index)
     }
 
     /// Drop cached views after DuckDB changed the chunk's vectors.
@@ -784,6 +798,49 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_array_drops_each_wrapped_item_once() {
+        use std::cell::Cell;
+
+        struct Counted<'a>(&'a Cell<usize>);
+        impl Drop for Counted<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let drops = Cell::new(0);
+        for failing in 0..4 {
+            drops.set(0);
+            let result = super::collect_array([0, 1, 2, 3], |index| match index == failing {
+                true => Err(crate::Error::invalid_input("failed")),
+                false => Ok(Counted(&drops)),
+            });
+            assert!(result.is_err());
+            assert_eq!(drops.get(), failing, "failure at {failing}");
+        }
+
+        drops.set(0);
+        let vectors = super::collect_array([0, 1, 2], |_| Ok(Counted(&drops))).unwrap();
+        assert_eq!(drops.get(), 0);
+        drop(vectors);
+        assert_eq!(drops.get(), 3);
+
+        let empty: [Counted<'_>; 0] = super::collect_array([], |_| unreachable!("no index")).unwrap();
+        assert_eq!(empty.len(), 0);
+
+        // A panic leaks the items wrapped before it instead of dropping them.
+        drops.set(0);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::collect_array([0, 1, 2], |index| match index {
+                2 => panic!("wrap panicked"),
+                _ => Ok(Counted(&drops)),
+            })
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(drops.get(), 0);
+    }
+
+    #[test]
     fn test_argument_collection() -> crate::Result<()> {
         use super::{RowCount, VectorCollection};
         use crate::vector::Access;
@@ -796,6 +853,15 @@ mod tests {
         fn fail(_: *mut std::ffi::c_void, _: usize) -> crate::Result<crate::ffi::duckdb_v2_vector_handle> {
             Err(crate::Error::invalid_input("no argument"))
         }
+        fn fail_second(
+            info: *mut std::ffi::c_void,
+            index: usize,
+        ) -> crate::Result<crate::ffi::duckdb_v2_vector_handle> {
+            match index {
+                1 => Err(crate::Error::invalid_input("no second argument")),
+                _ => get(info, index),
+            }
+        }
 
         let env = Environment::new()?;
         let conn = env.open(StorageLocation::InMemory)?.connect()?;
@@ -805,7 +871,7 @@ mod tests {
             vector.set_size(1)?;
             vector.writer()?.set(0, &value)?;
         }
-        let mut handles = [chunk.get_vector_handle_at(0), chunk.get_vector_handle_at(1)];
+        let mut handles = [chunk.get_vector_handle_at(0)?, chunk.get_vector_handle_at(1)?];
         let info = (&mut handles as *mut [crate::ffi::duckdb_v2_vector_handle; 2]).cast();
 
         // SAFETY: `handles` and `chunk` outlive the collection.
@@ -826,6 +892,16 @@ mod tests {
         let mut failing = unsafe { VectorCollection::arguments(info, 2, fail, Access::Exclusive, RowCount::Fixed(1)) };
         assert!(failing.get_vector_at::<i64>(0).is_err());
         assert!(failing.get_vector_at_mut::<i64>(1).is_err());
+        assert!(failing.get_vector_array_mut([0, 1]).is_err());
+
+        // A failure after the first vector drops the vectors wrapped so far and reports the error.
+        // SAFETY: `handles` and `chunk` outlive the collection.
+        let mut partial =
+            unsafe { VectorCollection::arguments(info, 2, fail_second, Access::Exclusive, RowCount::Fixed(1)) };
+        let error = partial.get_vector_array_mut([0, 1]).unwrap_err();
+        assert!(error.message.contains("no second argument"), "{error}");
+        let [first] = partial.get_vector_array_mut([0])?;
+        assert_eq!(first.cast::<i64>()?.reader()?.get(0)?, Some(&10));
         Ok(())
     }
 

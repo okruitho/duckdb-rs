@@ -44,6 +44,7 @@ mod primitive;
 mod string;
 mod temporal;
 mod tuple;
+mod type_memo;
 mod uuid;
 mod variant;
 
@@ -66,7 +67,7 @@ pub use list::{List, ListIndex};
 pub use map::Map;
 pub use primitive::Any;
 pub use primitive::{HugeInt, UHugeInt};
-pub use string::{BitValue, BlobValue, UncheckedString};
+pub use string::{BitValue, BlobValue, UncheckedString, VarcharBytes};
 pub use structs::Struct;
 pub use temporal::{
     DateValue, IntervalValue, TimeNsValue, TimeTzValue, TimeValue, TimestampMsValue, TimestampNsValue,

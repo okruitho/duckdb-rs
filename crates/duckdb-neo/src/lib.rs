@@ -199,6 +199,7 @@ pub mod __derive {
     ///
     /// # Safety
     /// A row marked valid must hold initialized children.
+    #[inline]
     pub unsafe fn set_row_validity<T: NativeElement>(
         writer: &mut VectorWriter<'_, T>,
         row: usize,

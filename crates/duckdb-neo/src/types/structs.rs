@@ -4,6 +4,7 @@
 //! values and, with `#[duckdb(reader, writer)]`, row readers and writers. [`Struct`] is the
 //! untyped fallback.
 
+use super::type_memo::{TypeMemo, memo_find, memo_remember};
 use crate::{
     Result,
     data_chunk::VectorCollection,
@@ -63,9 +64,15 @@ unsafe impl WritableNativeElement for Struct {
 /// Runtime support for the struct derives in `duckdb-loadable-macros`; not a stable API.
 pub mod derive_support {
     use crate::{
-        Error, Result, data_chunk::VectorCollection, logical_type::LogicalType, logical_type::LogicalTypeID,
-        value::Value, vector::NativeElement,
+        Error, Result,
+        data_chunk::VectorCollection,
+        logical_type::LogicalType,
+        logical_type::LogicalTypeID,
+        value::Value,
+        vector::{NativeElement, RowWriter},
     };
+
+    use super::param_names_match;
 
     /// Check that `value` is a `STRUCT` with `expected` fields and return their names.
     pub fn value_field_names(value: &Value, expected: usize) -> Result<Vec<String>> {
@@ -96,34 +103,58 @@ pub mod derive_support {
         value.get_child(index)
     }
 
+    /// NULL a row whose field write failed with `error`, then return the error.
+    #[cold]
+    #[inline(never)]
+    pub fn null_failed_row<W: RowWriter + ?Sized>(writer: &mut W, row: usize, error: Error) -> Result<()> {
+        writer.set_null(row)?;
+        Err(error)
+    }
+
     /// Reject a SQL NULL for a field whose Rust type is not optional.
     pub fn required<T>(value: Option<T>, name: &str) -> Result<T> {
         value.ok_or_else(|| Error::invalid_input(format!("STRUCT field '{name}' is NULL")))
     }
 
-    /// Check that a vector type is a `STRUCT` with `count` fields and child vectors.
-    pub fn validate_layout(other: &LogicalType, children: Option<&VectorCollection>, count: usize) -> Result<bool> {
-        Ok(other.id()? == LogicalTypeID::Struct
-            && other.param_count()? == count
-            && children.map_or(0, VectorCollection::col_count) == count)
-    }
-
-    /// Check the name (case-insensitively) and child vector of the field at `index`.
-    pub fn validate_field<T: NativeElement>(
+    /// Check that a vector type is a `STRUCT` whose fields and child vectors are `names`, case-insensitively.
+    pub fn validate_layout(
         other: &LogicalType,
         children: Option<&VectorCollection>,
-        index: usize,
-        name: &str,
+        names: &'static [&'static str],
     ) -> Result<bool> {
+        Ok(other.id()? == LogicalTypeID::Struct
+            && other.param_count()? == names.len()
+            && children.map_or(0, VectorCollection::col_count) == names.len()
+            && param_names_match(other, names)?)
+    }
+
+    /// Check the child vector of the field at `index`.
+    pub fn validate_field<T: NativeElement>(children: Option<&VectorCollection>, index: usize) -> Result<bool> {
         let Some(children) = children.filter(|children| index < children.col_count()) else {
             return Ok(false);
         };
-        if !other.get_param(index)?.0.eq_ignore_ascii_case(name) {
-            return Ok(false);
-        }
         let child = children.get_untyped_vector_at(index)?;
         T::validate(child.logical_type(), child.children())
     }
+}
+
+thread_local! {
+    static NAMED_TYPES: TypeMemo<&'static [&'static str]> = const { TypeMemo::new() };
+}
+
+/// Check that the `param_count()` parameters of a `STRUCT` or `UNION` are named `names`, case-insensitively.
+pub(crate) fn param_names_match(other: &LogicalType, names: &'static [&'static str]) -> Result<bool> {
+    // DuckDB compares parameter names ignoring ASCII case, so a type equal to one already checked passes.
+    if memo_find(&NAMED_TYPES, other, |checked| (*checked == names).then_some(()))?.is_some() {
+        return Ok(true);
+    }
+    for (index, name) in names.iter().enumerate() {
+        if !other.get_param(index)?.0.eq_ignore_ascii_case(name) {
+            return Ok(false);
+        }
+    }
+    memo_remember(&NAMED_TYPES, other, names)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -396,7 +427,7 @@ mod tests {
     }
 
     #[derive(Debug, PartialEq, crate::AsDuckDB)]
-    #[duckdb(reader)]
+    #[duckdb(reader, writer)]
     struct Entry {
         key: i32,
         value: String,
@@ -492,6 +523,249 @@ mod tests {
                 "{sql}"
             );
         }
+        Ok(())
+    }
+
+    #[derive(duckdb_loadable_macros::AsNativeElement)]
+    struct MoodRow {
+        _mood: crate::types::EnumIndex<u8>,
+    }
+
+    #[derive(duckdb_loadable_macros::AsNativeElement)]
+    struct MoodsRow {
+        _xs: List<crate::types::EnumIndex<u8>>,
+    }
+
+    #[derive(duckdb_loadable_macros::AsNativeElement)]
+    struct AnyKey {
+        _key: Unknown,
+    }
+
+    #[derive(crate::AsDuckDBUnion)]
+    enum NumOrText {
+        #[duckdb(rename = "num")]
+        _Num(i32),
+        #[duckdb(rename = "str")]
+        _Str(String),
+    }
+
+    #[derive(crate::AsDuckDBUnion)]
+    enum NumOrTextUpper {
+        #[duckdb(rename = "NUM")]
+        _Num(i32),
+        #[duckdb(rename = "Str")]
+        _Str(String),
+    }
+
+    #[derive(crate::AsDuckDBUnion)]
+    enum NumOrName {
+        #[duckdb(rename = "num")]
+        _Num(i32),
+        #[duckdb(rename = "name")]
+        _Name(String),
+    }
+
+    /// Run `test` on a fresh thread, so it sees an empty memo.
+    fn on_fresh_thread(test: impl FnOnce() -> Result<()> + Send + 'static) -> Result<()> {
+        std::thread::spawn(test).join().unwrap()
+    }
+
+    fn named_types() -> usize {
+        crate::types::type_memo::memo_len(&NAMED_TYPES)
+    }
+
+    #[test]
+    fn struct_names_are_remembered_per_type() -> Result<()> {
+        on_fresh_thread(|| {
+            let env = Environment::new()?;
+            let conn = env.open(StorageLocation::InMemory)?.connect()?;
+            let chunk = conn
+                .query(
+                    "SELECT {'key': 42, 'value': 'duck'}, {'kay': 42, 'value': 'duck'}, {'KEY': 7, 'Value': 'x'}",
+                    Parameters::None,
+                )?
+                .next_chunk()?
+                .unwrap();
+            for _ in 0..2 {
+                let reader = chunk.get_vector_at::<Entry>(0)?;
+                assert_eq!(reader.row_reader()?.get(0)?.unwrap().key, Some(&42));
+                assert!(chunk.get_vector_at::<Entry>(1).is_err());
+                let row = chunk.get_vector_at::<Entry>(2)?;
+                assert_eq!(row.row_reader()?.get(0)?.unwrap().value, Some("x"));
+            }
+            // DuckDB compares field names ignoring ASCII case, so the third type hits the first one's entry.
+            assert_eq!(named_types(), 1);
+
+            let mut chunk = DataChunk::create(&conn, &[<Entry as DuckDBType>::logical_type(&conn)?], true)?;
+            let mut vector = chunk.get_vector_at_mut::<Entry>(0)?;
+            vector.set_size(1)?;
+            vector.row_writer()?.set(
+                0,
+                &Entry {
+                    key: 1,
+                    value: "written".to_owned(),
+                },
+            )?;
+            assert!(chunk.get_vector_at_mut::<IntegerEntry>(0).is_err());
+            assert_eq!(named_types(), 1);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn union_names_are_remembered_per_name_list() -> Result<()> {
+        on_fresh_thread(|| {
+            let env = Environment::new()?;
+            let conn = env.open(StorageLocation::InMemory)?.connect()?;
+            let chunk = conn
+                .query(
+                    "SELECT union_value(num := 1)::UNION(num INTEGER, str VARCHAR)",
+                    Parameters::None,
+                )?
+                .next_chunk()?
+                .unwrap();
+            for _ in 0..2 {
+                assert!(chunk.get_vector_at::<NumOrText>(0).is_ok());
+                assert!(chunk.get_vector_at::<NumOrName>(0).is_err());
+                assert!(chunk.get_vector_at::<NumOrTextUpper>(0).is_ok());
+            }
+            // One entry per accepted name list, both for the same type.
+            assert_eq!(named_types(), 2);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn struct_types_with_enums_are_not_remembered() -> Result<()> {
+        on_fresh_thread(|| {
+            let env = Environment::new()?;
+            let conn = env.open(StorageLocation::InMemory)?.connect()?;
+            conn.execute("CREATE TYPE mood AS ENUM ('sad', 'happy')", Parameters::None)?;
+            let chunk = conn
+                .query(
+                    "SELECT {'_mood': 'happy'::mood}, {'_xs': ['sad'::mood]}, {'key': 42, 'value': 'duck'}",
+                    Parameters::None,
+                )?
+                .next_chunk()?
+                .unwrap();
+            assert!(chunk.get_vector_at::<MoodRow>(0)?.reader()?.get(0)?.is_some());
+            assert!(chunk.get_vector_at::<MoodsRow>(1)?.reader()?.get(0)?.is_some());
+            assert_eq!(named_types(), 0);
+
+            // Whether a type is remembered depends on the type itself, not on the children passed with it.
+            let plain = chunk.get_vector_at::<Entry>(2)?;
+            assert_eq!(named_types(), 1);
+            let with_enum = LogicalType::from_text(&conn, "STRUCT(key mood, value VARCHAR)")?;
+            assert!(<Entry as crate::vector::NativeElement>::validate(
+                &with_enum,
+                plain.children()
+            )?);
+            assert_eq!(named_types(), 1);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn nine_struct_types_stay_remembered() -> Result<()> {
+        on_fresh_thread(|| {
+            let env = Environment::new()?;
+            let conn = env.open(StorageLocation::InMemory)?.connect()?;
+            let types = [
+                "BOOLEAN", "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "FLOAT", "DOUBLE", "VARCHAR", "DATE",
+            ]
+            .map(|key| LogicalType::from_text(&conn, &format!("STRUCT(_key {key})")));
+            let chunk = DataChunk::create(&conn, &types.into_iter().collect::<Result<Vec<_>>>()?, true)?;
+            for _ in 0..3 {
+                for column in 0..9 {
+                    chunk.get_vector_at::<AnyKey>(column)?;
+                }
+                assert_eq!(named_types(), 9);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn remembered_struct_types_outlive_their_database() -> Result<()> {
+        on_fresh_thread(|| {
+            {
+                let env = Environment::new()?;
+                let conn = env.open(StorageLocation::InMemory)?.connect()?;
+                conn.execute("CREATE TYPE money AS DECIMAL(18, 3)", Parameters::None)?;
+                conn.execute(
+                    "CREATE TYPE point AS STRUCT(key INTEGER, value VARCHAR)",
+                    Parameters::None,
+                )?;
+                let chunk = conn
+                    .query(
+                        "SELECT {'key': 42, 'value': 'duck'}, 1.5::DECIMAL(18, 3), {'key': 1, 'value': 'x'}::point, \
+                         {'_key': 1, '_value': 1.5::money}, 2.5::money",
+                        Parameters::None,
+                    )?
+                    .next_chunk()?
+                    .unwrap();
+                chunk.get_vector_at::<Entry>(0)?;
+                chunk.get_vector_at::<crate::types::Decimal<18, 3>>(1)?;
+                chunk.get_vector_at::<Entry>(2)?;
+                chunk.get_vector_at::<AnyKeyValue>(3)?;
+                chunk.get_vector_at::<crate::types::Decimal<18, 3>>(4)?;
+            }
+            // Catalog aliases bind to the built-in types they name, so these copies own all their parameters.
+            assert_eq!(named_types(), 2);
+            Ok(())
+        })
+    }
+
+    #[derive(duckdb_loadable_macros::AsNativeElement)]
+    struct AnyKeyValue {
+        _key: Unknown,
+        _value: Unknown,
+    }
+
+    #[derive(Debug, crate::AsDuckDB)]
+    #[duckdb(writer)]
+    struct Tagged {
+        key: i32,
+        items: List<i32>,
+    }
+
+    #[test]
+    fn struct_writer_nulls_a_row_whose_field_write_fails() -> Result<()> {
+        let env = Environment::new()?;
+        let conn = env.open(StorageLocation::InMemory)?.connect()?;
+        let mut chunk = DataChunk::create(&conn, &[Tagged::logical_type(&conn)?], true)?;
+        let mut vector = chunk.get_vector_at_mut::<Tagged>(0)?;
+        vector.set_size(3)?;
+        vector
+            .children_mut()
+            .unwrap()
+            .get_vector_at_mut::<List<i32>>(1)?
+            .set_child_size(1)?;
+        {
+            let mut writer = vector.row_writer()?;
+            let too_long = Tagged {
+                key: 1,
+                items: List(vec![Some(1), Some(2)]),
+            };
+            assert!(writer.set(0, &too_long).is_err());
+            writer.set(
+                1,
+                &Tagged {
+                    key: 2,
+                    items: List(vec![Some(3)]),
+                },
+            )?;
+            assert!(writer.set(3, &too_long).is_err());
+        }
+        let reader = vector.reader()?;
+        assert_eq!(
+            (0..3).map(|row| reader.is_null(row)).collect::<Result<Vec<_>>>()?,
+            [true, false, false]
+        );
+        let keys = vector.children().unwrap().get_vector_at::<i32>(0)?.reader()?;
+        assert_eq!(keys.get(0)?, None);
+        assert_eq!(keys.get(1)?, Some(&2));
+        assert_eq!(vector.get_value_slow(1)?.dbg_string()?, "{'key': 2, 'items': [3]}");
         Ok(())
     }
 

@@ -44,7 +44,7 @@
 //! [`WithReader`] and [`WithWriter`], whose readers and writers, such as [`ListReader`] and
 //! [`ListWriter`], prepare their children once and compose for nested types.
 
-use std::{cell::OnceCell, marker::PhantomData};
+use std::{borrow::Borrow, cell::OnceCell, marker::PhantomData};
 
 use crate::builder_helpers::ffi_enum_redeclaration;
 use crate::error::DuckDBError;
@@ -57,7 +57,7 @@ use crate::{
     data_chunk::{ChildrenMut, VectorCollection},
     error::Error,
     ffi,
-    logical_type::LogicalType,
+    logical_type::{LogicalType, LogicalTypeID},
     value::Value,
 };
 
@@ -78,7 +78,10 @@ ffi_enum_redeclaration! {
     }
 }
 
-pub use crate::{arena::Arena, bytes::DuckDBBytes};
+pub use crate::{
+    arena::Arena,
+    bytes::{BytesBuffer, DuckDBBytes, StrBuffer},
+};
 
 mod array_writer;
 mod child;
@@ -107,6 +110,7 @@ pub use union_writer::{
 #[doc(hidden)]
 pub use combined::VectorReaderTuple;
 pub use combined::{CombinedVectorIterator, EnumeratedCombinedVectorIterator};
+pub(crate) use reader::RowLayout;
 pub use reader::{EnumeratedVectorReaderIter, Selection, VectorReader, VectorReaderIter};
 pub use rows::{RowIter, RowReader, RowWriter, WithReader, WithWriter};
 pub use writer::VectorWriter;
@@ -172,6 +176,8 @@ pub struct Vector<'a, T: NativeElement> {
     pub(crate) handle: ffi::duckdb_v2_vector_handle,
     pub(crate) access: Access,
     kind: StorageKind,
+    /// `None` for an id this crate does not know.
+    type_id: Option<LogicalTypeID>,
     logical_type: LogicalType,
     len: usize,
     /// Prepared read metadata, dropped by every operation that may replace storage.
@@ -190,28 +196,19 @@ impl<'a, T: NativeElement> Vector<'a, T> {
     pub(crate) fn from_handle(handle: &ffi::duckdb_v2_vector_handle, access: Access) -> Result<Self> {
         let logical_type = check_api_call!(ffi::duckdb_v2_vector_get_logical_type, *handle, RET)
             .map(|handle| LogicalType { handle })?;
+        let type_id = check_api_call!(ffi::duckdb_v2_logical_type_get_id, logical_type.handle, RET)?;
+        let type_id = LogicalTypeID::try_from(type_id).ok();
 
-        let kind =
-            check_api_call!(ffi::duckdb_v2_vector_get_vector_type, *handle, RET).map(StorageKind::try_from)??;
+        let kind = check_api_call!(ffi::duckdb_v2_vector_get_vector_type, *handle, RET).map(StorageKind::from_ffi)?;
         let len = check_api_call!(ffi::duckdb_v2_vector_get_size, *handle, RET).map(|x| x as usize)?;
         let access = access.for_kind(kind);
 
-        let child_count = check_api_call!(ffi::duckdb_v2_vector_get_child_count, *handle, RET).map(|x| x as usize)?;
-        let mut child_handles = Vec::with_capacity(child_count as usize);
-        for index in 0..child_count {
-            child_handles.push(check_api_call!(
-                ffi::duckdb_v2_vector_get_child,
-                *handle,
-                index as u64,
-                RET
-            )?);
-        }
-
-        let children = (!child_handles.is_empty()).then(|| Box::new(VectorCollection::children(child_handles, access)));
+        let children = children(*handle, type_id, access)?;
 
         let vector = Self {
             handle: *handle,
             logical_type,
+            type_id,
             kind,
             len,
             access,
@@ -224,6 +221,52 @@ impl<'a, T: NativeElement> Vector<'a, T> {
         };
         vector.validate_as::<T>()?;
         Ok(vector)
+    }
+}
+
+/// Fetch the child vectors of a vector, skipping the C API calls for types without children.
+#[inline]
+fn children(
+    handle: ffi::duckdb_v2_vector_handle,
+    type_id: Option<LogicalTypeID>,
+    access: Access,
+) -> Result<Option<Box<VectorCollection>>> {
+    // DuckDB derives the child count from the type id alone.
+    if !type_id.is_none_or(has_children) {
+        return Ok(None);
+    }
+    let child_count = check_api_call!(ffi::duckdb_v2_vector_get_child_count, handle, RET)?;
+    let mut child_handles = Vec::with_capacity(child_count as usize);
+    for index in 0..child_count {
+        child_handles.push(check_api_call!(ffi::duckdb_v2_vector_get_child, handle, index, RET)?);
+    }
+    Ok((!child_handles.is_empty()).then(|| Box::new(VectorCollection::children(child_handles, access))))
+}
+
+/// Whether DuckDB exposes child vectors for vectors of this type.
+#[inline]
+fn has_children(id: LogicalTypeID) -> bool {
+    matches!(
+        id,
+        LogicalTypeID::List
+            | LogicalTypeID::Map
+            | LogicalTypeID::Array
+            | LogicalTypeID::Struct
+            | LogicalTypeID::Tuple
+            | LogicalTypeID::Union
+    )
+}
+
+impl StorageKind {
+    /// Convert without failing: a kind this crate does not know must be flattened like `OTHER`.
+    #[inline(always)]
+    fn from_ffi(kind: ffi::DUCKDB_V2_VECTOR_TYPE) -> Self {
+        match kind {
+            ffi::DUCKDB_V2_VECTOR_TYPE::DUCKDB_V2_VECTOR_TYPE_FLAT => Self::Flat,
+            ffi::DUCKDB_V2_VECTOR_TYPE::DUCKDB_V2_VECTOR_TYPE_CONSTANT => Self::Constant,
+            ffi::DUCKDB_V2_VECTOR_TYPE::DUCKDB_V2_VECTOR_TYPE_DICTIONARY => Self::Dictionary,
+            _ => Self::Other,
+        }
     }
 }
 
@@ -310,6 +353,7 @@ impl<'a, T: NativeElement> Vector<'a, T> {
         Vector {
             handle: self.handle,
             logical_type: self.logical_type,
+            type_id: self.type_id,
             kind: self.kind,
             len: self.len,
             access: self.access,
@@ -403,7 +447,7 @@ impl<'a, T: NativeElement> Vector<'a, T> {
     }
 
     /// Return the prepared read metadata, fetched once per state; `OTHER` storage has none.
-    #[inline]
+    #[inline(always)]
     fn view(&self) -> Result<Option<reader::CachedReader>> {
         if self.kind == StorageKind::Other {
             return Ok(None);
@@ -411,7 +455,7 @@ impl<'a, T: NativeElement> Vector<'a, T> {
         if let Some(view) = self.view.get() {
             return Ok(Some(*view));
         }
-        let view = check_api_call!(ffi::duckdb_v2_vector_get_view, self.handle, RET)?;
+        let view = vector_view(self.handle)?;
         // SAFETY: DuckDB returned a current view of this vector, including its constant validity slot.
         let view = unsafe { reader::CachedReader::new(view, self.kind, self.len) };
         let _ = self.view.set(view);
@@ -506,7 +550,15 @@ impl<'a, T: NativeElement> Vector<'a, T> {
         Ok(())
     }
 
+    #[inline]
     pub(crate) fn validate_as<U: NativeElement>(&self) -> Result<()> {
+        if U::VALIDATES_BY_ID && self.type_id == Some(U::TYPE_ID) {
+            return Ok(());
+        }
+        self.validate_slow::<U>()
+    }
+
+    fn validate_slow<U: NativeElement>(&self) -> Result<()> {
         match U::validate(self.logical_type(), self.children.as_deref()) {
             Ok(true) => Ok(()),
             Ok(false) => Err(Error::invalid_input(format!(
@@ -637,14 +689,16 @@ impl<'a, T: NativeElement> Vector<'a, T> {
         }
     }
 
-    /// Turn writable output into a constant vector, returning the rebuilt vector.
+    /// Turn writable output into a constant vector, returning it with its new storage.
     ///
     /// `value` must have the vector's logical type. Every logical row contains
-    /// `value`, or is `NULL` when `value` is `NULL`.
+    /// `value`, or is `NULL` when `value` is `NULL`. It takes `&Value` as well as
+    /// `Value`, since DuckDB copies it: one value can fill many vectors.
     ///
     /// The returned vector is not writable: a constant holds a single
     /// slot, so per-row writes would go past its buffer.
-    pub fn make_constant(self, value: Value, count: usize) -> Result<Self> {
+    pub fn make_constant(mut self, value: impl Borrow<Value>, count: usize) -> Result<Self> {
+        let value = value.borrow();
         if !self.is_writable() {
             return Err(not_writable());
         }
@@ -657,13 +711,19 @@ impl<'a, T: NativeElement> Vector<'a, T> {
 
         check_api_call!(ffi::duckdb_v2_vector_constant_set_valid, self.handle, !value.is_null()?)?;
 
-        // The constant brings its own buffer and child vectors, so rebuild from the handle.
-        let mut vector = Self::from_handle(&self.handle, Access::Exclusive)?;
-        vector.len = count;
-        Ok(vector)
+        // The constant keeps the logical type but replaces the buffer that owned any child vectors.
+        let had_children = self.children.take().is_some();
+        self.kind = StorageKind::Constant;
+        self.len = count;
+        self.set_not_writable();
+        self.refresh_buffers()?;
+        if had_children {
+            self.children = children(self.handle, self.type_id, self.access)?;
+        }
+        Ok(self)
     }
 
-    /// Turn writable output into an arithmetic sequence, returning the rebuilt vector.
+    /// Turn writable output into an arithmetic sequence, returning it with its new storage.
     ///
     /// Produces `count` values following `start + index * increment`. The
     /// sequence uses [`StorageKind::Other`] and must be flattened before typed
@@ -728,7 +788,7 @@ impl<T: NativeElement> Vector<'_, T> {
     /// Prepare a storage-specific reader, along with readers for every descendant.
     ///
     /// Returns an error for [`StorageKind::Other`]; flatten the vector explicitly first.
-    #[inline]
+    #[inline(always)]
     pub fn reader(&self) -> Result<VectorReader<'_, T>> {
         VectorReader::new(self)
     }
@@ -738,6 +798,24 @@ impl<T: NativeElement> Vector<'_, T> {
     /// This is the slow path; prefer [`VectorReader::get`] or [`VectorReader::iter`].
     pub fn get_value_slow(&self, index: usize) -> Result<Value> {
         check_api_call!(ffi::duckdb_v2_vector_get_value, self.handle, index as u64, RET).map(|handle| Value { handle })
+    }
+}
+
+/// Fetch a vector's view, reading the fields one at a time: DuckDB stores them separately, so copying
+/// the struct as a whole would reload them as one, stalling store forwarding.
+#[inline(always)]
+fn vector_view(handle: ffi::duckdb_v2_vector_handle) -> Result<ffi::duckdb_v2_vector_view> {
+    let mut view = std::mem::MaybeUninit::<ffi::duckdb_v2_vector_view>::uninit();
+    check_api_call!(ffi::duckdb_v2_vector_get_view, handle, view.as_mut_ptr())?;
+    let view = view.as_ptr();
+    // SAFETY: DuckDB wrote every field on success. Volatile reads keep the loads field-sized.
+    unsafe {
+        Ok(ffi::duckdb_v2_vector_view {
+            data: std::ptr::read_volatile(&raw const (*view).data),
+            validity: std::ptr::read_volatile(&raw const (*view).validity),
+            sel: std::ptr::read_volatile(&raw const (*view).sel),
+            count: std::ptr::read_volatile(&raw const (*view).count),
+        })
     }
 }
 
