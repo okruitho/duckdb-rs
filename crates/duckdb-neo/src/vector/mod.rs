@@ -105,6 +105,7 @@ pub use union_writer::{
 #[doc(hidden)]
 pub use combined::VectorReaderTuple;
 pub use combined::{CombinedVectorIterator, EnumeratedCombinedVectorIterator};
+pub(crate) use reader::RowLayout;
 pub use reader::{EnumeratedVectorReaderIter, Selection, VectorReader, VectorReaderIter};
 pub use rows::{RowIter, RowReader, RowWriter, WithReader, WithWriter};
 pub use writer::VectorWriter;

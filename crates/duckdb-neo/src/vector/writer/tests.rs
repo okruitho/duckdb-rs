@@ -1124,3 +1124,299 @@ fn writer_buffers_match_duckdb_mutable_buffers() -> Result<()> {
     }
     Ok(())
 }
+
+static LAYOUTS: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn map_probes(conn: &crate::connection::Connection) -> Result<()> {
+    fn prefill(output: &mut Vector<'_, i64>, len: usize) -> Result<()> {
+        let mut writer = output.writer()?;
+        writer.write_slice(0, &vec![-1; len])?;
+        for row in (0..len).step_by(3) {
+            writer.set_null(row)?;
+        }
+        Ok(())
+    }
+    fn expect_rows(output: &Vector<'_, i64>, expected: Vec<Option<i64>>) -> Result<()> {
+        assert_eq!(
+            output.reader()?.iter().map(|v| v.copied()).collect::<Vec<_>>(),
+            expected
+        );
+        Ok(())
+    }
+    MicroScalar::create(
+        "map_probe",
+        |_ctx, mut input: Vector<'_, i64>, mut output: Vector<'_, i64>| {
+            if input.storage_kind() == StorageKind::Other {
+                input.flatten()?;
+            }
+            let reader = input.reader()?;
+            LAYOUTS
+                .lock()
+                .unwrap()
+                .insert(format!("{:?}/{}", input.storage_kind(), reader.validity().is_some()));
+            prefill(&mut output, reader.len())?;
+            output.writer()?.map_from(&reader, |value| value.wrapping_mul(3))?;
+            expect_rows(&output, reader.iter().map(|v| v.map(|v| v.wrapping_mul(3))).collect())?;
+            prefill(&mut output, reader.len())?;
+            output
+                .writer()?
+                .try_map_from(&reader, |value| Ok(value.wrapping_sub(1)))?;
+            expect_rows(&output, reader.iter().map(|v| v.map(|v| v.wrapping_sub(1))).collect())?;
+            prefill(&mut output, reader.len())?;
+            let swap = |value: Option<&i64>| match value {
+                Some(value) if value % 2 == 0 => None,
+                Some(value) => Some(*value),
+                None => Some(7),
+            };
+            output.writer()?.map_option_from(&reader, swap)?;
+            expect_rows(&output, reader.iter().map(swap).collect())?;
+            output.writer()?.map_from(&reader, |value| *value)
+        },
+    )
+    .set_property(crate::enums::FunctionProperty::HasSpecialNullHandling(true))
+    .register(conn)
+}
+
+#[test]
+fn writer_maps_every_storage_layout() -> Result<()> {
+    let env = Environment::new()?;
+    let conn = env.open(StorageLocation::InMemory)?.connect()?;
+    map_probes(&conn)?;
+    conn.query(
+        "CREATE TABLE t AS SELECT CASE WHEN i % 7 = 3 OR i BETWEEN 128 AND 191 THEN NULL ELSE i END AS v \
+         FROM range(5000) r(i)",
+        Parameters::None,
+    )?
+    .drain()?;
+    conn.query(
+        "CREATE TABLE t2 AS SELECT range AS i FROM range(5000)",
+        Parameters::None,
+    )?
+    .drain()?;
+    for sql in [
+        "SELECT count(*) FILTER (WHERE map_probe(test_vector) IS DISTINCT FROM test_vector) \
+         FROM test_vector_types(NULL::BIGINT, all_flat := false)",
+        "SELECT count(*) FILTER (WHERE map_probe(v) IS DISTINCT FROM v) FROM t",
+        "SELECT count(*) FILTER (WHERE map_probe(v) IS DISTINCT FROM v) FROM t WHERE v IS NULL OR v % 3 <> 1",
+        "SELECT count(*) FILTER (WHERE map_probe(v) IS DISTINCT FROM v) FROM t WHERE v > 4000",
+        "SELECT count(*) FILTER (WHERE map_probe(42) IS DISTINCT FROM 42) FROM t",
+        "SELECT count(*) FILTER (WHERE map_probe(NULL) IS NOT NULL) FROM t",
+        "SELECT count(*) FILTER (WHERE map_probe(range) IS DISTINCT FROM range) FROM range(3000)",
+        "SELECT count(*) FILTER (WHERE map_probe(i) IS DISTINCT FROM i) FROM t2 WHERE i % 3 <> 1",
+        "SELECT count(*) FILTER (WHERE map_probe(n) IS NOT NULL) FROM t CROSS JOIN (SELECT NULL::BIGINT AS n)",
+    ] {
+        let mut result = conn.query(sql, Parameters::None)?;
+        let chunk = result.next_chunk()?.unwrap();
+        assert_eq!(chunk.get_vector_at::<i64>(0)?.reader()?.get(0)?, Some(&0), "{sql}");
+    }
+    let layouts = LAYOUTS.lock().unwrap();
+    for layout in [
+        "Constant/false",
+        "Constant/true",
+        "Dictionary/false",
+        "Dictionary/true",
+        "Flat/false",
+        "Flat/true",
+    ] {
+        assert!(layouts.contains(layout), "{layout} not covered: {layouts:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn writer_maps_across_mask_words_and_bounds() -> Result<()> {
+    let env = Environment::new()?;
+    let conn = env.open(StorageLocation::InMemory)?.connect()?;
+    let types = [i64::logical_type(&conn)?, bool::logical_type(&conn)?];
+    let mut chunk = DataChunk::create(&conn, &types, true)?;
+    let [input, output] = chunk.get_vector_array_mut([0, 1])?;
+    let (mut input, mut output) = (input.cast::<i64>()?, output.cast::<bool>()?);
+    input.set_size(0)?;
+    output.set_size(2)?;
+    output
+        .writer()?
+        .map_from(&input.reader()?, |_| unreachable!("no rows"))?;
+    assert!(output.writer()?.validity.is_null());
+
+    input.set_size(200)?;
+    input.writer()?.write_slice(0, &(0..200).collect::<Vec<_>>())?;
+    let error = output
+        .writer()?
+        .map_from(&input.reader()?, |_| true)
+        .expect_err("input is longer");
+    assert!(error.message.contains("out of bounds"), "{error}");
+
+    output.set_size(201)?;
+    {
+        let mut writer = output.writer()?;
+        writer.set_null(200)?;
+        writer.map_from(&input.reader()?, |value| value % 2 == 0)?;
+    }
+    let rows = output.reader()?.iter().map(|v| v.copied()).collect::<Vec<_>>();
+    let expected = (0..201)
+        .map(|row| (row < 200).then_some(row % 2 == 0))
+        .collect::<Vec<_>>();
+    assert_eq!(rows, expected);
+
+    {
+        let mut writer = input.writer()?;
+        for row in (0..200).filter(|row| row % 64 == 63 || (64..128).contains(row)) {
+            writer.set_null(row)?;
+        }
+    }
+    output.set_size(200)?;
+    output.writer()?.map_from(&input.reader()?, |_| true)?;
+    let rows = output.reader()?.iter().map(|v| v.copied()).collect::<Vec<_>>();
+    let expected = (0..200)
+        .map(|row| (row % 64 != 63 && !(64..128).contains(&row)).then_some(true))
+        .collect::<Vec<_>>();
+    assert_eq!(rows, expected);
+
+    output.set_size(0)?;
+    output.set_size(200)?;
+    let mut calls = 0;
+    let error = output
+        .writer()?
+        .try_map_from(&input.reader()?, |value| {
+            calls += 1;
+            if *value == 150 {
+                return Err(crate::Error::invalid_input("stop at 150"));
+            }
+            Ok(true)
+        })
+        .expect_err("the closure fails");
+    assert!(error.message.contains("stop at 150"), "{error}");
+    assert_eq!(calls, 63 + 23);
+    let rows = output.reader()?.iter().map(|v| v.copied()).collect::<Vec<_>>();
+    assert_eq!(rows[..128], expected[..128]);
+    assert!(rows[150..].iter().all(|row| *row != Some(true)));
+    Ok(())
+}
+
+#[test]
+fn writer_map_from_constant_vectors() -> Result<()> {
+    let env = Environment::new()?;
+    let conn = env.open(StorageLocation::InMemory)?.connect()?;
+    let types = [i64::logical_type(&conn)?, i64::logical_type(&conn)?];
+    for value in [Some(5_i64), None] {
+        let mut chunk = DataChunk::create(&conn, &types, true)?;
+        let [input, output] = chunk.get_vector_array_mut([0, 1])?;
+        let constant = match value {
+            Some(value) => value.value(&conn)?,
+            None => Value::null(&conn, &i64::logical_type(&conn)?)?,
+        };
+        let input = input.cast::<i64>()?.make_constant(constant, 70)?;
+        assert_eq!(input.storage_kind(), StorageKind::Constant);
+        let mut output = output.cast::<i64>()?;
+        output.set_size(70)?;
+        output.writer()?.map_from(&input.reader()?, |value| value + 1)?;
+        let rows = output.reader()?.iter().map(|v| v.copied()).collect::<Vec<_>>();
+        assert_eq!(rows, vec![value.map(|value| value + 1); 70]);
+    }
+    Ok(())
+}
+
+#[test]
+fn writer_maps_leave_valid_rows_after_a_panic() -> Result<()> {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let env = Environment::new()?;
+    let conn = env.open(StorageLocation::InMemory)?.connect()?;
+    let types = [i64::logical_type(&conn)?, i64::logical_type(&conn)?];
+    let old = |row: usize| (!row.is_multiple_of(3)).then_some(7);
+    let new = |row: usize| (row % 64 != 63).then_some(2 * row as i64);
+    for map in 0..3 {
+        let mut chunk = DataChunk::create(&conn, &types, true)?;
+        let [input, output] = chunk.get_vector_array_mut([0, 1])?;
+        let (mut input, mut output) = (input.cast::<i64>()?, output.cast::<i64>()?);
+        input.set_size(200)?;
+        output.set_size(200)?;
+        {
+            let (mut input, mut output) = (input.writer()?, output.writer()?);
+            for row in 0..200 {
+                input.set_option(row, (row % 64 != 63).then_some(row as i64).as_ref())?;
+                output.set_option(row, old(row).as_ref())?;
+            }
+        }
+        let reader = input.reader()?;
+        let double = |value: &i64| {
+            assert!(*value != 150, "map {map} panicked");
+            2 * value
+        };
+        let mut writer = output.writer()?;
+        let panicked = catch_unwind(AssertUnwindSafe(|| match map {
+            0 => writer.map_from(&reader, double),
+            1 => writer.map_option_from(&reader, |value| value.map(double)),
+            _ => writer.try_map_from(&reader, |value| Ok(double(value))),
+        }));
+        assert!(panicked.is_err(), "map {map}");
+        let rows = output.reader()?.iter().map(|v| v.copied()).collect::<Vec<_>>();
+        for (row, value) in rows.into_iter().enumerate() {
+            let expected = match row {
+                ..128 => new(row),
+                128..150 => old(row).and(new(row)),
+                _ => old(row),
+            };
+            assert_eq!(value, expected, "map {map}, row {row}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn writer_resize_and_write_zeroes_rows_after_a_failure() -> Result<()> {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let env = Environment::new()?;
+    let conn = env.open(StorageLocation::InMemory)?.connect()?;
+    let mut chunk = DataChunk::create(&conn, &[i64::logical_type(&conn)?], true)?;
+    let mut vector = chunk.get_vector_at_mut::<i64>(0)?;
+    vector.set_size(100)?;
+    vector.writer()?.write_slice(0, &[7; 100])?;
+    let rows = |vector: &Vector<'_, i64>| -> Result<Vec<Option<i64>>> {
+        Ok(vector.reader()?.iter().map(|v| v.copied()).collect())
+    };
+
+    let fail = |writer: &mut VectorWriter<'_, i64>| {
+        writer.write_slice(0, &[1; 10])?;
+        Err(crate::Error::invalid_input("write failed"))
+    };
+    // SAFETY: the closure fails, so the rows are zeroed.
+    let error = unsafe { vector.writer()?.resize_and_write(300, fail) }.expect_err("the closure fails");
+    assert!(error.message.contains("write failed"), "{error}");
+    assert_eq!(rows(&vector)?, vec![Some(0); 300]);
+
+    vector.writer()?.write_slice(0, &[7; 300])?;
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the closure panics, so the rows are zeroed.
+        unsafe {
+            vector.writer()?.resize_and_write(500, |writer| {
+                writer.write_slice(0, &[1; 10])?;
+                panic!("write panicked")
+            })
+        }
+    }));
+    assert!(panicked.is_err());
+    assert_eq!(rows(&vector)?, vec![Some(0); 500]);
+
+    // SAFETY: zero rows need no writes.
+    unsafe { vector.writer()?.resize_and_write(0, |_| Ok(()))? };
+    assert!(vector.is_empty());
+    // SAFETY: as above; the guard has no rows to zero.
+    let error = unsafe {
+        vector
+            .writer()?
+            .resize_and_write(0, |_| Err(crate::Error::invalid_input("write failed")))
+    }
+    .expect_err("the closure fails");
+    assert!(error.message.contains("write failed"), "{error}");
+    assert!(vector.is_empty());
+
+    // SAFETY: the closure writes every row.
+    unsafe {
+        vector
+            .writer()?
+            .resize_and_write(130, |writer| writer.write_slice(0, &[3; 130]))?
+    };
+    assert_eq!(rows(&vector)?, vec![Some(3); 130]);
+    Ok(())
+}
