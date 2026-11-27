@@ -37,11 +37,7 @@ use crate::{
 /// let function = MicroScalar::create(
 ///     "plus_one",
 ///     |_ctx, input: Vector<'_, i32>, mut output: Vector<'_, i64>| {
-///         let mut writer = output.writer()?;
-///         for (row, value) in input.reader()?.iter().enumerate() {
-///             writer.set_option(row, value.map(|value| i64::from(*value) + 1).as_ref())?;
-///         }
-///         Ok(())
+///         output.writer()?.map_from(&input.reader()?, |value| i64::from(*value) + 1)
 ///     },
 /// );
 /// let env = Environment::new()?;
@@ -97,8 +93,8 @@ impl MicroScalar {
     ///
     /// The peer of DuckDB's `ScalarExecutor`: storage and validity are resolved once per batch, a NULL in a
     /// [`PlainNative`] argument makes the row NULL without a call, and batches without NULLs run a loop that
-    /// LLVM can vectorize. [`RowArgument`] and [`RowResult`] describe the `Option` forms. The parameter is named
-    /// `input`, and `SEQUENCE` arguments are flattened first.
+    /// LLVM can vectorize. [`RowArgument`] and [`RowResult`] describe the `Option` and `Result` forms. The
+    /// parameter is named `input`, and `SEQUENCE` arguments are flattened first.
     ///
     /// ```
     /// use duckdb_neo::{Parameters, environment::{Environment, StorageLocation}, scalar::MicroScalar};
@@ -216,12 +212,13 @@ pub trait RowArgument: sealed::Sealed + 'static {
 }
 
 /// The result of a row function of [`MicroScalar::unary`] to [`MicroScalar::quaternary`]: a [`PlainNative`]
-/// value, or `Option` of one, whose `None` makes the row NULL.
+/// value, or `Option` of one, whose `None` makes the row NULL. Either may be wrapped in [`Result`], whose
+/// error fails the whole call.
 pub trait RowResult: sealed::Sealed + 'static {
     /// The element type of the SQL result.
     type Element: PlainNative + DuckDBType + 'static;
     #[doc(hidden)]
-    fn into_row(self) -> Option<Self::Element>;
+    fn into_row(self) -> Result<Option<Self::Element>>;
 }
 
 impl<T: PlainNative + DuckDBType + 'static> sealed::Sealed for T {}
@@ -248,12 +245,16 @@ impl<T: PlainNative + DuckDBType + 'static> RowArgument for Option<T> {
     }
 }
 
+impl<T: PlainNative + DuckDBType + 'static> sealed::Sealed for Result<T> {}
+
+impl<T: PlainNative + DuckDBType + 'static> sealed::Sealed for Result<Option<T>> {}
+
 impl<T: PlainNative + DuckDBType + 'static> RowResult for T {
     type Element = T;
 
     #[inline(always)]
-    fn into_row(self) -> Option<T> {
-        Some(self)
+    fn into_row(self) -> Result<Option<T>> {
+        Ok(Some(self))
     }
 }
 
@@ -261,7 +262,25 @@ impl<T: PlainNative + DuckDBType + 'static> RowResult for Option<T> {
     type Element = T;
 
     #[inline(always)]
-    fn into_row(self) -> Option<T> {
+    fn into_row(self) -> Result<Option<T>> {
+        Ok(self)
+    }
+}
+
+impl<T: PlainNative + DuckDBType + 'static> RowResult for Result<T> {
+    type Element = T;
+
+    #[inline(always)]
+    fn into_row(self) -> Result<Option<T>> {
+        self.map(Some)
+    }
+}
+
+impl<T: PlainNative + DuckDBType + 'static> RowResult for Result<Option<T>> {
+    type Element = T;
+
+    #[inline(always)]
+    fn into_row(self) -> Result<Option<T>> {
         self
     }
 }
@@ -430,7 +449,7 @@ where
                     layout,
                     !A::NULLABLE,
                     |physical, _| *data.add(physical),
-                    |value| Ok(function(A::from_row(value)).into_row()),
+                    |value| function(A::from_row(value)).into_row(),
                 )
             })
         }
@@ -498,13 +517,13 @@ macro_rules! row_callback {
                             rows,
                             propagate_nulls,
                             |_, _| u64::MAX,
-                            |row, _| Ok(function($($column.get(row)),+).into_row()),
+                            |row, _| function($($column.get(row)),+).into_row(),
                         )),
                         _ => writer.write_rows(
                             rows,
                             propagate_nulls,
                             |start, end| u64::MAX $(& $column.validity_word(start, end))+,
-                            |row, _| Ok(function($($column.get(row)),+).into_row()),
+                            |row, _| function($($column.get(row)),+).into_row(),
                         ),
                     })
                 }

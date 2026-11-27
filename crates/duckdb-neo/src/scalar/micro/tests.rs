@@ -381,3 +381,38 @@ fn row_executor_panics_become_errors() -> Result<()> {
     assert!(error.message.contains("row function panicked"), "{error}");
     Ok(())
 }
+
+#[test]
+fn row_executor_errors_fail_the_call() -> Result<()> {
+    let env = Environment::new()?;
+    let conn = env.open(StorageLocation::InMemory)?.connect()?;
+    MicroScalar::unary("row_sqrt", |value: f64| {
+        if value < 0.0 {
+            return Err(Error::invalid_input("row_sqrt: negative input"));
+        }
+        Ok(value.sqrt())
+    })
+    .register(&conn)?;
+    MicroScalar::binary("row_try_div", |a: i64, b: i64| -> Result<Option<i64>> {
+        if b == 0 {
+            return Err(Error::invalid_input("row_try_div: division by zero"));
+        }
+        Ok(a.checked_div(b))
+    })
+    .register(&conn)?;
+    let error = conn
+        .query(
+            "SELECT row_sqrt(4000 - range::DOUBLE) FROM range(5000)",
+            Parameters::None,
+        )
+        .and_then(|mut result| result.drain())
+        .expect_err("negative input fails");
+    assert_eq!(error.code, DuckDBError::InputInvalid);
+    assert!(error.message.contains("row_sqrt: negative input"), "{error}");
+    let sql = "SELECT count(*) FILTER (WHERE TRY(row_try_div(range, range % 7)) IS DISTINCT FROM \
+               CASE WHEN range % 7 <> 0 THEN range // (range % 7) END) FROM range(5000)";
+    assert_eq!(count_mismatches(&conn, sql)?, Some(0));
+    let sql = "SELECT count(*) FILTER (WHERE row_sqrt(range::DOUBLE) IS DISTINCT FROM sqrt(range)) FROM range(5000)";
+    assert_eq!(count_mismatches(&conn, sql)?, Some(0));
+    Ok(())
+}

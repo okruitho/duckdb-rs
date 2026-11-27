@@ -56,17 +56,12 @@ fn register_mix(conn: &Connection) -> Result<()> {
 }
 
 fn register_strict_sqrt(conn: &Connection) -> Result<()> {
-    MicroScalar::create(
-        "vs_strict_sqrt",
-        |_context, input: Vector<'_, f64>, mut output: Vector<'_, f64>| {
-            output.writer()?.try_map_from(&input.reader()?, |value| {
-                if *value < 0.0 {
-                    return Err(Error::invalid_input("vs_strict_sqrt: negative input"));
-                }
-                Ok(value.sqrt())
-            })
-        },
-    )
+    MicroScalar::unary("vs_strict_sqrt", |value: f64| {
+        if value < 0.0 {
+            return Err(Error::invalid_input("vs_strict_sqrt: negative input"));
+        }
+        Ok(value.sqrt())
+    })
     .register(conn)
 }
 
