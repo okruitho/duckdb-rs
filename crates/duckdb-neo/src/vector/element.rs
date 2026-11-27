@@ -231,8 +231,9 @@ unsafe impl ReadableNativeElement for Unknown {
 /// Element types stored as themselves: a slot holds exactly one `Self`, so slices copy unchanged.
 ///
 /// Enables [`VectorWriter::write_slice`](crate::vector::VectorWriter::write_slice),
-/// [`VectorWriter::write_slice_as`](crate::vector::VectorWriter::write_slice_as) and
-/// [`VectorWriter::copy_from`](crate::vector::VectorWriter::copy_from).
+/// [`VectorWriter::write_slice_as`](crate::vector::VectorWriter::write_slice_as),
+/// [`VectorWriter::copy_from`](crate::vector::VectorWriter::copy_from) and the bulk maps such as
+/// [`VectorWriter::map_from`](crate::vector::VectorWriter::map_from).
 ///
 /// These writes copy values unchecked, so a value can lie outside its logical type's range: a
 /// `DECIMAL` value with more digits than the width, or a `TIME` past midnight. Checking every
@@ -243,6 +244,8 @@ unsafe impl ReadableNativeElement for Unknown {
 ///
 /// `Self` must have the size and alignment of one physical slot, and every value of `Self` must be
 /// a row of every logical type DuckDB stores in the same physical type that is safe to read.
+/// Conversely, every valid slot of those types must be a valid `Self`, and all-zero bytes must be a
+/// valid `Self`, which bulk writes use to initialize rows.
 pub unsafe trait PlainNative:
     slot::PlainSlot + WritableNativeElement<Write = Self> + ReadableNativeElement + Copy
 {
@@ -310,7 +313,8 @@ macro_rules! plain_native {
             const SLOT: slot::Slot = slot::Slot::$slot;
         }
 
-        // SAFETY: the type is its own physical slot, and every value is a valid row.
+        // SAFETY: the type is its own physical slot, every value is a valid row, and every valid slot as well as
+        // all-zero bytes is a valid value.
         unsafe impl PlainNative for $type {}
     )*};
 }

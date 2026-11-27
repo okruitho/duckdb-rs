@@ -272,25 +272,19 @@ fn row_executors_match_sql_over_every_layout() -> Result<()> {
     MicroScalar::unary("row_add", |value: i64| value.wrapping_add(1))
         .set_property(FunctionProperty::HasSpecialNullHandling(true))
         .register(&conn)?;
-    MicroScalar::unary("row_coalesce", |value: Option<i64>| value.unwrap_or(-1))
-        .set_property(FunctionProperty::HasSpecialNullHandling(true))
-        .register(&conn)?;
+    MicroScalar::unary("row_coalesce", |value: Option<i64>| value.unwrap_or(-1)).register(&conn)?;
     MicroScalar::unary("row_is_odd", |value: i64| (value % 2 != 0).then_some(true)).register(&conn)?;
     MicroScalar::binary("row_div", |a: i64, b: i64| a.checked_div(b))
         .set_property(FunctionProperty::HasSpecialNullHandling(true))
         .register(&conn)?;
-    MicroScalar::binary("row_pick", |a: Option<i64>, b: Option<i64>| a.or(b))
-        .set_property(FunctionProperty::HasSpecialNullHandling(true))
-        .register(&conn)?;
+    MicroScalar::binary("row_pick", |a: Option<i64>, b: Option<i64>| a.or(b)).register(&conn)?;
     MicroScalar::ternary("row_clamp", |v: i64, lo: Option<i64>, hi: i64| {
         v.max(lo.unwrap_or(i64::MIN)).min(hi)
     })
-    .set_property(FunctionProperty::HasSpecialNullHandling(true))
     .register(&conn)?;
     MicroScalar::quaternary("row_mix", |a: i32, b: i64, c: Option<f64>, d: i16| {
         c.map(|c| f64::from(a) * c + b as f64 - f64::from(d))
     })
-    .set_property(FunctionProperty::HasSpecialNullHandling(true))
     .register(&conn)?;
     conn.query(
         "CREATE TABLE t AS SELECT CASE WHEN i % 7 = 3 OR i BETWEEN 128 AND 191 THEN NULL ELSE i - 2500 END AS v, \
@@ -414,5 +408,31 @@ fn row_executor_errors_fail_the_call() -> Result<()> {
     assert_eq!(count_mismatches(&conn, sql)?, Some(0));
     let sql = "SELECT count(*) FILTER (WHERE row_sqrt(range::DOUBLE) IS DISTINCT FROM sqrt(range)) FROM range(5000)";
     assert_eq!(count_mismatches(&conn, sql)?, Some(0));
+    Ok(())
+}
+
+#[test]
+fn row_executor_option_arguments_see_every_null() -> Result<()> {
+    let env = Environment::new()?;
+    let conn = env.open(StorageLocation::InMemory)?.connect()?;
+    MicroScalar::unary("row_zero", |value: Option<i64>| value.unwrap_or(0)).register(&conn)?;
+    MicroScalar::unary("row_zero_default", |value: Option<i64>| value.unwrap_or(0))
+        .set_property(FunctionProperty::HasSpecialNullHandling(false))
+        .register(&conn)?;
+    conn.query(
+        "CREATE TABLE t AS SELECT CASE WHEN i % 3 = 0 THEN NULL ELSE i END AS v FROM range(3000) r(i)",
+        Parameters::None,
+    )?
+    .drain()?;
+    for from in [
+        "(SELECT NULL::BIGINT AS v)",
+        "range(3000) CROSS JOIN (SELECT NULL::BIGINT AS v)",
+        "t WHERE v IS NULL",
+    ] {
+        let sql = format!("SELECT count(*) FILTER (WHERE row_zero(v) IS DISTINCT FROM 0) FROM {from}");
+        assert_eq!(count_mismatches(&conn, &sql)?, Some(0), "{sql}");
+    }
+    assert_eq!(count_mismatches(&conn, "SELECT row_zero(NULL)")?, Some(0));
+    assert_eq!(count_mismatches(&conn, "SELECT row_zero_default(NULL)")?, None);
     Ok(())
 }

@@ -362,9 +362,7 @@ impl<'vec, T: ReadableNativeElement> VectorReader<'vec, T> {
 
 impl<'vec, T: PlainNative> VectorReader<'vec, T> {
     /// Borrow every row's value when the storage is flat without a validity mask, else return `None`.
-    ///
-    /// Every row is then valid, so `values[row]` is what [`Self::get`] returns for `row`, and a loop
-    /// over the slice can vectorize. Constant, dictionary and masked vectors need [`Self::iter`].
+    /// Every row is then valid: `values[row]` is what [`Self::get`] returns for `row`.
     ///
     /// ```
     /// # use duckdb_neo::{Parameters, Result, environment::{Environment, StorageLocation}};
@@ -389,7 +387,8 @@ impl<'vec, T: PlainNative> VectorReader<'vec, T> {
             return None;
         }
         // SAFETY: flat storage without a mask holds a valid, initialized row in each of its `len` slots, which
-        // `get` also reads; `T` is the slot type, and the shared vector borrow keeps the storage alive and unchanged.
+        // `get` also reads; each is a valid `T` by `PlainNative`, and the shared vector borrow keeps the storage alive
+        // and unchanged.
         Some(unsafe { std::slice::from_raw_parts(view.data.cast::<T>(), self.len()) })
     }
 }
@@ -409,8 +408,6 @@ pub(crate) enum RowLayout {
 }
 
 impl RowLayout {
-    /// Return row `row`'s slot.
-    ///
     /// # Safety
     /// `row` must be a row of the layout's reader.
     #[inline(always)]
@@ -423,8 +420,6 @@ impl RowLayout {
         }
     }
 
-    /// Return row `row`'s slot, or `None` for a NULL row.
-    ///
     /// # Safety
     /// `row` must be a row of the layout's reader.
     #[inline(always)]

@@ -581,11 +581,8 @@ impl<T: PlainNative> VectorWriter<'_, T> {
         Ok(())
     }
 
-    /// Write `f(value)` for every row of `input` into the first rows of this vector; NULL rows stay NULL
-    /// without calling `f`.
-    ///
-    /// The input's storage and validity are resolved once, and validity is written a word at a time,
-    /// so a flat input without NULLs runs a loop LLVM can vectorize. Fails if `input` is longer.
+    /// Write `f(value)` for each row of `input` into the first rows, NULL rows staying NULL without a call; fails if
+    /// `input` is longer. Storage is resolved once, so a flat input without NULLs runs a vectorizable loop.
     ///
     /// ```
     /// # use duckdb_neo::{Parameters, Result, environment::{Environment, StorageLocation}, scalar::MicroScalar, vector::Vector};
@@ -642,9 +639,8 @@ impl<T: PlainNative> VectorWriter<'_, T> {
         self.map_reader(input, false, |value| Ok(f(value)))
     }
 
-    /// As [`Self::map_from`] with a fallible `f`, returning its first error.
-    ///
-    /// After an error, the rows of `input` are partly written: each row holds its old or its new value.
+    /// As [`Self::map_from`] with a fallible `f`, returning its first error; each row of `input` then holds its old
+    /// or its new value.
     #[inline]
     pub fn try_map_from<'v, I: ReadableNativeElement + 'v>(
         &mut self,
@@ -678,9 +674,8 @@ impl<T: PlainNative> VectorWriter<'_, T> {
         }
     }
 
-    /// Write rows `0..len` with `f` over the rows of `layout`, each read as `read(physical, row)`.
-    ///
-    /// With `propagate_nulls`, NULL rows become NULL without calling `f`; otherwise `f` gets `None`.
+    /// Write rows `0..len` with `f` over the rows of `layout`, each read as `read(physical, row)`; with
+    /// `propagate_nulls`, NULL rows become NULL without calling `f`, otherwise `f` gets `None`.
     ///
     /// # Safety
     /// `len` must not exceed [`Self::len`], `layout` must describe at least `len` rows, and `read` must be sound for
@@ -726,10 +721,8 @@ impl<T: PlainNative> VectorWriter<'_, T> {
         }
     }
 
-    /// Write rows `0..len` from `row(index, valid)`, a word of 64 rows at a time; `None` writes NULL.
-    ///
-    /// `valid(start, end)` returns the input validity of rows `start..end`, bit `i` for row `start + i`. With
-    /// `propagate_nulls`, rows without the bit become NULL without calling `row`.
+    /// Write rows `0..len` from `row(index, valid)` 64 at a time, `None` writing NULL; `valid(start, end)` has bit `i`
+    /// set when input row `start + i` is valid, and with `propagate_nulls` other rows become NULL without a call.
     ///
     /// # Safety
     /// `len` must not exceed [`Self::len`], and both closures must be sound for every row below `len`.
@@ -816,17 +809,16 @@ impl<T: PlainNative> VectorWriter<'_, T> {
     }
 }
 
-/// Zeroes `len` plain slots when dropped, so that a failed write leaves no row uninitialized.
-struct ZeroRowsOnDrop<T> {
+struct ZeroRowsOnDrop<T: PlainNative> {
     data: *mut T,
     len: usize,
 }
 
-impl<T> Drop for ZeroRowsOnDrop<T> {
+impl<T: PlainNative> Drop for ZeroRowsOnDrop<T> {
     fn drop(&mut self) {
         if self.len != 0 && !self.data.is_null() {
-            // SAFETY: the slots are the writer's flat rows, and zero bytes are a valid value of every plain slot type,
-            // as `init_rows` relies on too.
+            // SAFETY: the slots are the writer's flat rows of `T`, and `PlainNative` guarantees that all-zero bytes are
+            // a valid `T` and row.
             unsafe { self.data.write_bytes(0, self.len) };
         }
     }

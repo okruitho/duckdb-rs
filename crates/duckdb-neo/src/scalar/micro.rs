@@ -5,6 +5,7 @@ use crate::{
     DuckDBType, Error, Result,
     connection::Context,
     data_chunk::VectorCollection,
+    enums::FunctionProperty,
     signature::{FunctionParameter, SignatureBuilder, TypeDeclaration},
     vector::{
         NativeElement, PlainNative, RowLayout, StorageKind, Unknown, Vector, VectorReader, WritableNativeElement,
@@ -20,7 +21,8 @@ use crate::{
 /// instead, for plain argument and result types.
 /// The output vector is already sized to the batch's row count; the closure
 /// must write every output row. DuckDB's default NULL handling applies unless
-/// overridden with [`ScalarFunctionBuilder::set_property`].
+/// overridden with [`ScalarFunctionBuilder::set_property`] or, for the row
+/// functions, requested by an `Option` argument.
 ///
 /// Closures may capture owned `Send + Sync` state; binding and worker-local
 /// initialization remain available through [`ScalarCallbacks`] instead.
@@ -89,12 +91,8 @@ impl MicroScalar {
         )
     }
 
-    /// Infer the signature from the argument and result types, and call `function` once per row.
-    ///
-    /// The peer of DuckDB's `ScalarExecutor`: storage and validity are resolved once per batch, a NULL in a
-    /// [`PlainNative`] argument makes the row NULL without a call, and batches without NULLs run a loop that
-    /// LLVM can vectorize. [`RowArgument`] and [`RowResult`] describe the `Option` and `Result` forms. The
-    /// parameter is named `input`, and `SEQUENCE` arguments are flattened first.
+    /// Call `function` once per row of argument `arg0`, with the signature inferred from the types, like
+    /// DuckDB's `ScalarExecutor`; see [`RowArgument`] and [`RowResult`] for NULLs and errors.
     ///
     /// ```
     /// use duckdb_neo::{Parameters, environment::{Environment, StorageLocation}, scalar::MicroScalar};
@@ -115,7 +113,7 @@ impl MicroScalar {
         R: RowResult,
         F: Fn(A) -> R + Send + Sync + 'static,
     {
-        Self::rows::<(A,), R, F>(name, &["input"], function)
+        Self::rows::<(A,), R, F>(name, &["arg0"], function)
     }
 
     /// As [`Self::unary`], for two arguments named `arg0` and `arg1`.
@@ -181,14 +179,19 @@ impl MicroScalar {
     {
         let mut signature = Args::parameters(names);
         signature.return_type = Some(TypeDeclaration::rust_type::<R::Element>());
-        ScalarFunctionBuilder::new(
+        let builder = ScalarFunctionBuilder::new(
             name,
             signature,
             RowCallback {
                 function,
                 types: PhantomData,
             },
-        )
+        );
+        if Args::NULLABLE {
+            builder.set_property(FunctionProperty::HasSpecialNullHandling(true))
+        } else {
+            builder
+        }
     }
 }
 
@@ -196,12 +199,8 @@ mod sealed {
     pub trait Sealed {}
 }
 
-/// An argument of the row functions of [`MicroScalar::unary`] to [`MicroScalar::quaternary`].
-///
-/// A [`PlainNative`] type gets the value of each row where it is not NULL; a NULL in it makes the result
-/// NULL without calling the function, DuckDB's default. `Option<T>` gets NULL as `None`, for functions
-/// registered with [`FunctionProperty::HasSpecialNullHandling`](crate::enums::FunctionProperty::HasSpecialNullHandling);
-/// without it, DuckDB may already fold constant NULL arguments to a NULL result.
+/// An argument of [`MicroScalar::unary`] to [`MicroScalar::quaternary`]: a NULL in a [`PlainNative`] makes the row
+/// NULL without a call; `Option<T>` gets it as `None` and sets [`FunctionProperty::HasSpecialNullHandling`].
 pub trait RowArgument: sealed::Sealed + 'static {
     /// The element type of the SQL parameter.
     type Element: PlainNative + DuckDBType + 'static;
@@ -211,9 +210,8 @@ pub trait RowArgument: sealed::Sealed + 'static {
     fn from_row(value: Option<Self::Element>) -> Self;
 }
 
-/// The result of a row function of [`MicroScalar::unary`] to [`MicroScalar::quaternary`]: a [`PlainNative`]
-/// value, or `Option` of one, whose `None` makes the row NULL. Either may be wrapped in [`Result`], whose
-/// error fails the whole call.
+/// The result of [`MicroScalar::unary`] to [`MicroScalar::quaternary`]: a [`PlainNative`] or `Option` of one,
+/// whose `None` makes the row NULL, either possibly in a [`Result`] whose error fails the call.
 pub trait RowResult: sealed::Sealed + 'static {
     /// The element type of the SQL result.
     type Element: PlainNative + DuckDBType + 'static;
@@ -285,8 +283,9 @@ impl<T: PlainNative + DuckDBType + 'static> RowResult for Result<Option<T>> {
     }
 }
 
-/// Tuples of row arguments, which declare their parameters.
 trait RowArguments {
+    const NULLABLE: bool;
+
     fn parameters(names: &[&str]) -> SignatureBuilder;
 }
 
@@ -295,7 +294,6 @@ struct RowCallback<Args, R, F> {
     types: PhantomData<fn() -> (Args, R)>,
 }
 
-/// One argument's rows, read with the storage resolved once per batch.
 struct Column<'v, A: RowArgument> {
     data: *const A::Element,
     layout: RowLayout,
@@ -319,35 +317,32 @@ impl<'v, A: RowArgument> Column<'v, A> {
         })
     }
 
-    /// Return a lane without per-row storage or validity tests, if every row is valid in flat or constant storage.
     #[inline(always)]
     fn dense(&self) -> Option<Dense<A>> {
         match self.layout {
             RowLayout::Flat { validity } if validity.is_null() => Some(Dense::Flat(FlatLane(self.data))),
-            // SAFETY: a valid constant with rows holds an initialized value in slot zero.
             RowLayout::Constant { is_null: false } if self.len != 0 => {
-                Some(Dense::Constant(ConstantLane(unsafe { *self.data })))
+                // SAFETY: a valid constant with rows holds a valid `A::Element` in slot zero.
+                let value = unsafe { *self.data };
+                Some(Dense::Constant(ConstantLane(value)))
             }
             _ => None,
         }
     }
 
-    /// Return the validity of rows `start..end` for NULL propagation: `Option` arguments are never NULL.
-    ///
     /// # Safety
     /// As for [`RowLayout::validity_word`].
     #[inline(always)]
     unsafe fn validity_word(&self, start: usize, end: usize) -> u64 {
-        // SAFETY: the caller guarantees the rows.
         if A::NULLABLE {
             u64::MAX
         } else {
+            // SAFETY: the caller guarantees the rows.
             unsafe { self.layout.validity_word(start, end) }
         }
     }
 }
 
-/// An argument's value per row.
 trait Lane {
     type Argument;
 
@@ -361,7 +356,7 @@ impl<A: RowArgument> Lane for Column<'_, A> {
 
     #[inline(always)]
     unsafe fn get(&self, row: usize) -> A {
-        // SAFETY: the caller guarantees the row; slots of valid rows hold initialized values of the slot type.
+        // SAFETY: the caller guarantees the row; slots of valid rows hold valid `A::Element`s, by `PlainNative`.
         unsafe {
             if A::NULLABLE {
                 A::from_row(self.layout.valid_physical(row).map(|physical| *self.data.add(physical)))
@@ -400,7 +395,6 @@ impl<A: RowArgument> Lane for ConstantLane<A> {
     }
 }
 
-/// Flatten `SEQUENCE` and other arguments the readers cannot read.
 fn flatten_unreadable(input: &mut VectorCollection) -> Result<()> {
     for index in 0..input.col_count() {
         if input.get_untyped_vector_at(index)?.storage_kind() == StorageKind::Other {
@@ -411,6 +405,8 @@ fn flatten_unreadable(input: &mut VectorCollection) -> Result<()> {
 }
 
 impl<A: RowArgument> RowArguments for (A,) {
+    const NULLABLE: bool = A::NULLABLE;
+
     fn parameters(names: &[&str]) -> SignatureBuilder {
         SignatureBuilder::new().param(FunctionParameter::new::<A::Element>(names[0]))
     }
@@ -456,7 +452,6 @@ where
     }
 }
 
-/// Expand `body` once per combination of flat and constant lanes, rebinding each column to its lane.
 macro_rules! dense_lanes {
     ([] => $body:expr) => {
         $body
@@ -478,6 +473,8 @@ macro_rules! dense_lanes {
 macro_rules! row_callback {
     ($(($argument:ident, $column:ident, $index:tt)),+) => {
         impl<$($argument: RowArgument),+> RowArguments for ($($argument,)+) {
+            const NULLABLE: bool = false $(|| $argument::NULLABLE)+;
+
             fn parameters(names: &[&str]) -> SignatureBuilder {
                 SignatureBuilder::new()
                     $(.param(FunctionParameter::new::<$argument::Element>(names[$index])))+

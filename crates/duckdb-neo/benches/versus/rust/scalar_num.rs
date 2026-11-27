@@ -14,7 +14,6 @@ use duckdb_neo::{
     bind_arguments::BindArguments,
     connection::{Connection, Context},
     data_chunk::VectorCollection,
-    enums::FunctionProperty,
     scalar::{MicroScalar, ScalarBindCallbacks, ScalarCallbacks, ScalarFunctionBuilder},
     signature::{FunctionParameter, SignatureBuilder},
     vector::{Unknown, Vector},
@@ -39,9 +38,8 @@ fn register_is_even(conn: &Connection) -> Result<()> {
 }
 
 fn register_coalesce_zero(conn: &Connection) -> Result<()> {
-    MicroScalar::unary("vs_coalesce_zero", |value: Option<i64>| value.unwrap_or(0))
-        .set_property(FunctionProperty::HasSpecialNullHandling(true))
-        .register(conn)
+    // The `Option` argument registers special NULL handling.
+    MicroScalar::unary("vs_coalesce_zero", |value: Option<i64>| value.unwrap_or(0)).register(conn)
 }
 
 fn register_checked_div(conn: &Connection) -> Result<()> {

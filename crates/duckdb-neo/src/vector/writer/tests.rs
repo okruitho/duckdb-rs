@@ -1316,3 +1316,107 @@ fn writer_map_from_constant_vectors() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn writer_maps_leave_valid_rows_after_a_panic() -> Result<()> {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let env = Environment::new()?;
+    let conn = env.open(StorageLocation::InMemory)?.connect()?;
+    let types = [i64::logical_type(&conn)?, i64::logical_type(&conn)?];
+    let old = |row: usize| (!row.is_multiple_of(3)).then_some(7);
+    let new = |row: usize| (row % 64 != 63).then_some(2 * row as i64);
+    for map in 0..3 {
+        let mut chunk = DataChunk::create(&conn, &types, true)?;
+        let [input, output] = chunk.get_vector_array_mut([0, 1])?;
+        let (mut input, mut output) = (input.cast::<i64>()?, output.cast::<i64>()?);
+        input.set_size(200)?;
+        output.set_size(200)?;
+        {
+            let (mut input, mut output) = (input.writer()?, output.writer()?);
+            for row in 0..200 {
+                input.set_option(row, (row % 64 != 63).then_some(row as i64).as_ref())?;
+                output.set_option(row, old(row).as_ref())?;
+            }
+        }
+        let reader = input.reader()?;
+        let double = |value: &i64| {
+            assert!(*value != 150, "map {map} panicked");
+            2 * value
+        };
+        let mut writer = output.writer()?;
+        let panicked = catch_unwind(AssertUnwindSafe(|| match map {
+            0 => writer.map_from(&reader, double),
+            1 => writer.map_option_from(&reader, |value| value.map(double)),
+            _ => writer.try_map_from(&reader, |value| Ok(double(value))),
+        }));
+        assert!(panicked.is_err(), "map {map}");
+        let rows = output.reader()?.iter().map(|v| v.copied()).collect::<Vec<_>>();
+        for (row, value) in rows.into_iter().enumerate() {
+            let expected = match row {
+                ..128 => new(row),
+                128..150 => old(row).and(new(row)),
+                _ => old(row),
+            };
+            assert_eq!(value, expected, "map {map}, row {row}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn writer_resize_and_write_zeroes_rows_after_a_failure() -> Result<()> {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let env = Environment::new()?;
+    let conn = env.open(StorageLocation::InMemory)?.connect()?;
+    let mut chunk = DataChunk::create(&conn, &[i64::logical_type(&conn)?], true)?;
+    let mut vector = chunk.get_vector_at_mut::<i64>(0)?;
+    vector.set_size(100)?;
+    vector.writer()?.write_slice(0, &[7; 100])?;
+    let rows = |vector: &Vector<'_, i64>| -> Result<Vec<Option<i64>>> {
+        Ok(vector.reader()?.iter().map(|v| v.copied()).collect())
+    };
+
+    let fail = |writer: &mut VectorWriter<'_, i64>| {
+        writer.write_slice(0, &[1; 10])?;
+        Err(crate::Error::invalid_input("write failed"))
+    };
+    // SAFETY: the closure fails, so the rows are zeroed.
+    let error = unsafe { vector.writer()?.resize_and_write(300, fail) }.expect_err("the closure fails");
+    assert!(error.message.contains("write failed"), "{error}");
+    assert_eq!(rows(&vector)?, vec![Some(0); 300]);
+
+    vector.writer()?.write_slice(0, &[7; 300])?;
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the closure panics, so the rows are zeroed.
+        unsafe {
+            vector.writer()?.resize_and_write(500, |writer| {
+                writer.write_slice(0, &[1; 10])?;
+                panic!("write panicked")
+            })
+        }
+    }));
+    assert!(panicked.is_err());
+    assert_eq!(rows(&vector)?, vec![Some(0); 500]);
+
+    // SAFETY: zero rows need no writes.
+    unsafe { vector.writer()?.resize_and_write(0, |_| Ok(()))? };
+    assert!(vector.is_empty());
+    // SAFETY: as above; the guard has no rows to zero.
+    let error = unsafe {
+        vector
+            .writer()?
+            .resize_and_write(0, |_| Err(crate::Error::invalid_input("write failed")))
+    }
+    .expect_err("the closure fails");
+    assert!(error.message.contains("write failed"), "{error}");
+    assert!(vector.is_empty());
+
+    // SAFETY: the closure writes every row.
+    unsafe {
+        vector
+            .writer()?
+            .resize_and_write(130, |writer| writer.write_slice(0, &[3; 130]))?
+    };
+    assert_eq!(rows(&vector)?, vec![Some(3); 130]);
+    Ok(())
+}
