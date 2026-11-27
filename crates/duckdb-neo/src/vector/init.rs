@@ -117,6 +117,17 @@ impl<T: NativeElement> Vector<'_, T> {
 }
 
 impl<T: NativeElement> Vector<'_, T> {
+    /// Return the bytes per row when the vector has no children and zeroed rows are valid values.
+    pub(super) fn zeroed_row_size(&self) -> Result<Option<usize>> {
+        if self.children.is_some() {
+            return Ok(None);
+        }
+        Ok(match fill(&self.logical_type)? {
+            Fill::Zero(size) => Some(size),
+            _ => None,
+        })
+    }
+
     fn check_rows(&self, end: usize) -> Result<()> {
         if end > self.len {
             return Err(out_of_bounds(end - 1, self.len));

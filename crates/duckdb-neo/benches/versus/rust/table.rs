@@ -29,7 +29,7 @@ use duckdb_neo::{
         BindFunctionHandle, ExecColumnInfo, InitColumnData, OrderPreservation, PushdownData,
         TableFilterPushdownCallbacks, TableFunctionBuilder, TableFunctionCallbacks,
     },
-    vector::{NativeElement, WritableNativeElement},
+    vector::PlainNative,
 };
 
 /// Rows a parallel scan claims at a time, which also sizes its thread count.
@@ -50,22 +50,13 @@ fn chunk_rows(output: &DataChunk<'_>, remaining: i64) -> Result<usize> {
     Ok(remaining.clamp(0, output.capacity()? as i64) as usize)
 }
 
-fn fill_column<T>(
-    output: &mut DataChunk<'_>,
-    position: usize,
-    rows: usize,
-    mut value: impl FnMut(usize) -> T,
-) -> Result<()>
+fn fill_column<T>(output: &mut DataChunk<'_>, position: usize, rows: usize, value: impl FnMut(usize) -> T) -> Result<()>
 where
-    T: NativeElement + WritableNativeElement<Write = T>,
+    T: PlainNative,
 {
-    let mut vector = output.get_vector_at_mut::<T>(position)?;
-    vector.set_size(rows)?;
-    let mut writer = vector.writer()?;
-    for row in 0..rows {
-        writer.set(row, &value(row))?;
-    }
-    Ok(())
+    output
+        .get_vector_at_mut::<T>(position)?
+        .append(rows, |column| column.push_with(rows, value))
 }
 
 fn fill_series(output: &mut DataChunk<'_>, rows: usize, first: i64) -> Result<()> {
@@ -228,28 +219,28 @@ impl TableFunctionCallbacks for Grid {
                 1 => fill_column::<i64>(output, position, rows, |row| at(row).wrapping_mul(at(row)))?,
                 2 => fill_column::<f64>(output, position, rows, |row| at(row) as f64 / 2.0)?,
                 3 => {
-                    let mut vector = output.get_vector_at_mut::<String>(position)?;
-                    vector.set_size(rows)?;
-                    let mut writer = vector.writer()?;
                     let mut tag = String::new();
-                    for row in 0..rows {
-                        write_tag(&mut tag, at(row));
-                        writer.set(row, &tag)?;
-                    }
+                    output.get_vector_at_mut::<String>(position)?.append(rows, |tags| {
+                        for row in 0..rows {
+                            write_tag(&mut tag, at(row));
+                            tags.push(&tag)?;
+                        }
+                        Ok(())
+                    })?;
                 }
                 4 => fill_column::<bool>(output, position, rows, |row| at(row) % 2 == 0)?,
                 5 => {
-                    let mut vector = output.get_vector_at_mut::<i32>(position)?;
-                    vector.set_size(rows)?;
-                    let mut writer = vector.writer()?;
-                    for row in 0..rows {
-                        let i = at(row);
-                        if i % 5 == 0 {
-                            writer.set_null(row)?;
-                        } else {
-                            writer.set(row, &((i % 1000) as i32))?;
+                    output.get_vector_at_mut::<i32>(position)?.append(rows, |opts| {
+                        for row in 0..rows {
+                            let i = at(row);
+                            if i % 5 == 0 {
+                                opts.push_null()?;
+                            } else {
+                                opts.push(&((i % 1000) as i32))?;
+                            }
                         }
-                    }
+                        Ok(())
+                    })?;
                 }
                 column => return Err(Error::invalid_input(format!("vs_grid has no column {column}"))),
             }
@@ -324,13 +315,13 @@ impl TableFunctionCallbacks for Words {
     ) -> Result<()> {
         let scan = local_state.expect("init_local_state sets the scan");
         let rows = chunk_rows(output, bind_data.count - scan.position)?;
-        let mut vector = output.get_vector_at_mut::<String>(0)?;
-        vector.set_size(rows)?;
-        let mut writer = vector.writer()?;
-        for row in 0..rows {
-            write_word(&mut scan.word, scan.position + row as i64, &bind_data.padding);
-            writer.set(row, &scan.word)?;
-        }
+        output.get_vector_at_mut::<String>(0)?.append(rows, |words| {
+            for row in 0..rows {
+                write_word(&mut scan.word, scan.position + row as i64, &bind_data.padding);
+                words.push(&scan.word)?;
+            }
+            Ok(())
+        })?;
         scan.position += rows as i64;
         Ok(())
     }

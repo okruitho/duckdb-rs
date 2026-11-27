@@ -83,6 +83,7 @@ pub use crate::{arena::Arena, bytes::DuckDBBytes};
 mod array_writer;
 mod child;
 mod combined;
+mod fill;
 mod init;
 mod list_writer;
 mod map_writer;
@@ -94,6 +95,7 @@ mod writer;
 
 pub use array_writer::ArrayWriter;
 pub use child::ChildVector;
+pub use fill::VectorAppender;
 pub use list_writer::ListWriter;
 pub use map_writer::MapWriter;
 pub use nested_reader::{ArrayReader, Elements, Entries, ListReader, MapReader};

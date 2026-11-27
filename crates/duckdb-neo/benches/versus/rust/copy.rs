@@ -439,18 +439,17 @@ fn decode_lines_column<'f, T>(
 where
     T: NativeElement + WritableNativeElement<Write = T>,
 {
-    let mut vector = output.get_vector_at_mut::<T>(index)?;
-    vector.set_size(rows)?;
-    let mut writer = vector.writer()?;
-    for (row, field) in fields.enumerate() {
-        if field == NULL_FIELD {
-            writer.set_null(row)?;
-        } else {
-            let value = parse(field).ok_or_else(|| invalid_field("vs_lines", type_name, field))?;
-            writer.set(row, &value)?;
+    output.get_vector_at_mut::<T>(index)?.append(rows, |column| {
+        for field in fields {
+            if field == NULL_FIELD {
+                column.push_null()?;
+            } else {
+                let value = parse(field).ok_or_else(|| invalid_field("vs_lines", type_name, field))?;
+                column.push(&value)?;
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn decode_lines_varchar<'f>(
@@ -461,19 +460,18 @@ fn decode_lines_varchar<'f>(
     sep: u8,
     unescaped: &mut Vec<u8>,
 ) -> Result<()> {
-    let mut vector = output.get_vector_at_mut::<String>(index)?;
-    vector.set_size(rows)?;
-    let mut writer = vector.writer()?;
-    for (row, field) in fields.enumerate() {
-        if field == NULL_FIELD {
-            writer.set_null(row)?;
-            continue;
+    output.get_vector_at_mut::<String>(index)?.append(rows, |column| {
+        for field in fields {
+            if field == NULL_FIELD {
+                column.push_null()?;
+                continue;
+            }
+            let text = std::str::from_utf8(unescape(field, sep, unescaped)?)
+                .map_err(|_| invalid_field("vs_lines", "VARCHAR", field))?;
+            column.push(text)?;
         }
-        let text = std::str::from_utf8(unescape(field, sep, unescaped)?)
-            .map_err(|_| invalid_field("vs_lines", "VARCHAR", field))?;
-        writer.set(row, text)?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 impl CopyFromFunctionCallbacks for VsLines {
@@ -703,19 +701,18 @@ where
 {
     let row_width = data.len() / rows;
     let offset = index * FIXED_VALUE_WIDTH;
-    let mut vector = output.get_vector_at_mut::<T>(index)?;
-    vector.set_size(rows)?;
-    let mut writer = vector.writer()?;
-    for (row, bytes) in data.chunks_exact(row_width).enumerate() {
-        let field = &bytes[offset..offset + FIXED_VALUE_WIDTH];
-        let value: [u8; 8] = field[1..].try_into().expect("a fixed value has 8 value bytes");
-        match field[0] {
-            0 => writer.set_null(row)?,
-            1 => writer.set(row, &from_le_bytes(value))?,
-            _ => return Err(Error::invalid_input("vs_fixed: invalid validity byte")),
+    output.get_vector_at_mut::<T>(index)?.append(rows, |column| {
+        for bytes in data.chunks_exact(row_width) {
+            let field = &bytes[offset..offset + FIXED_VALUE_WIDTH];
+            let value: [u8; 8] = field[1..].try_into().expect("a fixed value has 8 value bytes");
+            match field[0] {
+                0 => column.push_null()?,
+                1 => column.push(&from_le_bytes(value))?,
+                _ => return Err(Error::invalid_input("vs_fixed: invalid validity byte")),
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 impl CopyFromFunctionCallbacks for VsFixed {
